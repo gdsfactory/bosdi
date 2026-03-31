@@ -6,7 +6,82 @@ use std::os::raw::{c_char, c_void};
 use std::sync::RwLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. OSDI 0.4 ABI TYPES  (must match osdi_0_4.h layout exactly)
+// 1. OSDI VERSION ABSTRACTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OsdiVersion {
+    V04 = 4,
+    V05 = 5,  // placeholder — layout not yet defined
+}
+
+impl OsdiVersion {
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            4 => Some(Self::V04),
+            5 => Some(Self::V05),
+            _ => None,
+        }
+    }
+}
+
+/// All byte offsets and flag constants that vary between OSDI standard versions.
+/// Field names match OSDI spec terminology.
+#[derive(Clone, Copy)]
+struct AbiLayout {
+    // OsdiDescriptor byte offsets
+    desc_num_nodes:            usize,
+    desc_num_terminals:        usize,
+    desc_num_params:           usize,
+    desc_node_mapping_off:     usize,
+    desc_num_states:           usize,
+    desc_instance_size:        usize,
+    desc_model_size:           usize,
+    desc_fn_load_resid:        usize,
+    desc_num_resist_jac:       usize,
+    desc_fn_write_jac_resist:  usize,
+    // OsdiSimInfo shape (for layout-driven construction in future versions)
+    sim_info_prev_solve_off:   usize,
+    sim_info_flags_off:        usize,
+    sim_info_total_size:       usize,
+    // Simulation flags
+    flag_calc_resist_residual: u32,
+    // Exported descriptor symbol
+    descriptor_symbol:         &'static [u8],
+}
+
+impl AbiLayout {
+    fn for_version(ver: OsdiVersion) -> Option<Self> {
+        match ver {
+            OsdiVersion::V04 => Some(Self::v04()),
+            OsdiVersion::V05 => None,  // not yet implemented
+        }
+    }
+
+    fn v04() -> Self {
+        Self {
+            desc_num_nodes:            8,
+            desc_num_terminals:        12,
+            desc_num_params:           76,
+            desc_node_mapping_off:     96,
+            desc_num_states:           104,
+            desc_instance_size:        116,
+            desc_model_size:           120,
+            desc_fn_load_resid:        168,
+            desc_num_resist_jac:       256,
+            desc_fn_write_jac_resist:  264,
+            sim_info_prev_solve_off:   40,
+            sim_info_flags_off:        64,
+            sim_info_total_size:       72,
+            flag_calc_resist_residual: 1,
+            descriptor_symbol:         b"OSDI_DESCRIPTORS\0",
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. OSDI 0.4 ABI TYPES  (must match osdi_0_4.h layout exactly)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// OsdiSimParas — 4 pointers, 32 bytes total.
@@ -36,6 +111,8 @@ impl OsdiSimParas {
 ///   offset 48: prev_state
 ///   offset 56: next_state
 ///   offset 64: flags     (u32)        ← eval checks CALC_RESIST_RESIDUAL here
+///
+/// OSDI 0.4 only. For V05: use layout-driven raw buffer (see AbiLayout::sim_info_*).
 #[repr(C)]
 struct OsdiSimInfo {
     paras:      OsdiSimParas,
@@ -46,8 +123,6 @@ struct OsdiSimInfo {
     flags:      u32,
     _pad:       u32,
 }
-
-const CALC_RESIST_RESIDUAL: u32 = 1; // from osdi_0_4.h
 
 #[repr(C)]
 struct OsdiInitInfo {
@@ -62,7 +137,7 @@ impl Default for OsdiInitInfo {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. OSDI 0.4 FUNCTION POINTER TYPES
+// 3. OSDI FUNCTION POINTER TYPES
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Called once per model to fill default model params.
@@ -74,7 +149,6 @@ type SetupModelFn = unsafe extern "C" fn(
 );
 
 /// Called once per instance to precompute conductances into the inst block.
-/// Signature: (handle, inst, model, temperature, num_terminals, sim_paras, init_info)
 type SetupInstanceFn = unsafe extern "C" fn(
     handle:        *mut c_void,
     inst:          *mut c_void,
@@ -87,11 +161,13 @@ type SetupInstanceFn = unsafe extern "C" fn(
 
 /// Called each Newton step to compute residuals.
 /// Returns EVAL_RET_FLAG_* bits (0 = ok).
+/// Last arg is *mut c_void (not *mut OsdiSimInfo) so the 0.4 typed path and a
+/// future layout-driven raw-buffer path can both use the same fn pointer type.
 type EvalFn = unsafe extern "C" fn(
     handle:   *mut c_void,
     inst:     *mut c_void,
     model:    *mut c_void,
-    sim_info: *mut OsdiSimInfo,
+    sim_info: *mut c_void,
 ) -> u32;
 
 /// Adds this element's currents into dst[node_index] (accumulates).
@@ -101,7 +177,7 @@ type LoadResidualFn = unsafe extern "C" fn(inst: *mut c_void, model: *mut c_void
 type WriteJacobianFn = unsafe extern "C" fn(inst: *mut c_void, model: *mut c_void, dst: *mut f64);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. OsdiDescriptor field offsets  (derived from osdi_0_4.h, 64-bit ABI)
+// 4. OsdiDescriptor field layout  (derived from osdi_0_4.h, 64-bit ABI)
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // struct OsdiDescriptor layout (abbreviated):
@@ -138,20 +214,8 @@ type WriteJacobianFn = unsafe extern "C" fn(inst: *mut c_void, model: *mut c_voi
 //   +256  num_resistive_jacobian_entries (u32)
 //   +260  num_reactive_jacobian_entries  (u32)
 //   +264  write_jacobian_array_resist    (fn ptr)  ← present in descriptor
-
-mod desc {
-    pub const NUM_NODES:           usize = 8;
-    pub const NUM_TERMINALS:       usize = 12;
-    pub const NUM_PARAMS:          usize = 76;
-    pub const NUM_INST_PARAMS:     usize = 80;
-    pub const NODE_MAPPING_OFF:    usize = 96;  // byte offset of node index array in inst
-    pub const NUM_STATES:          usize = 104;
-    pub const INSTANCE_SIZE:       usize = 116;
-    pub const MODEL_SIZE:          usize = 120;
-    pub const FN_LOAD_RESID:       usize = 168;
-    pub const NUM_RESIST_JAC:      usize = 256;
-    pub const FN_WRITE_JAC_RESIST: usize = 264;
-}
+//
+// Byte offsets for OSDI 0.4 are stored in AbiLayout::v04().
 
 unsafe fn read_u32(base: *const u8, offset: usize) -> u32 {
     (base.add(offset) as *const u32).read_unaligned()
@@ -164,11 +228,12 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. LOADED MODEL & REGISTRY
+// 5. LOADED MODEL & REGISTRY
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedOsdi {
     _lib:                 Library,
+    layout:               AbiLayout,
     pub num_terminals:    u32,
     pub num_nodes:        u32,
     pub num_resist_jac:   u32,
@@ -190,11 +255,12 @@ unsafe impl Sync for LoadedOsdi {}
 /// Metadata returned to C++ and then to Python.
 #[repr(C)]
 pub struct ModelMetadata {
-    pub model_id:   u32,
-    pub num_pins:   usize,
-    pub num_params: usize,
-    pub num_states: usize,
-    pub success:    bool,
+    pub model_id:      u32,
+    pub num_pins:      usize,
+    pub num_params:    usize,
+    pub num_states:    usize,
+    pub osdi_version:  u32,
+    pub success:       bool,
 }
 
 lazy_static::lazy_static! {
@@ -204,15 +270,27 @@ lazy_static::lazy_static! {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. PHASE 1: LOADING
+// 6. PHASE 1: LOADING
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn fail() -> ModelMetadata {
-    ModelMetadata { model_id: 0, num_pins: 0, num_params: 0, num_states: 0, success: false }
+    ModelMetadata {
+        model_id: 0, num_pins: 0, num_params: 0,
+        num_states: 0, osdi_version: 0, success: false,
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn load_osdi_library(path_ptr: *const c_char) -> ModelMetadata {
+pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> ModelMetadata {
+    let ver = match OsdiVersion::from_u32(version) {
+        Some(v) => v,
+        None    => { eprintln!("OSDI: unknown version {version}"); return fail(); }
+    };
+    let layout = match AbiLayout::for_version(ver) {
+        Some(l) => l,
+        None    => { eprintln!("OSDI: version {:?} not yet implemented", ver); return fail(); }
+    };
+
     let path = unsafe {
         assert!(!path_ptr.is_null());
         match CStr::from_ptr(path_ptr).to_str() {
@@ -243,37 +321,36 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char) -> ModelMetadata {
     // ── read descriptor metadata ──────────────────────────────────────────────
     let desc: *const u8 = {
         let desc_sym: Symbol<*const u8> =
-            match unsafe { lib.get(b"OSDI_DESCRIPTORS\0") } {
+            match unsafe { lib.get(layout.descriptor_symbol) } {
                 Ok(s)  => s,
-                Err(e) => { eprintln!("OSDI missing OSDI_DESCRIPTORS: {e}"); return fail(); }
+                Err(e) => { eprintln!("OSDI missing descriptor symbol: {e}"); return fail(); }
             };
         unsafe { *desc_sym }
     };
 
-    let num_nodes        = unsafe { read_u32(desc, desc::NUM_NODES) };
-    let num_terminals    = unsafe { read_u32(desc, desc::NUM_TERMINALS) };
-    let num_params       = unsafe { read_u32(desc, desc::NUM_PARAMS) };
-    let node_map_off     = unsafe { read_u32(desc, desc::NODE_MAPPING_OFF) } as usize;
-    let num_states       = unsafe { read_u32(desc, desc::NUM_STATES) };
-    let instance_size    = unsafe { read_u32(desc, desc::INSTANCE_SIZE) } as usize;
-    let model_size       = unsafe { read_u32(desc, desc::MODEL_SIZE) } as usize;
-    let num_resist_jac   = unsafe { read_u32(desc, desc::NUM_RESIST_JAC) };
+    let num_nodes      = unsafe { read_u32(desc, layout.desc_num_nodes) };
+    let num_terminals  = unsafe { read_u32(desc, layout.desc_num_terminals) };
+    let num_params     = unsafe { read_u32(desc, layout.desc_num_params) };
+    let node_map_off   = unsafe { read_u32(desc, layout.desc_node_mapping_off) } as usize;
+    let num_states     = unsafe { read_u32(desc, layout.desc_num_states) };
+    let instance_size  = unsafe { read_u32(desc, layout.desc_instance_size) } as usize;
+    let model_size     = unsafe { read_u32(desc, layout.desc_model_size) } as usize;
+    let num_resist_jac = unsafe { read_u32(desc, layout.desc_num_resist_jac) };
 
     // ── function pointers present in descriptor (filled by dynamic linker) ───
     let load_residual: LoadResidualFn =
-        match unsafe { read_fn(desc, desc::FN_LOAD_RESID) } {
+        match unsafe { read_fn(desc, layout.desc_fn_load_resid) } {
             Some(f) => f,
             None    => { eprintln!("OSDI: load_residual_resist fn is null"); return fail(); }
         };
     let write_jacobian: WriteJacobianFn =
-        match unsafe { read_fn(desc, desc::FN_WRITE_JAC_RESIST) } {
+        match unsafe { read_fn(desc, layout.desc_fn_write_jac_resist) } {
             Some(f) => f,
             None    => { eprintln!("OSDI: write_jacobian_array_resist fn is null"); return fail(); }
         };
 
     // ── function pointers with NULL descriptor slots — look up by name ────────
-    // OpenVAF OSDI 0.4 leaves access/setup_model/setup_instance/eval NULL in
-    // the descriptor but exports them as `fname_0` (index 0 = first model).
+    // OpenVAF exports these as `fname_0` (index 0 = first model in the binary).
     let setup_model:    SetupModelFn    = sym!(lib, b"setup_model_0\0",    SetupModelFn);
     let setup_instance: SetupInstanceFn = sym!(lib, b"setup_instance_0\0", SetupInstanceFn);
     let eval:           EvalFn          = sym!(lib, b"eval_0\0",           EvalFn);
@@ -287,6 +364,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char) -> ModelMetadata {
 
     OSDI_REGISTRY.write().unwrap().insert(model_id, LoadedOsdi {
         _lib: lib,
+        layout,
         num_terminals,
         num_nodes,
         num_resist_jac,
@@ -302,16 +380,16 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char) -> ModelMetadata {
 
     ModelMetadata {
         model_id,
-        num_pins:   num_terminals as usize,
-        // num_params in the descriptor = total user params (model + instance).
-        num_params: num_params as usize,
-        num_states: num_states as usize,
-        success:    true,
+        num_pins:     num_terminals as usize,
+        num_params:   num_params as usize,
+        num_states:   num_states as usize,
+        osdi_version: version,
+        success:      true,
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. PHASE 2: SINGLE-DEVICE EVALUATION
+// 7. PHASE 2: SINGLE-DEVICE EVALUATION
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // OSDI 0.4 evaluation protocol (confirmed by disassembling the resistor binary):
@@ -362,7 +440,6 @@ fn eval_one_device(
     }
 
     // ── set node mapping: terminal i → node index i ───────────────────────────
-    // Each entry is a i32 at inst[node_map_off + i*4].
     for i in 0..m.num_terminals as usize {
         unsafe {
             *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) = i as i32;
@@ -375,84 +452,72 @@ fn eval_one_device(
     // ── setup_model: validates R and applies defaults ─────────────────────────
     let mut init1 = OsdiInitInfo::default();
     unsafe {
-        (m.setup_model)(
-            std::ptr::null_mut(),
-            model_ptr,
-            std::ptr::null_mut(),
-            &mut init1,
-        );
+        (m.setup_model)(std::ptr::null_mut(), model_ptr, std::ptr::null_mut(), &mut init1);
     }
 
     // ── setup_instance: precomputes G = m/R into inst[72], -G into inst[80] ──
     let mut init2 = OsdiInitInfo::default();
     unsafe {
         (m.setup_instance)(
-            std::ptr::null_mut(),
-            inst_ptr,
-            model_ptr,
-            300.0,            // temperature (K) — affects tnom-dependent models
-            m.num_terminals,
-            std::ptr::null_mut(),
-            &mut init2,
+            std::ptr::null_mut(), inst_ptr, model_ptr,
+            300.0, m.num_terminals, std::ptr::null_mut(), &mut init2,
         );
     }
 
     // ── eval: computes I_A → inst[88], I_B → inst[96] ────────────────────────
-    let mut vol_buf: Vec<f64> = vol.to_vec(); // OsdiSimInfo.prev_solve needs *mut f64
+    // OSDI 0.4: use the typed OsdiSimInfo struct (layout verified by disassembly).
+    // For V05: use layout-driven raw buffer (see AbiLayout::sim_info_*).
+    let mut vol_buf: Vec<f64> = vol.to_vec();
     let mut sim_info = OsdiSimInfo {
         paras:      OsdiSimParas::null(),
         abstime:    0.0,
         prev_solve: vol_buf.as_mut_ptr(),
         prev_state: std::ptr::null_mut(),
         next_state: std::ptr::null_mut(),
-        flags:      CALC_RESIST_RESIDUAL,
+        flags:      m.layout.flag_calc_resist_residual,
         _pad:       0,
     };
     unsafe {
-        (m.eval)(std::ptr::null_mut(), inst_ptr, model_ptr, &mut sim_info);
+        (m.eval)(
+            std::ptr::null_mut(), inst_ptr, model_ptr,
+            &mut sim_info as *mut _ as *mut c_void,
+        );
     }
 
     // ── extract currents via load_residual_resist ─────────────────────────────
-    // Signature: (inst, model, dst) — ADDS inst's currents into dst[node_idx].
-    // cur is already zeroed by the caller, so we get a clean accumulation.
-    unsafe {
-        (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr());
-    }
+    unsafe { (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr()); }
 
     // ── extract conductances via write_jacobian_array_resist ──────────────────
-    // Signature: (inst, model, dst) — writes num_resist_jac f64s to dst.
-    unsafe {
-        (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr());
-    }
+    unsafe { (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr()); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. PHASE 2: BATCHED FFI ENTRY POINT (called from C++ XLA handler)
+// 8. PHASE 2: BATCHED FFI ENTRY POINT (called from C++ XLA handler)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn batched_osdi_eval_ffi(
-    model_id:        u32,
-    num_devices:     usize,
-    num_pins:        usize,
-    num_params:      usize,
-    num_states:      usize,
-    voltages_ptr:    *const f64,
-    params_ptr:      *const f64,
-    _old_state_ptr:  *const f64,  // unused for stateless models
-    currents_ptr:    *mut f64,
+    model_id:         u32,
+    num_devices:      usize,
+    num_pins:         usize,
+    num_params:       usize,
+    num_states:       usize,
+    voltages_ptr:     *const f64,
+    params_ptr:       *const f64,
+    _old_state_ptr:   *const f64,
+    currents_ptr:     *mut f64,
     conductances_ptr: *mut f64,
-    charges_ptr:     *mut f64,
+    charges_ptr:      *mut f64,
     capacitances_ptr: *mut f64,
-    _new_state_ptr:  *mut f64,    // unused for stateless models
+    _new_state_ptr:   *mut f64,
 ) {
     let registry = OSDI_REGISTRY.read().unwrap();
     let m = registry.get(&model_id).expect("Unknown OSDI model ID");
 
     let jac_size = m.num_resist_jac as usize;
 
-    let voltages  = unsafe { std::slice::from_raw_parts(voltages_ptr, num_devices * num_pins) };
-    let params    = unsafe { std::slice::from_raw_parts(params_ptr,   num_devices * num_params) };
+    let voltages = unsafe { std::slice::from_raw_parts(voltages_ptr, num_devices * num_pins) };
+    let params   = unsafe { std::slice::from_raw_parts(params_ptr,   num_devices * num_params) };
 
     // Reactive outputs are zero for resistive-only models.
     let charges      = unsafe { std::slice::from_raw_parts_mut(charges_ptr,      num_devices * num_pins) };
@@ -460,8 +525,8 @@ pub extern "C" fn batched_osdi_eval_ffi(
     charges.fill(0.0);
     capacitances.fill(0.0);
 
-    let currents     = unsafe { std::slice::from_raw_parts_mut(currents_ptr,      num_devices * num_pins) };
-    let conductances = unsafe { std::slice::from_raw_parts_mut(conductances_ptr,  num_devices * jac_size) };
+    let currents     = unsafe { std::slice::from_raw_parts_mut(currents_ptr,     num_devices * num_pins) };
+    let conductances = unsafe { std::slice::from_raw_parts_mut(conductances_ptr, num_devices * jac_size) };
 
     // State slices (num_states=0 for the resistor — avoid par_chunks_exact(0) panic).
     if num_states == 0 {
@@ -470,11 +535,11 @@ pub extern "C" fn batched_osdi_eval_ffi(
             .zip(voltages.par_chunks_exact(num_pins))
             .zip(params.par_chunks_exact(num_params))
             .for_each(|(((cur, cond), vol), param)| {
-                cur.fill(0.0); // load_residual ADDS, so must start at zero
+                cur.fill(0.0);
                 eval_one_device(m, vol, param, cur, cond);
             });
     } else {
-        // TODO: stateful model support (pass old_state/new_state slices)
+        // TODO: stateful model support
         eprintln!("OSDI: stateful models not yet supported (num_states={})", num_states);
     }
 }

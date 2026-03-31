@@ -1,7 +1,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/string.h> 
+#include <nanobind/stl/string.h>
 #include "xla/ffi/api/ffi.h"
 
 namespace nb = nanobind;
@@ -13,15 +13,16 @@ namespace ffi = xla::ffi;
 
 struct ModelMetadata {
     uint32_t model_id;
-    size_t num_pins;
-    size_t num_params;
-    size_t num_states;
-    bool success;
+    size_t   num_pins;
+    size_t   num_params;
+    size_t   num_states;
+    uint32_t osdi_version;
+    bool     success;
 };
 
 extern "C" {
-    // Phase 1: The loader (now OSDI 0.4 compatible in Rust)
-    ModelMetadata load_osdi_library(const char* path_ptr);
+    // Phase 1: The loader — version selects the ABI layout in Rust
+    ModelMetadata load_osdi_library(const char* path_ptr, uint32_t version);
 
     // Phase 2: The batched execution (Rayon zipper in Rust)
     void batched_osdi_eval_ffi(
@@ -89,18 +90,18 @@ ffi::Error batched_osdi_eval_impl(
 // ---------------------------------------------------------
 // 3. REGISTER THE FFI SYMBOL
 // ---------------------------------------------------------
-// This defines the 'OsdiEvalCpu' object that was missing in your error log.
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiEvalCpu, batched_osdi_eval_impl,
     ffi::Ffi::Bind()
-        .Arg<ffi::Buffer<ffi::DataType::U32>>() 
-        .Arg<ffi::Buffer<ffi::DataType::F64>>() 
-        .Arg<ffi::Buffer<ffi::DataType::F64>>() 
-        .Arg<ffi::Buffer<ffi::DataType::F64>>() 
-        .Ret<ffi::Buffer<ffi::DataType::F64>>() 
-        .Ret<ffi::Buffer<ffi::DataType::F64>>() 
-        .Ret<ffi::Buffer<ffi::DataType::F64>>() 
-        .Ret<ffi::Buffer<ffi::DataType::F64>>() 
-        .Ret<ffi::Buffer<ffi::DataType::F64>>() 
+        .Arg<ffi::Buffer<ffi::DataType::U32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
 );
 
 // ---------------------------------------------------------
@@ -108,21 +109,21 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiEvalCpu, batched_osdi_eval_impl,
 // ---------------------------------------------------------
 
 NB_MODULE(osdi_shim_nb, m) {
-    m.doc() = "OSDI 0.4 Batched Evaluator for JAX";
+    m.doc() = "OSDI Batched Evaluator for JAX";
 
     nb::class_<ModelMetadata>(m, "ModelMetadata")
-        .def_ro("model_id", &ModelMetadata::model_id)
-        .def_ro("num_pins", &ModelMetadata::num_pins)
-        .def_ro("num_params", &ModelMetadata::num_params)
-        .def_ro("num_states", &ModelMetadata::num_states)
-        .def_ro("success", &ModelMetadata::success);
+        .def_ro("model_id",     &ModelMetadata::model_id)
+        .def_ro("num_pins",     &ModelMetadata::num_pins)
+        .def_ro("num_params",   &ModelMetadata::num_params)
+        .def_ro("num_states",   &ModelMetadata::num_states)
+        .def_ro("osdi_version", &ModelMetadata::osdi_version)
+        .def_ro("success",      &ModelMetadata::success);
 
-    m.def("load_osdi_library", [](const std::string& path) {
-        return load_osdi_library(path.c_str());
-    });
+    m.def("load_osdi_library", [](const std::string& path, uint32_t version) {
+        return load_osdi_library(path.c_str(), version);
+    }, nb::arg("path"), nb::arg("version") = 4u);
 
-    m.def("batched_osdi_eval", []() { 
-        // This now correctly references the OsdiEvalCpu defined above
-        return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET"); 
+    m.def("batched_osdi_eval", []() {
+        return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET");
     });
 }
