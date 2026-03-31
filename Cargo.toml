@@ -1,0 +1,13 @@
+[package]
+name = "bodi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bodi"
+crate-type = ["staticlib"]
+
+[dependencies]
+rayon = "1.8"
+libloading = "0.8"
+lazy_static = "1.4"

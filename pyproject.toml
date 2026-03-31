@@ -1,0 +1,47 @@
+[project]
+name = "bodi"
+version = "0.1.0"
+authors = [
+    { name = "Chris Daunt", email = "chris@gdsfactory.com" }
+]
+# Translates your 3.13.* requirement
+requires-python = ">=3.13, <3.14" 
+
+# --- IF YOU ARE LEAVING PIXI (Using uv, poetry, pip, etc.) ---
+# Standard PyPI dependencies go here.
+dependencies = [
+    "jax>=0.9.1,<0.10",
+    "jaxlib>=0.9.1,<0.10",
+]
+
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel", "nanobind>=2.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# In a pyproject.toml, Pixi treats standard `dependencies` as PyPI packages.
+# If you want JAX pulled from conda-forge, they must go here instead:
+[tool.pixi.dependencies]
+jax = ">=0.9.1,<0.10"
+jaxlib = ">=0.9.1,<0.10"
+pytest = ">=9.0.2,<10"
+nanobind = ">=2.12.0,<3"
+setuptools = ">=82.0.1,<83"
+tsl_robin_map = ">=1.4.0,<2"
+
+
+[tool.pixi.tasks]
+test = "pytest -v"
+build = "python setup.py build_ext --inplace"
+build-clean = "rm -rf build/ && find . -name 'osdi_shim_nb*.so' -delete && python setup.py build_ext --inplace"
+
+# --- PYTEST CONFIGURATION ---
+[tool.pytest.ini_options]
+# This tells pytest to always add your 'src' folder to the Python path
+pythonpath = ["src"]
+# Optional: explicitly tell it where your tests live
+testpaths = ["tests"]
+
