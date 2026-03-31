@@ -1,10 +1,13 @@
 # bodi
 
-Make [OSDI](https://github.com/OpenVAF/OpenVAF) device models (Verilog-A compiled to `.osdi` binaries) differentiable via JAX.
+Make [OSDI](https://github.com/OpenVAF/OpenVAF) device models (Verilog-A compiled to `.osdi` binaries) differentiable
+via JAX.
 
 ## What it does
 
-Wraps OSDI 0.4 device models in a JAX custom call so you can use `jax.grad()` through them. Analytical Jacobians (conductances dI/dV, capacitances dQ/dV) are provided directly by the OSDI model — no finite differences. Batched evaluation runs in parallel via Rayon.
+Wraps OSDI 0.4 device models in a JAX custom call so you can use `jax.grad()` through them. Analytical Jacobians
+(conductances dI/dV, capacitances dQ/dV) are provided directly by the OSDI model — no finite differences. Batched
+evaluation runs in parallel via Rayon.
 
 ```python
 from osdi_loader import load_osdi_model

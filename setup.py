@@ -7,16 +7,19 @@ import nanobind
 
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
 def get_include_dirs():
     dirs = []
     # ... (Keep the exact same get_include_dirs() function from before) ...
     try:
         import jax.ffi
+
         dirs.append(jax.ffi.include_dir())
     except ImportError:
         pass
     dirs.append(nanobind.include_dir())
     return dirs
+
 
 class BuildExt(build_ext):
     def build_extension(self, ext):
@@ -36,7 +39,11 @@ class BuildExt(build_ext):
             # 3. Link the Rust library
             ext.extra_objects = [static_lib_path]
             if sys.platform != "win32":
-                ext.extra_link_args = list(ext.extra_link_args or []) + ["-lm", "-ldl", "-pthread"]
+                ext.extra_link_args = list(ext.extra_link_args or []) + [
+                    "-lm",
+                    "-ldl",
+                    "-pthread",
+                ]
                 if sys.platform == "darwin":
                     ext.extra_link_args += ["-framework", "CoreFoundation"]
 
@@ -47,12 +54,15 @@ class BuildExt(build_ext):
 
         super().build_extension(ext)
 
+
 # Combine your shim with the Nanobind core logic
-nanobind_src = os.path.join(os.path.dirname(nanobind.__file__), "src", "nb_combined.cpp")
+nanobind_src = os.path.join(
+    os.path.dirname(nanobind.__file__), "src", "nb_combined.cpp"
+)
 
 osdi_extension = Extension(
-    "osdi_shim_nb",  
-    sources=["src/osdi_shim.cpp", nanobind_src], # Points to the src/ folder
+    "osdi_shim_nb",
+    sources=["src/osdi_shim.cpp", nanobind_src],  # Points to the src/ folder
     include_dirs=get_include_dirs(),
     extra_compile_args=["-std=c++17"] if sys.platform != "win32" else ["/std:c++17"],
 )
@@ -61,8 +71,8 @@ setup(
     name="bodi",
     version="0.1.0",
     # --- THIS IS THE KEY CHANGE ---
-    package_dir={"": "src"}, 
-    py_modules=["osdi_loader", "osdi_jax"], 
+    package_dir={"": "src"},
+    py_modules=["osdi_loader", "osdi_jax"],
     ext_modules=[osdi_extension],
     cmdclass={"build_ext": BuildExt},
     zip_safe=False,
