@@ -7,8 +7,8 @@ authors = [{ name = "Chris Daunt", email = "chris@gdsfactory.com" }]
 # --- IF YOU ARE LEAVING PIXI (Using uv, poetry, pip, etc.) ---
 # Standard PyPI dependencies go here.
 dependencies = [
-  "jax>=0.9.1,<0.10",
-  "jaxlib>=0.9.1,<0.10",
+  "jax>=0.7.0,<0.8",
+  "jaxlib>=0.7.0,<0.8",
 ]
 
 [build-system]
@@ -22,8 +22,8 @@ platforms = ["linux-64"]
 # In a pyproject.toml, Pixi treats standard `dependencies` as PyPI packages.
 # If you want JAX pulled from conda-forge, they must go here instead:
 [tool.pixi.dependencies]
-jax = ">=0.9.1,<0.10"
-jaxlib = ">=0.9.1,<0.10"
+jax = ">=0.7.0,<0.8"
+jaxlib = ">=0.7.0,<0.8"
 pytest = ">=9.0.2,<10"
 nanobind = ">=2.12.0,<3"
 setuptools = ">=82.0.1,<83"
