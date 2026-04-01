@@ -158,3 +158,47 @@ def test_resistor_jax_jvp(resistor_model):
         rtol=1e-6,
         err_msg="JAX JVP did not correctly pipe OSDI Jacobians",
     )
+
+
+def test_resistor_jit(resistor_model):
+    """
+    Verify that osdi_eval can be compiled by jax.jit and produces correct results.
+    Also checks that jit + grad composes correctly.
+    """
+    num_devices = 1
+    voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
+    params = jnp.array([[50.0, 1.0]], dtype=jnp.float64)
+    old_state = jnp.empty((num_devices, 0), dtype=jnp.float64)
+
+    # JIT the eval function
+    jit_eval = jax.jit(lambda v, p: osdi_eval(resistor_model.id, v, p, old_state))
+
+    cur, cond, _, _, _ = jit_eval(voltages, params)
+
+    np.testing.assert_allclose(
+        cur,
+        np.array([[0.02, -0.02]]),
+        rtol=1e-6,
+        err_msg="jit(osdi_eval) produced incorrect currents",
+    )
+    np.testing.assert_allclose(
+        cond,
+        np.array([[0.02, -0.02, -0.02, 0.02]]),
+        rtol=1e-6,
+        err_msg="jit(osdi_eval) produced incorrect conductances",
+    )
+
+    # JIT + grad should also compose
+    def pin_A_current(v):
+        cur, _, _, _, _ = osdi_eval(resistor_model.id, v, params, old_state)
+        return cur[0, 0]
+
+    jit_grad = jax.jit(jax.grad(pin_A_current))
+    gradient = jit_grad(voltages)
+
+    np.testing.assert_allclose(
+        gradient,
+        np.array([[0.02, -0.02]]),
+        rtol=1e-6,
+        err_msg="jit(grad(osdi_eval)) produced incorrect gradient",
+    )
