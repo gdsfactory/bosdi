@@ -160,6 +160,90 @@ def test_resistor_jax_jvp(resistor_model):
     )
 
 
+@pytest.fixture(scope="module")
+def capacitor_model():
+    """Load the compiled capacitor OSDI binary once for the test module."""
+    model = folder / "capacitor_va.osdi"
+    model = load_osdi_model(str(model))
+
+    assert model.num_pins == 2, f"Expected 2 pins, got {model.num_pins}"
+    assert model.num_params == 3, (
+        f"Expected 3 parameters (C, m, tnom), got {model.num_params}"
+    )
+    assert model.num_states == 0, "Linear capacitor should have 0 internal states"
+
+    return model
+
+
+def test_capacitor_dc_evaluation(capacitor_model):
+    """
+    Test a single capacitor at a DC operating point.
+    A linear capacitor I = C*ddt(V) has no resistive current; charge Q = C*V.
+    """
+    C = 1e-12  # 1 pF
+
+    voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
+    params = jnp.array([[C, 1.0, 27.0]], dtype=jnp.float64)  # C, m=1, tnom=27°C
+    old_state = jnp.empty((1, 0), dtype=jnp.float64)
+
+    cur, cond, chg, cap, _ = osdi_eval(capacitor_model.id, voltages, params, old_state)
+
+    # No resistive current or conductance for a pure capacitor
+    np.testing.assert_allclose(
+        cur,
+        np.zeros_like(cur),
+        atol=1e-30,
+        err_msg="Pure capacitor should produce no resistive current",
+    )
+    np.testing.assert_allclose(
+        cond,
+        np.zeros_like(cond),
+        atol=1e-30,
+        err_msg="Pure capacitor should have zero conductance",
+    )
+
+    # Q(P) = +C * V_PN = 1e-12,  Q(N) = -C * V_PN = -1e-12
+    expected_chg = np.array([[C, -C]])
+    np.testing.assert_allclose(
+        chg, expected_chg, rtol=1e-6, err_msg="Charge does not match Q = C * V"
+    )
+
+    # Capacitance matrix: [[C, -C], [-C, C]]  (row-major: [C_PP, C_PN, C_NP, C_NN])
+    expected_cap = np.array([[C, -C, -C, C]])
+    np.testing.assert_allclose(
+        cap,
+        expected_cap,
+        rtol=1e-6,
+        err_msg="Capacitance Jacobian (dQ/dV) is incorrect",
+    )
+
+
+def test_capacitor_jax_jvp(capacitor_model):
+    """
+    Verify that JAX's custom JVP routes the analytical OSDI capacitance Jacobians
+    correctly, enabling grad() through the reactive (charge) outputs.
+    """
+    C = 1e-12
+    voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
+    params = jnp.array([[C, 1.0, 27.0]], dtype=jnp.float64)
+    old_state = jnp.empty((1, 0), dtype=jnp.float64)
+
+    # d(Q_P)/d(V_P) = +C,  d(Q_P)/d(V_N) = -C
+    def pin_P_charge(v):
+        _, _, chg, _, _ = osdi_eval(capacitor_model.id, v, params, old_state)
+        return chg[0, 0]
+
+    gradient = jax.grad(pin_P_charge)(voltages)
+    expected = np.array([[C, -C]])
+
+    np.testing.assert_allclose(
+        gradient,
+        expected,
+        rtol=1e-6,
+        err_msg="JAX JVP did not correctly pipe OSDI capacitance Jacobians",
+    )
+
+
 def test_resistor_jit(resistor_model):
     """
     Verify that osdi_eval can be compiled by jax.jit and produces correct results.

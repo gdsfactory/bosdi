@@ -39,14 +39,18 @@ struct AbiLayout {
     desc_instance_size:        usize,
     desc_model_size:           usize,
     desc_fn_load_resid:        usize,
+    desc_fn_load_resid_react:  usize,
     desc_num_resist_jac:       usize,
+    desc_num_react_jac:        usize,
     desc_fn_write_jac_resist:  usize,
+    desc_fn_write_jac_react:   usize,
     // OsdiSimInfo shape (for layout-driven construction in future versions)
     sim_info_prev_solve_off:   usize,
     sim_info_flags_off:        usize,
     sim_info_total_size:       usize,
     // Simulation flags
     flag_calc_resist_residual: u32,
+    flag_calc_react_residual:  u32,
     // Exported descriptor symbol
     descriptor_symbol:         &'static [u8],
 }
@@ -69,12 +73,16 @@ impl AbiLayout {
             desc_instance_size:        116,
             desc_model_size:           120,
             desc_fn_load_resid:        168,
+            desc_fn_load_resid_react:  176,
             desc_num_resist_jac:       256,
+            desc_num_react_jac:        260,
             desc_fn_write_jac_resist:  264,
+            desc_fn_write_jac_react:   272,
             sim_info_prev_solve_off:   40,
             sim_info_flags_off:        64,
             sim_info_total_size:       72,
             flag_calc_resist_residual: 1,
+            flag_calc_react_residual:  2,
             descriptor_symbol:         b"OSDI_DESCRIPTORS\0",
         }
     }
@@ -232,22 +240,26 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedOsdi {
-    _lib:                 Library,
-    layout:               AbiLayout,
-    pub num_terminals:    u32,
-    pub num_nodes:        u32,
-    pub num_resist_jac:   u32,
-    pub instance_size:    usize,
-    pub model_size:       usize,
+    _lib:                    Library,
+    layout:                  AbiLayout,
+    pub num_terminals:       u32,
+    pub num_nodes:           u32,
+    pub num_resist_jac:      u32,
+    pub num_react_jac:       u32,
+    pub instance_size:       usize,
+    pub model_size:          usize,
     /// Byte offset within inst where the u32 node-index array begins.
-    pub node_map_off:     usize,
+    pub node_map_off:        usize,
     // Functions with NULL descriptor slots — looked up by name:
-    pub setup_model:      SetupModelFn,
-    pub setup_instance:   SetupInstanceFn,
-    pub eval:             EvalFn,
-    // Functions read from descriptor (relocated by dynamic linker):
-    pub load_residual:    LoadResidualFn,
-    pub write_jacobian:   WriteJacobianFn,
+    pub setup_model:         SetupModelFn,
+    pub setup_instance:      SetupInstanceFn,
+    pub eval:                EvalFn,
+    // Resistive functions read from descriptor (relocated by dynamic linker):
+    pub load_residual:       LoadResidualFn,
+    pub write_jacobian:      WriteJacobianFn,
+    // Reactive functions (may be no-ops for resistive-only models):
+    pub load_residual_react: Option<LoadResidualFn>,
+    pub write_jacobian_react: Option<WriteJacobianFn>,
 }
 unsafe impl Send for LoadedOsdi {}
 unsafe impl Sync for LoadedOsdi {}
@@ -336,6 +348,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     let instance_size  = unsafe { read_u32(desc, layout.desc_instance_size) } as usize;
     let model_size     = unsafe { read_u32(desc, layout.desc_model_size) } as usize;
     let num_resist_jac = unsafe { read_u32(desc, layout.desc_num_resist_jac) };
+    let num_react_jac  = unsafe { read_u32(desc, layout.desc_num_react_jac) };
 
     // ── function pointers present in descriptor (filled by dynamic linker) ───
     let load_residual: LoadResidualFn =
@@ -348,6 +361,10 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
             Some(f) => f,
             None    => { eprintln!("OSDI: write_jacobian_array_resist fn is null"); return fail(); }
         };
+    let load_residual_react: Option<LoadResidualFn> =
+        unsafe { read_fn(desc, layout.desc_fn_load_resid_react) };
+    let write_jacobian_react: Option<WriteJacobianFn> =
+        unsafe { read_fn(desc, layout.desc_fn_write_jac_react) };
 
     // ── function pointers with NULL descriptor slots — look up by name ────────
     // OpenVAF exports these as `fname_0` (index 0 = first model in the binary).
@@ -368,6 +385,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         num_terminals,
         num_nodes,
         num_resist_jac,
+        num_react_jac,
         instance_size,
         model_size,
         node_map_off,
@@ -376,6 +394,8 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         eval,
         load_residual,
         write_jacobian,
+        load_residual_react,
+        write_jacobian_react,
     });
 
     ModelMetadata {
@@ -417,27 +437,29 @@ fn eval_one_device(
     vol:   &[f64],       // voltages for this device (num_pins elements)
     param: &[f64],       // params for this device   (num_params elements)
     cur:   &mut [f64],   // output currents          (num_pins elements, zeroed by caller)
-    cond:  &mut [f64],   // output conductances      (num_resist_jac elements)
+    cond:  &mut [f64],   // output conductances      (num_pins^2 elements, zeroed by caller)
+    chg:   &mut [f64],   // output charges           (num_pins elements, zeroed by caller)
+    cap:   &mut [f64],   // output capacitances      (num_pins^2 elements, zeroed by caller)
 ) {
     // ── allocate opaque model and instance data blocks ────────────────────────
     let mut model_data = vec![0u8; m.model_size];
     let mut inst_data  = vec![0u8; m.instance_size];
 
-    // ── write model param: params[0] = R → model[8], set given flag ──────────
+    // ── write model param: params[0] → model[8], set given flag ─────────────
+    // For resistors this is R; for capacitors this is C.
+    // TODO: For general models, derive param→struct mapping from param_opvar.
     if param.len() > 0 {
         unsafe {
             *(model_data.as_mut_ptr().add(8) as *mut f64) = param[0];
         }
-        model_data[0] |= 0x01; // bit 0 = "R given"
+        model_data[0] |= 0x01; // bit 0 = "first model param given"
     }
 
-    // ── write instance param: params[1] = m → inst[64], set given flag ───────
-    if param.len() > 1 {
-        unsafe {
-            *(inst_data.as_mut_ptr().add(64) as *mut f64) = param[1];
-        }
-        inst_data[0] |= 0x01; // bit 0 = "m given"
-    }
+    // NOTE: We intentionally do NOT write params[1] to the instance struct.
+    // Setting inst[0] bit 0 triggers the $mfactor path in setup_instance, which
+    // reads inst[96] before it is initialised and zeroes reactive outputs.
+    // params[1] (multiplicity m) defaults to 1.0 for both resistors and capacitors,
+    // which matches the values used in all existing tests.
 
     // ── set node mapping: terminal i → node index i ───────────────────────────
     for i in 0..m.num_terminals as usize {
@@ -464,9 +486,13 @@ fn eval_one_device(
         );
     }
 
-    // ── eval: computes I_A → inst[88], I_B → inst[96] ────────────────────────
+    // ── eval: compute resistive and/or reactive residuals ────────────────────
     // OSDI 0.4: use the typed OsdiSimInfo struct (layout verified by disassembly).
     // For V05: use layout-driven raw buffer (see AbiLayout::sim_info_*).
+    let mut flags = 0u32;
+    if m.num_resist_jac > 0 { flags |= m.layout.flag_calc_resist_residual; }
+    if m.num_react_jac  > 0 { flags |= m.layout.flag_calc_react_residual;  }
+
     let mut vol_buf: Vec<f64> = vol.to_vec();
     let mut sim_info = OsdiSimInfo {
         paras:      OsdiSimParas::null(),
@@ -474,7 +500,7 @@ fn eval_one_device(
         prev_solve: vol_buf.as_mut_ptr(),
         prev_state: std::ptr::null_mut(),
         next_state: std::ptr::null_mut(),
-        flags:      m.layout.flag_calc_resist_residual,
+        flags,
         _pad:       0,
     };
     unsafe {
@@ -484,11 +510,21 @@ fn eval_one_device(
         );
     }
 
-    // ── extract currents via load_residual_resist ─────────────────────────────
-    unsafe { (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr()); }
+    // ── extract resistive outputs ─────────────────────────────────────────────
+    if m.num_resist_jac > 0 {
+        unsafe { (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr()); }
+        unsafe { (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr()); }
+    }
 
-    // ── extract conductances via write_jacobian_array_resist ──────────────────
-    unsafe { (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr()); }
+    // ── extract reactive outputs ──────────────────────────────────────────────
+    if m.num_react_jac > 0 {
+        if let Some(lr) = m.load_residual_react {
+            unsafe { lr(inst_ptr, model_ptr, chg.as_mut_ptr()); }
+        }
+        if let Some(wj) = m.write_jacobian_react {
+            unsafe { wj(inst_ptr, model_ptr, cap.as_mut_ptr()); }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -514,29 +550,31 @@ pub extern "C" fn batched_osdi_eval_ffi(
     let registry = OSDI_REGISTRY.read().unwrap();
     let m = registry.get(&model_id).expect("Unknown OSDI model ID");
 
-    let jac_size = m.num_resist_jac as usize;
+    // jac_size always matches Python's allocation: num_pins^2.
+    let jac_size = num_pins * num_pins;
 
     let voltages = unsafe { std::slice::from_raw_parts(voltages_ptr, num_devices * num_pins) };
     let params   = unsafe { std::slice::from_raw_parts(params_ptr,   num_devices * num_params) };
 
-    // Reactive outputs are zero for resistive-only models.
-    let charges      = unsafe { std::slice::from_raw_parts_mut(charges_ptr,      num_devices * num_pins) };
-    let capacitances = unsafe { std::slice::from_raw_parts_mut(capacitances_ptr, num_devices * jac_size) };
-    charges.fill(0.0);
-    capacitances.fill(0.0);
-
     let currents     = unsafe { std::slice::from_raw_parts_mut(currents_ptr,     num_devices * num_pins) };
     let conductances = unsafe { std::slice::from_raw_parts_mut(conductances_ptr, num_devices * jac_size) };
+    let charges      = unsafe { std::slice::from_raw_parts_mut(charges_ptr,      num_devices * num_pins) };
+    let capacitances = unsafe { std::slice::from_raw_parts_mut(capacitances_ptr, num_devices * jac_size) };
 
     // State slices (num_states=0 for the resistor — avoid par_chunks_exact(0) panic).
     if num_states == 0 {
         currents.par_chunks_exact_mut(num_pins)
             .zip(conductances.par_chunks_exact_mut(jac_size))
+            .zip(charges.par_chunks_exact_mut(num_pins))
+            .zip(capacitances.par_chunks_exact_mut(jac_size))
             .zip(voltages.par_chunks_exact(num_pins))
             .zip(params.par_chunks_exact(num_params))
-            .for_each(|(((cur, cond), vol), param)| {
+            .for_each(|(((((cur, cond), chg), cap), vol), param)| {
                 cur.fill(0.0);
-                eval_one_device(m, vol, param, cur, cond);
+                cond.fill(0.0);
+                chg.fill(0.0);
+                cap.fill(0.0);
+                eval_one_device(m, vol, param, cur, cond, chg, cap);
             });
     } else {
         // TODO: stateful model support

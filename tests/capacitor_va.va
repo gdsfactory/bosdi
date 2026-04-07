@@ -1,0 +1,19 @@
+`include "disciplines.vams"
+`include "constants.vams"
+
+// Simple linear capacitor: I = C * dV/dt
+// Pins: P (positive), N (negative)
+// Parameters: C (capacitance in Farads), m (multiplicity)
+module capacitor(P, N);
+
+    inout P, N;  // codespell:ignore inout
+    electrical P, N;
+
+    parameter real C = 1e-12 from (0:inf);  // Capacitance (F)
+    parameter real m = 1.0 from (0:inf);     // Multiplicity
+
+    analog begin
+        I(P, N) <+ m * C * ddt(V(P, N));
+    end
+
+endmodule
