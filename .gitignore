@@ -5,6 +5,7 @@
 # build artifacts
 build/
 target/
+_nanobind_src/
 __pycache__/
 *.pyc
 *.so

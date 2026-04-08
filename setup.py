@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import subprocess
 import tomllib
 from setuptools import Extension, setup
@@ -14,13 +15,38 @@ _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def get_include_dirs():
     dirs = []
-    # ... (Keep the exact same get_include_dirs() function from before) ...
+
+    # JAX/XLA headers — try jax.ffi.include_dir() first, fall back to jaxlib path
+    found_xla = False
     try:
         import jax.ffi
 
-        dirs.append(jax.ffi.include_dir())
-    except ImportError:
+        jax_inc = jax.ffi.include_dir()
+        if os.path.exists(os.path.join(jax_inc, "xla", "ffi", "api", "ffi.h")):
+            dirs.append(jax_inc)
+            found_xla = True
+    except (ImportError, AttributeError):
         pass
+
+    if not found_xla:
+        candidates = []
+        try:
+            import jaxlib
+
+            jaxlib_dir = os.path.dirname(os.path.abspath(jaxlib.__file__))
+            candidates += [os.path.join(jaxlib_dir, "include"), jaxlib_dir]
+        except ImportError:
+            pass
+        candidates += [os.path.join(sys.prefix, "include"), os.getcwd()]
+        for cand in candidates:
+            if os.path.exists(os.path.join(cand, "xla", "ffi", "api", "ffi.h")):
+                dirs.append(cand)
+                found_xla = True
+                break
+
+    if not found_xla:
+        print("WARNING: could not find xla/ffi/api/ffi.h — build will likely fail")
+
     dirs.append(nanobind.include_dir())
     return dirs
 
@@ -59,10 +85,17 @@ class BuildExt(build_ext):
         super().build_extension(ext)
 
 
-# Combine your shim with the Nanobind core logic
-nanobind_src = os.path.join(
-    os.path.dirname(nanobind.__file__), "src", "nb_combined.cpp"
+# Copy the entire nanobind src/ directory into the build tree.
+# nb_combined.cpp #includes sibling .cpp files, so the whole directory is needed.
+# A relative path is also required — absolute paths are rejected when building from an sdist.
+_nb_src_dir = os.path.join(_ROOT_DIR, "_nanobind_src")
+if os.path.exists(_nb_src_dir):
+    shutil.rmtree(_nb_src_dir)
+shutil.copytree(
+    os.path.join(os.path.dirname(nanobind.__file__), "src"),
+    _nb_src_dir,
 )
+nanobind_src = "_nanobind_src/nb_combined.cpp"
 
 osdi_extension = Extension(
     "osdi_shim_nb",

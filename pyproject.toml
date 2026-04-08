@@ -3,8 +3,8 @@ name = "bosdi"
 version = "0.1.0"
 description = "Make OSDI device models (Verilog-A compiled to .osdi) differentiable via JAX"
 readme = "README.md"
-requires-python = ">=3.13, <3.14"
-license = { text = "MIT" }
+requires-python = ">=3.12"
+license = "MIT"
 authors = [{ name = "Chris Daunt", email = "chris@gdsfactory.com" }]
 keywords = [
   "JAX",
@@ -14,9 +14,12 @@ keywords = [
   "circuit simulation"
 ]
 classifiers = [
-  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
@@ -37,27 +40,42 @@ build-backend = "setuptools.build_meta"
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = ["linux-64", "win-64", "osx-arm64"]
 
 # In a pyproject.toml, Pixi treats standard `dependencies` as PyPI packages.
 # If you want JAX pulled from conda-forge, they must go here instead:
 [tool.pixi.dependencies]
-jax = ">=0.7.0,<0.8"
-jaxlib = ">=0.7.0,<0.8"
 pytest = ">=9.0.2,<10"
 nanobind = ">=2.12.0,<3"
 setuptools = ">=82.0.1,<83"
 tsl_robin_map = ">=1.4.0,<2"
 pre-commit = ">=4.5.1,<5"
-ty = ">=0.0.26,<0.0.27"
 numpy = ">=2.4.3,<3"
 python-build = ">=1.2.2,<2"
+wheel = ">=0.45.0,<1"
+
+[tool.pixi.pypi-dependencies]
+jax = ">=0.7.0,<0.8"  # needs to be installed from pypi for windows support
+jaxlib = ">=0.7.0,<0.8"
+
+[tool.pixi.feature.py312.dependencies]
+python = "3.12.*"
+
+[tool.pixi.feature.py313.dependencies]
+python = "3.13.*"
+
+[tool.pixi.environments]
+default = { features = ["py313"], solve-group = "py313" }
+py312 = { features = ["py312"], solve-group = "py312" }
+py313 = { features = ["py313"], solve-group = "py313" }
 
 [tool.pixi.tasks]
 test = "pytest -v"
 build = "python setup.py build_ext --inplace"
 build-clean = "rm -rf build/ && find . -name 'osdi_shim_nb*.so' -delete && python setup.py build_ext --inplace"
-dist = "python -m build"
+wheel = "python -m build --no-isolation --wheel"
+sdist = "python -m build --no-isolation --sdist"
+dist = "python -m build --no-isolation --wheel && python -m build --no-isolation --sdist"
 
 # --- PYTEST CONFIGURATION ---
 [tool.pytest.ini_options]
