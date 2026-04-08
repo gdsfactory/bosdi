@@ -22,7 +22,7 @@ All commands should be run inside the Pixi environment. If Pixi is not activated
 
 ## Architecture
 
-BODI is a three-layer bridge that makes OSDI device models (Verilog-A compiled to `.osdi` ELF binaries) differentiable
+BOSDI is a three-layer bridge that makes OSDI device models (Verilog-A compiled to `.osdi` ELF binaries) differentiable
 via JAX.
 
 ### Layer 1 — Rust (`src/lib.rs`)
@@ -34,7 +34,7 @@ Core engine. Exposes two C FFI functions:
 - `batched_osdi_eval_ffi()`: Uses Rayon parallel iterators to evaluate N device instances simultaneously, zero-copy by
   zipping input/output array chunks.
 
-Built as a `staticlib` (`libbodi.a`), linked into the C++ extension at build time.
+Built as a `staticlib` (`libbosdi.a`), linked into the C++ extension at build time.
 
 ### Layer 2 — C++ (`src/osdi_shim.cpp`)
 
@@ -71,7 +71,7 @@ Outputs per device: `[currents, conductances, charges, capacitances]` — all `f
 
 `setup.py` orchestrates the two-stage build:
 
-1. `cargo build --release` → produces `target/release/libbodi.a`
-1. Compiles `osdi_shim.cpp` with nanobind and JAX FFI headers, links against `libbodi.a`
+1. `cargo build --release` → produces `target/release/libbosdi.a`
+1. Compiles `osdi_shim.cpp` with nanobind and JAX FFI headers, links against `libbosdi.a`
 
 The Pixi environment (Python 3.13, Linux-64) provides JAX, jaxlib, nanobind, and all C++ headers.

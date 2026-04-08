@@ -1,11 +1,13 @@
 [package]
-name = "bodi"
-version = "0.1.0"
+name = "bosdi"
+version = "0.1.0"  # Keep in sync with pyproject.toml [project].version
 edition = "2021"
+description = "Rust core for BOSDI: batched OSDI device model evaluation via libloading + Rayon"
+license = "MIT"
 
 [lib]
 crate-type = ["staticlib"]
-name = "bodi"
+name = "bosdi"
 
 [dependencies]
 lazy_static = "1.4"

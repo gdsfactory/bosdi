@@ -1,4 +1,9 @@
-# bodi
+# bosdi
+
+![CI](https://github.com/OWNER/bosdi/actions/workflows/test.yml/badge.svg)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
+![Platform: Linux x86-64](https://img.shields.io/badge/platform-linux--x86--64-lightgrey)
 
 Make [OSDI](https://github.com/OpenVAF/OpenVAF) device models (Verilog-A compiled to `.osdi` binaries) differentiable
 via JAX.
@@ -34,9 +39,20 @@ Python: osdi_eval()  →  JAX XLA custom call "OsdiEvalCpu"
 - **`src/osdi_jax.py`** — JAX wrapper with `@custom_jvp` for autodiff
 - **`src/osdi_loader.py`** — Python model loader returning metadata + buffer helpers
 
-## Requirements
+## Installation
 
-Linux x86-64, Python 3.13, Rust toolchain. All Python/C++ dependencies managed by [Pixi](https://pixi.sh).
+### Using Pixi (recommended for development)
+
+```bash
+git clone https://github.com/OWNER/bosdi && cd bosdi
+pixi run build
+```
+
+### Using pip (Linux x86-64, Python 3.13, Rust toolchain required)
+
+```bash
+pip install bosdi
+```
 
 ## Build & test
 
@@ -47,3 +63,9 @@ pixi run test    # run pytest suite
 # single test
 pixi run pytest tests/test_osdi.py::test_resistor_dc_evaluation -v
 ```
+
+## Limitations
+
+- Linux x86-64 only
+- Python 3.13 only
+- OSDI 0.4 ABI only

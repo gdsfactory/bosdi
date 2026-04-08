@@ -1,9 +1,13 @@
 import os
 import sys
 import subprocess
+import tomllib
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 import nanobind
+
+with open(os.path.join(os.path.dirname(__file__), "pyproject.toml"), "rb") as _f:
+    _version = tomllib.load(_f)["project"]["version"]
 
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,7 +37,7 @@ class BuildExt(build_ext):
 
             # 2. Locate the output static library
             rust_target_dir = os.path.join(_ROOT_DIR, "target", "release")
-            static_lib_name = "bodi.lib" if sys.platform == "win32" else "libbodi.a"
+            static_lib_name = "bosdi.lib" if sys.platform == "win32" else "libbosdi.a"
             static_lib_path = os.path.join(rust_target_dir, static_lib_name)
 
             # 3. Link the Rust library
@@ -68,8 +72,8 @@ osdi_extension = Extension(
 )
 
 setup(
-    name="bodi",
-    version="0.1.0",
+    name="bosdi",
+    version=_version,
     # --- THIS IS THE KEY CHANGE ---
     package_dir={"": "src"},
     py_modules=["osdi_loader", "osdi_jax"],
