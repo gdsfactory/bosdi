@@ -48,6 +48,12 @@ def get_include_dirs():
         print("WARNING: could not find xla/ffi/api/ffi.h — build will likely fail")
 
     dirs.append(nanobind.include_dir())
+    # nanobind bundles tsl-robin-map; add it so nb_combined.cpp can find tsl/robin_map.h
+    tsl_dir = os.path.join(
+        os.path.dirname(nanobind.__file__), "ext", "robin_map", "include"
+    )
+    if os.path.exists(tsl_dir):
+        dirs.append(tsl_dir)
     return dirs
 
 

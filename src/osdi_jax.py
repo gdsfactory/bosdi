@@ -47,7 +47,11 @@ def osdi_eval(model_id, voltages, params, old_state):
     )
 
     # ffi_call(name, out_shapes) returns a callable; pass inputs to that callable.
-    return jffi.ffi_call("OsdiEvalCpu", out_shapes)(m_id, v, p, s)
+    # vmap_method="sequential" is required in JAX 0.7+ so that transformations
+    # (jacfwd, grad, etc.) that internally use vmap can handle the ffi_call.
+    return jffi.ffi_call("OsdiEvalCpu", out_shapes, vmap_method="sequential")(
+        m_id, v, p, s
+    )
 
 
 # 4. DIFFERENTIATION (Analytical chain rule)

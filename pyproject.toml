@@ -3,7 +3,7 @@ name = "bosdi"
 version = "0.1.0"
 description = "Make OSDI device models (Verilog-A compiled to .osdi) differentiable via JAX"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Chris Daunt", email = "chris@gdsfactory.com" }]
 keywords = [
@@ -18,6 +18,7 @@ classifiers = [
   "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Rust",
@@ -41,6 +42,31 @@ build-backend = "setuptools.build_meta"
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64", "win-64", "osx-arm64"]
+preview = ["pixi-build"]
+
+[tool.pixi.package]
+name = "bosdi"
+version = "0.1.0"
+
+[tool.pixi.package.build]
+backend = { name = "pixi-build-python", version = "*" }
+
+[tool.pixi.package.build.config]
+compilers = ["cxx"]
+
+[tool.pixi.package.host-dependencies]
+python = ">=3.11"
+setuptools = ">=61.0.0"
+wheel = "*"
+nanobind = ">=2.0.0"
+tsl_robin_map = ">=1.4.0"
+rust = "*"  # provides cargo for the setup.py build step
+jaxlib = ">=0.7.0,<0.8"  # provides XLA FFI headers found by setup.py
+
+[tool.pixi.package.run-dependencies]
+python = ">=3.11"
+jax = ">=0.7.0,<0.8"
+jaxlib = ">=0.7.0,<0.8"
 
 # In a pyproject.toml, Pixi treats standard `dependencies` as PyPI packages.
 # If you want JAX pulled from conda-forge, they must go here instead:
@@ -58,24 +84,35 @@ wheel = ">=0.45.0,<1"
 jax = ">=0.7.0,<0.8"  # needs to be installed from pypi for windows support
 jaxlib = ">=0.7.0,<0.8"
 
+[tool.pixi.feature.py311.dependencies]
+python = "3.11.*"
+
 [tool.pixi.feature.py312.dependencies]
 python = "3.12.*"
 
 [tool.pixi.feature.py313.dependencies]
 python = "3.13.*"
 
+[tool.pixi.feature.py314.dependencies]
+python = "3.14.*"
+
 [tool.pixi.environments]
 default = { features = ["py313"], solve-group = "py313" }
+py311 = { features = ["py311"], solve-group = "py311" }
 py312 = { features = ["py312"], solve-group = "py312" }
 py313 = { features = ["py313"], solve-group = "py313" }
+py314 = { features = ["py314"], solve-group = "py314" }
 
 [tool.pixi.tasks]
 test = "pytest -v"
 build = "python setup.py build_ext --inplace"
 build-clean = "rm -rf build/ && find . -name 'osdi_shim_nb*.so' -delete && python setup.py build_ext --inplace"
+# Wheel must use --no-isolation so the pixi env provides jaxlib's XLA FFI headers.
+# sdist can use uv build directly (no native compilation needed).
 wheel = "python -m build --no-isolation --wheel"
-sdist = "python -m build --no-isolation --sdist"
-dist = "python -m build --no-isolation --wheel && python -m build --no-isolation --sdist"
+sdist = "uv build --sdist"
+dist = "uv build --sdist && python -m build --no-isolation --wheel"
+publish = "uv publish dist/*"
 
 # --- PYTEST CONFIGURATION ---
 [tool.pytest.ini_options]
