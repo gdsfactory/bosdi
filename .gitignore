@@ -9,3 +9,8 @@ _nanobind_src/
 __pycache__/
 *.pyc
 *.so
+src/*.egg-info/*
+*.conda
+
+#vscode
+settings.json
