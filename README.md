@@ -1,27 +1,36 @@
-# bosdi
+# bosdi — Batched OSDI
 
 ![CI](https://github.com/OWNER/bosdi/actions/workflows/test.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
 ![Platform: Linux x86-64](https://img.shields.io/badge/platform-linux--x86--64-lightgrey)
 
-Make [OSDI](https://github.com/OpenVAF/OpenVAF) device models (Verilog-A compiled to `.osdi` binaries) differentiable
-via JAX.
+Batched evaluation of [OSDI](https://github.com/OpenVAF/OpenVAF) device models (Verilog-A compiled to `.osdi` binaries)
+with JAX differentiability.
 
 ## What it does
 
-Wraps OSDI 0.4 device models in a JAX custom call so you can use `jax.grad()` through them. Analytical Jacobians
-(conductances dI/dV, capacitances dQ/dV) are provided directly by the OSDI model — no finite differences. Batched
-evaluation runs in parallel via Rayon.
+Evaluates batches of N OSDI 0.4 device instances in parallel (via Rayon) inside a JAX XLA custom call, so you can use
+`jax.grad()` through the entire batch. Analytical Jacobians (conductances dI/dV, capacitances dQ/dV) come directly from
+the OSDI model — no finite differences.
 
 ```python
+import jax.numpy as jnp
 from osdi_loader import load_osdi_model
 from osdi_jax import osdi_eval
 
 model = load_osdi_model("path/to/device.osdi")
+
+# Batch of N devices evaluated in parallel via Rayon
+N = 1024
+voltages   = jnp.zeros((N, model.num_terminals - 1))  # per-device bias points
+params     = jnp.tile(model.default_params, (N, 1))   # per-device parameters
+old_state  = jnp.zeros((N, model.num_states))          # per-device internal state
+
+# Returns batched outputs — one row per device
 cur, cond, chg, cap, new_state = osdi_eval(model.id, voltages, params, old_state)
 
-# Full JAX AD support
+# jax.grad works through the batched call — no finite differences
 grad_fn = jax.grad(lambda v: osdi_eval(model.id, v, params, old_state)[0].sum())
 ```
 
