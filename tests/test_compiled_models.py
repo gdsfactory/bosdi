@@ -330,12 +330,25 @@ def test_compiled_inductor_l_param_affects_output():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  COMPLEX MODEL EVAL — smoke tests
-#     These run each complex model with $mfactor=1 and all other params at
-#     OSDI defaults (not given).  They verify the model evaluates without
-#     crashing and returns finite values.
+#
+#     Each entry: (name, voltages_np, expect_nonzero)
+#
+#     expect_nonzero=True  → assert at least one output (cur or cond) is non-zero.
+#                            Only set for models with num_states=0 that are known
+#                            to produce non-trivial physics at the given bias.
+#     expect_nonzero=False → stateful model (eval skipped, all outputs = 0) or
+#                            model with independent internal nodes stuck at 0 V.
+#
+#     Stateful models (num_states > 0): bosdi returns defined zeros — eval is not
+#     yet implemented for them.  The smoke test verifies no crash and correct shape.
+#
+#     vbic_vbic_4T_et_cf: has 0 states but 7 independent internal nodes with no
+#     collapsible pairs.  Those nodes stay at 0 V so the model sees zero junction
+#     voltage and produces zero current.  This is a known bosdi limitation for
+#     models that cannot be evaluated without a Newton solve.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SMOKE_XFAIL_REASON = {
+_SMOKE_CRASH_REASON = {
     "bsim4v8": (
         "bsim4v8.osdi setup_instance crashes (SIGSEGV) with default parameters. "
         "Root cause is under investigation; likely requires specific critical model "
@@ -347,50 +360,73 @@ _SMOKE_XFAIL_REASON = {
         "The 4-terminal VBIC model appears to access uninitialised memory during "
         "evaluation; the 5-terminal variant (vbic_4T_et_cf) does not crash."
     ),
+    "diode": (
+        "diode.osdi setup_model crashes (SIGSEGV) with default parameters. "
+        "The compiled OpenVAF diode model allocates noise parameter memory in "
+        "setup_model that segfaults; the spice_diode wrapper works correctly."
+    ),
 }
 
 
-def _smoke_xfail(name):
-    """Return a pytest.mark.xfail if name is in the known-crashing set."""
-    reason = _SMOKE_XFAIL_REASON.get(name)
-    if reason:
-        return pytest.mark.xfail(reason=reason, strict=True, run=False)
-    return pytest.mark.usefixtures()  # identity mark — no effect
-
-
 @pytest.mark.parametrize(
-    "name,voltages_np",
+    "name,voltages_np,expect_nonzero",
     [
-        ("psp103v4_psp103", [[1.0, 0.7, 0.0, 0.0]]),  # [Vd, Vg, Vs, Vb] — 4 pins
+        # ── PSP103 family (num_states=0, all collapsible → non-zero outputs) ──
+        ("psp103v4_psp103", [[1.0, 0.7, 0.0, 0.0]], True),  # 4 pins
+        ("psp103v4_psp103t", [[1.0, 0.7, 0.0, 0.0, 0.0]], True),  # 5 pins (thermal)
+        ("psp103v4_psp103_nqs", [[1.0, 0.7, 0.0, 0.0]], True),  # 4 pins (NQS)
+        ("psp103v4_juncap200", [[0.6, 0.0]], True),  # 2 pins (junction cap)
+        # ── bsimbulk (num_states=0, 9 collapsible pairs → non-zero outputs) ──
+        ("bsimbulk106", [[1.0, 0.7, 0.0, 0.0, 0.0]], True),  # 5 pins
+        # ── Known crashes — run=False so the process is not killed ────────────
         pytest.param(
             "bsim4v8",
-            [[1.0, 0.7, 0.0, 0.0]],  # crashes in setup_instance
+            [[1.0, 0.7, 0.0, 0.0]],
+            True,
             marks=pytest.mark.xfail(
-                reason=_SMOKE_XFAIL_REASON["bsim4v8"], strict=True, run=False
+                reason=_SMOKE_CRASH_REASON["bsim4v8"], strict=True, run=False
             ),
         ),
-        ("bsim3v3", [[1.0, 0.7, 0.0, 0.0]]),  # [Vd, Vg, Vs, Vb] — 4 pins
-        ("bsimbulk106", [[1.0, 0.7, 0.0, 0.0, 0.0]]),  # 5 pins (bulk ext.)
         pytest.param(
             "vbic_vbic_1p3",
-            [[1.0, 0.7, 0.0, 0.0]],  # crashes in eval()
+            [[1.0, 0.7, 0.0, 0.0]],
+            True,
             marks=pytest.mark.xfail(
-                reason=_SMOKE_XFAIL_REASON["vbic_vbic_1p3"], strict=True, run=False
+                reason=_SMOKE_CRASH_REASON["vbic_vbic_1p3"], strict=True, run=False
             ),
         ),
-        ("vbic_vbic_4T_et_cf", [[1.0, 0.7, 0.0, 0.0, 0.0]]),  # 5 pins (extra node)
+        pytest.param(
+            "diode",
+            [[0.6, 0.0]],
+            True,
+            marks=pytest.mark.xfail(
+                reason=_SMOKE_CRASH_REASON["diode"], strict=True, run=False
+            ),
+        ),
+        # ── Stateful models: eval skipped → all outputs are defined zeros ─────
+        # bsim3v3 has num_states=5; outputs are zero until stateful eval is added.
+        ("bsim3v3", [[1.0, 0.7, 0.0, 0.0]], False),
+        # ── Independent internal nodes → outputs are zero at this bias ─────────
+        # vbic_vbic_4T_et_cf has 0 states but 7 internal nodes with no collapsible
+        # pairs; those nodes stay at 0 V so junctions see zero voltage → zero I.
+        ("vbic_vbic_4T_et_cf", [[1.0, 0.7, 0.0, 0.0, 0.0]], False),
     ],
 )
-def test_complex_model_eval_smoke(name, voltages_np):
-    """Complex model must evaluate without crash and return finite values.
-    Only $mfactor=1 is set; all other parameters are NaN (→ Verilog-A defaults).
+def test_complex_model_eval_smoke(name, voltages_np, expect_nonzero):
+    """Complex model must evaluate without crash, return finite values, and
+    produce non-zero outputs when the model is physically biased into conduction.
+
+    expect_nonzero=True:  model has num_states=0 and all internal nodes collapse
+                          to terminals, so it must produce non-zero I or G.
+    expect_nonzero=False: stateful model (eval returns defined zeros) or model
+                          with independent internal nodes stuck at 0 V.
     """
     model = load_osdi_model(str(compiled_dir / f"{name}.osdi"))
     voltages = jnp.array(voltages_np, dtype=jnp.float64)
     # NaN for all params → use Verilog-A defaults; only set $mfactor=1.
     params = jnp.full((1, model.num_params), jnp.nan, dtype=jnp.float64)
     params = params.at[0, 0].set(1.0)
-    state = jnp.empty((1, model.num_states), dtype=jnp.float64)
+    state = jnp.zeros((1, model.num_states), dtype=jnp.float64)
 
     cur, cond, chg, cap, _ = osdi_eval(model.id, voltages, params, state)
 
@@ -398,3 +434,10 @@ def test_complex_model_eval_smoke(name, voltages_np):
     assert jnp.all(jnp.isfinite(cond)), f"{name}: non-finite conductances"
     assert cur.shape == (1, model.num_pins)
     assert cond.shape == (1, model.num_pins**2)
+
+    if expect_nonzero:
+        nz = int(jnp.sum(cur != 0) + jnp.sum(cond != 0))
+        assert nz > 0, (
+            f"{name}: all currents and conductances are zero at the given bias — "
+            "model is not producing output (check collapsible pairs and Jacobian flags)"
+        )

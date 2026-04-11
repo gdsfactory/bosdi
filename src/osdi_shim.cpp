@@ -24,6 +24,9 @@ extern "C" {
     // Phase 1: The loader — version selects the ABI layout in Rust
     ModelMetadata load_osdi_library(const char* path_ptr, uint32_t version);
 
+    // Diagnostic
+    void dump_model_info(uint32_t model_id);
+
     // Phase 2: The batched execution (Rayon zipper in Rust)
     void batched_osdi_eval_ffi(
         uint32_t model_id,
@@ -126,4 +129,8 @@ NB_MODULE(osdi_shim_nb, m) {
     m.def("batched_osdi_eval", []() {
         return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET");
     });
+
+    m.def("dump_model_info", [](uint32_t model_id) {
+        dump_model_info(model_id);
+    }, nb::arg("model_id"));
 }

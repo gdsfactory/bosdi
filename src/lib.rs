@@ -44,6 +44,9 @@ struct AbiLayout {
     desc_num_react_jac:        usize,
     desc_fn_write_jac_resist:  usize,
     desc_fn_write_jac_react:   usize,
+    // Collapsible node pairs (internal node → terminal short-circuit when element = 0)
+    desc_num_collapsible:      usize,  // +40: count of collapsible pairs
+    desc_collapsible:          usize,  // +48: ptr to OsdiCollapsibleNode[]
     // Jacobian entry array (for mapping write_jacobian output to terminal pairs)
     desc_num_jac_entries:      usize,  // +24: total count (resist + react)
     desc_jac_entries:          usize,  // +32: ptr to OsdiJacobianEntry[]
@@ -57,8 +60,10 @@ struct AbiLayout {
     sim_info_flags_off:        usize,
     sim_info_total_size:       usize,
     // Simulation flags
-    flag_calc_resist_residual: u32,
-    flag_calc_react_residual:  u32,
+    flag_calc_resist_residual:  u32,
+    flag_calc_react_residual:   u32,
+    flag_calc_resist_jacobian:  u32,
+    flag_calc_react_jacobian:   u32,
     // Exported descriptor symbol
     descriptor_symbol:         &'static [u8],
 }
@@ -86,6 +91,8 @@ impl AbiLayout {
             desc_num_react_jac:        260,
             desc_fn_write_jac_resist:  264,
             desc_fn_write_jac_react:   272,
+            desc_num_collapsible:      40,
+            desc_collapsible:          48,
             desc_num_jac_entries:      24,
             desc_jac_entries:          32,
             desc_param_opvar:          88,
@@ -95,8 +102,10 @@ impl AbiLayout {
             sim_info_prev_solve_off:   40,
             sim_info_flags_off:        64,
             sim_info_total_size:       72,
-            flag_calc_resist_residual: 1,
-            flag_calc_react_residual:  2,
+            flag_calc_resist_residual:  1,
+            flag_calc_react_residual:   2,
+            flag_calc_resist_jacobian:  4,
+            flag_calc_react_jacobian:   8,
             descriptor_symbol:         b"OSDI_DESCRIPTORS\0",
         }
     }
@@ -329,6 +338,11 @@ struct LoadedOsdi {
     pub resist_jac_pairs:     Vec<(u32, u32)>,
     /// (node_1, node_2) for each reactive Jacobian entry, in write order.
     pub react_jac_pairs:      Vec<(u32, u32)>,
+    /// Collapsible node pairs from the descriptor. When a coupling element
+    /// (e.g. drain series resistance) is zero, these two nodes become
+    /// electrically identical. bosdi always collapses them so internal node
+    /// voltages match their terminal counterparts.
+    pub collapsible_pairs:    Vec<(u32, u32)>,
 }
 unsafe impl Send for LoadedOsdi {}
 unsafe impl Sync for LoadedOsdi {}
@@ -470,6 +484,27 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         }
     }
 
+    // ── collapsible node pairs ────────────────────────────────────────────────
+    // OsdiCollapsibleNode: {node_1: u32, node_2: u32} = 8 bytes.
+    // When the coupling element between node_1 and node_2 is zero, the simulator
+    // collapses them to the same MNA row. bosdi always collapses them so internal
+    // node voltages match their terminal counterparts and device current reaches
+    // the terminal outputs correctly.
+    let num_collapsible = unsafe { read_u32(desc, layout.desc_num_collapsible) };
+    let collapsible_pairs: Vec<(u32, u32)> = if num_collapsible > 0 {
+        let coll_ptr = unsafe {
+            let ptr_val = (desc.add(layout.desc_collapsible) as *const usize).read_unaligned();
+            ptr_val as *const u8
+        };
+        (0..num_collapsible as usize).map(|i| {
+            let n1 = unsafe { read_u32(coll_ptr.add(i * 8), 0) };
+            let n2 = unsafe { read_u32(coll_ptr.add(i * 8), 4) };
+            (n1, n2)
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
     // ── access and given_flag function pointers ───────────────────────────────
     let access: AccessFn = match unsafe { read_fn(desc, layout.desc_fn_access) } {
         Some(f) => f,
@@ -520,6 +555,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         param_flags,
         resist_jac_pairs,
         react_jac_pairs,
+        collapsible_pairs,
     });
 
     ModelMetadata {
@@ -565,15 +601,43 @@ fn eval_one_device(
     let mut model_data = vec![0u8; m.model_size];
     let mut inst_data  = vec![0u8; m.instance_size];
 
-    // ── set node mapping: node i → index i for all nodes ─────────────────────
-    // We map ALL nodes (including internal ones) to their own unique index so
-    // that load_residual / write_jacobian can write to a buffer of size num_nodes
-    // without aliasing terminal entries with internal ones.
-    for i in 0..m.num_nodes as usize {
-        unsafe {
-            *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) = i as i32;
+    // ── set node mapping with OSDI collapsing ────────────────────────────────
+    // Start with identity: node i → slot i.
+    let mut node_map: Vec<i32> = (0..m.num_nodes as i32).collect();
+
+    // Apply collapsible pairs: when coupling element is zero the two nodes share
+    // a slot.  We always collapse — bosdi evaluates at a single point and doesn't
+    // know the coupling element values.  Collapsing ensures internal nodes (e.g.
+    // PSP103's Dint/Sint) inherit the voltage of their terminal counterparts so
+    // the model sees the correct V_DS and can produce non-zero drain current.
+    //
+    // Strategy: iterate pairs; whichever node has the lower slot gets to "own"
+    // the merged slot, so terminals (low indices 0..num_terminals) tend to win.
+    for &(n1, n2) in &m.collapsible_pairs {
+        let (n1, n2) = (n1 as usize, n2 as usize);
+        if n1 >= m.num_nodes as usize || n2 >= m.num_nodes as usize { continue; }
+        // Follow any existing chain (in case of multi-hop collapsing)
+        let slot1 = node_map[n1];
+        let slot2 = node_map[n2];
+        let merged = slot1.min(slot2);
+        // Map both to the lower slot; also redirect any other node already
+        // pointing at the higher slot.
+        let higher = slot1.max(slot2);
+        for slot in node_map.iter_mut() {
+            if *slot == higher { *slot = merged; }
         }
     }
+
+    // Write the final node_map into the instance data block.
+    for (i, &slot) in node_map.iter().enumerate() {
+        unsafe {
+            *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) = slot;
+        }
+    }
+
+    // Effective number of distinct slots used (after collapsing).
+    let num_slots = node_map.iter().max().map(|&m| m as usize + 1)
+                    .unwrap_or(m.num_nodes as usize);
 
     let model_ptr = model_data.as_mut_ptr() as *mut c_void;
     let inst_ptr  = inst_data.as_mut_ptr() as *mut c_void;
@@ -659,17 +723,26 @@ fn eval_one_device(
     // OSDI 0.4: use the typed OsdiSimInfo struct (layout verified by disassembly).
     // For V05: use layout-driven raw buffer (see AbiLayout::sim_info_*).
     let mut flags = 0u32;
-    if m.num_resist_jac > 0 { flags |= m.layout.flag_calc_resist_residual; }
-    if m.num_react_jac  > 0 { flags |= m.layout.flag_calc_react_residual;  }
+    if m.num_resist_jac > 0 {
+        flags |= m.layout.flag_calc_resist_residual;
+        flags |= m.layout.flag_calc_resist_jacobian;
+    }
+    if m.num_react_jac > 0 {
+        flags |= m.layout.flag_calc_react_residual;
+        flags |= m.layout.flag_calc_react_jacobian;
+    }
 
-    // ── voltage buffer: num_nodes entries, terminals filled, internals at 0V ──
-    // eval() reads prev_solve[node_mapping[i]] = prev_solve[i] for each node i.
-    // Terminal voltages come from the caller; internal nodes start at 0V.
-    let num_nodes = m.num_nodes as usize;
+    // ── voltage buffer: num_slots entries, indexed by node_map slot ─────────
+    // eval() reads prev_solve[node_map[i]] for each node i.
+    // After collapsing, collapsed internal nodes share their terminal's slot, so
+    // they see the correct terminal voltage instead of 0V.
     let num_terms = m.num_terminals as usize;
-    let mut vol_buf = vec![0.0f64; num_nodes];
-    let copy_len = vol.len().min(num_terms);
-    vol_buf[..copy_len].copy_from_slice(&vol[..copy_len]);
+    let mut vol_buf = vec![0.0f64; num_slots];
+    // Fill terminal slots from caller voltages
+    for (term_idx, &v) in vol.iter().enumerate().take(num_terms) {
+        let slot = node_map[term_idx] as usize;
+        vol_buf[slot] = v;
+    }
 
     let mut sim_info = OsdiSimInfo {
         paras:      OsdiSimParas::null(),
@@ -688,22 +761,28 @@ fn eval_one_device(
     }
 
     // ── extract resistive outputs ─────────────────────────────────────────────
-    // load_residual writes to dst[node_mapping[i]] = dst[i] for each node.
-    // We use a num_nodes-sized buffer, then copy only terminal entries to cur.
+    // load_residual writes to dst[node_map[i]] for each node i, accumulating
+    // contributions from collapsed nodes into their shared terminal slot.
+    // The dst buffer must cover all slots (num_slots).
     if m.num_resist_jac > 0 {
-        let mut cur_all = vec![0.0f64; num_nodes];
+        let mut cur_all = vec![0.0f64; num_slots];
         unsafe { (m.load_residual)(inst_ptr, model_ptr, cur_all.as_mut_ptr()); }
-        cur[..num_terms].copy_from_slice(&cur_all[..num_terms]);
+        // Copy terminal slots to output. With collapsing, terminal slot = terminal index.
+        for t in 0..num_terms {
+            let slot = node_map[t] as usize;
+            cur[t] = cur_all[slot];
+        }
 
-        // write_jacobian writes num_resist_jac values, one per resistive entry.
-        // We scatter only terminal-to-terminal entries into the dense output.
+        // write_jacobian writes num_resist_jac values. After collapsing, scatter
+        // using the mapped (collapsed) node indices: pair (n1,n2) maps to
+        // (node_map[n1], node_map[n2]) and is terminal-terminal if both slots < num_terms.
         let mut jac_buf = vec![0.0f64; m.num_resist_jac as usize];
         unsafe { (m.write_jacobian)(inst_ptr, model_ptr, jac_buf.as_mut_ptr()); }
         for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
-            let n1 = n1 as usize;
-            let n2 = n2 as usize;
-            if n1 < num_terms && n2 < num_terms {
-                cond[n1 * num_terms + n2] += jac_buf[idx];
+            let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+            let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
+            if s1 >= 0 && s2 >= 0 && (s1 as usize) < num_terms && (s2 as usize) < num_terms {
+                cond[s1 as usize * num_terms + s2 as usize] += jac_buf[idx];
             }
         }
     }
@@ -711,18 +790,21 @@ fn eval_one_device(
     // ── extract reactive outputs ──────────────────────────────────────────────
     if m.num_react_jac > 0 {
         if let Some(lr) = m.load_residual_react {
-            let mut chg_all = vec![0.0f64; num_nodes];
+            let mut chg_all = vec![0.0f64; num_slots];
             unsafe { lr(inst_ptr, model_ptr, chg_all.as_mut_ptr()); }
-            chg[..num_terms].copy_from_slice(&chg_all[..num_terms]);
+            for t in 0..num_terms {
+                let slot = node_map[t] as usize;
+                chg[t] = chg_all[slot];
+            }
         }
         if let Some(wj) = m.write_jacobian_react {
             let mut jac_buf = vec![0.0f64; m.num_react_jac as usize];
             unsafe { wj(inst_ptr, model_ptr, jac_buf.as_mut_ptr()); }
             for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
-                let n1 = n1 as usize;
-                let n2 = n2 as usize;
-                if n1 < num_terms && n2 < num_terms {
-                    cap[n1 * num_terms + n2] += jac_buf[idx];
+                let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
+                if s1 >= 0 && s2 >= 0 && (s1 as usize) < num_terms && (s2 as usize) < num_terms {
+                    cap[s1 as usize * num_terms + s2 as usize] += jac_buf[idx];
                 }
             }
         }
@@ -747,7 +829,7 @@ pub extern "C" fn batched_osdi_eval_ffi(
     conductances_ptr: *mut f64,
     charges_ptr:      *mut f64,
     capacitances_ptr: *mut f64,
-    _new_state_ptr:   *mut f64,
+    new_state_ptr:    *mut f64,
 ) {
     let registry = OSDI_REGISTRY.read().unwrap();
     let m = registry.get(&model_id).expect("Unknown OSDI model ID");
@@ -779,7 +861,111 @@ pub extern "C" fn batched_osdi_eval_ffi(
                 eval_one_device(m, vol, param, cur, cond, chg, cap);
             });
     } else {
-        // TODO: stateful model support
+        // Stateful model support is not yet implemented.
+        // Zero all output buffers so callers receive defined (zero) values rather
+        // than uninitialized memory.  The XLA runtime does NOT guarantee that
+        // output buffers are zeroed before calling the FFI handler.
         eprintln!("OSDI: stateful models not yet supported (num_states={})", num_states);
+        currents.fill(0.0);
+        conductances.fill(0.0);
+        charges.fill(0.0);
+        capacitances.fill(0.0);
+        let new_state = unsafe {
+            std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
+        };
+        new_state.fill(0.0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. DIAGNOSTIC — dump model internals for debugging
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Print a detailed report of param flags, Jacobian entry pairs, and function
+/// pointer addresses for a loaded model.  Called from Python via nanobind.
+#[no_mangle]
+pub extern "C" fn dump_model_info(model_id: u32) {
+    let registry = OSDI_REGISTRY.read().unwrap();
+    let m = match registry.get(&model_id) {
+        Some(m) => m,
+        None => { eprintln!("dump_model_info: unknown model_id={model_id}"); return; }
+    };
+
+    println!("=== Model {} ===", model_id);
+    println!("  num_nodes={} num_terminals={}", m.num_nodes, m.num_terminals);
+    println!("  instance_size={} model_size={}", m.instance_size, m.model_size);
+    println!("  node_map_off={}", m.node_map_off);
+    println!("  num_resist_jac={} num_react_jac={}", m.num_resist_jac, m.num_react_jac);
+
+    println!("\n  param_flags (first 20 of {}):", m.param_flags.len());
+    for (i, &f) in m.param_flags.iter().enumerate().take(20) {
+        let kind = (f >> 30) & 3;
+        let ty   = f & 3;
+        let kind_s = ["MODEL","INST","OPVAR","?"][kind as usize];
+        let ty_s   = ["REAL","INT","STR","?"][ty as usize];
+        println!("    [{i:3}] flags=0x{f:08x}  kind={kind_s}  ty={ty_s}");
+    }
+    if m.param_flags.len() > 20 {
+        // count kinds across all params
+        let (n_model, n_inst, n_opvar) = m.param_flags.iter().fold((0usize,0,0), |(a,b,c), &f| {
+            let k = (f >> 30) & 3;
+            match k { 0 => (a+1,b,c), 1 => (a,b+1,c), 2 => (a,b,c+1), _ => (a,b,c) }
+        });
+        println!("    ... ({} total: {} MODEL, {} INST, {} OPVAR)",
+                 m.param_flags.len(), n_model, n_inst, n_opvar);
+    }
+
+    // Build node_map as eval_one_device would
+    let mut dbg_node_map: Vec<i32> = (0..m.num_nodes as i32).collect();
+    for &(n1, n2) in &m.collapsible_pairs {
+        let (n1, n2) = (n1 as usize, n2 as usize);
+        if n1 < m.num_nodes as usize && n2 < m.num_nodes as usize {
+            let s1 = dbg_node_map[n1]; let s2 = dbg_node_map[n2];
+            let merged = s1.min(s2); let higher = s1.max(s2);
+            for s in dbg_node_map.iter_mut() { if *s == higher { *s = merged; } }
+        }
+    }
+    let dbg_num_slots = dbg_node_map.iter().max().map(|&m| m as usize + 1)
+        .unwrap_or(m.num_nodes as usize);
+    println!("\n  node_map after collapsing: {:?}", dbg_node_map);
+    println!("  num_slots={}", dbg_num_slots);
+
+    println!("\n  resist_jac_pairs (first 16 of {}):", m.resist_jac_pairs.len());
+    for (i, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate().take(16) {
+        let is_terminal = n1 < m.num_terminals && n2 < m.num_terminals;
+        println!("    [{i:2}] ({n1}, {n2}){}",
+                 if is_terminal { " ← terminal-terminal" } else { "" });
+    }
+
+    // Count and list terminal-terminal pairs AFTER collapsing
+    let nt = m.num_terminals as usize;
+    let tt_resist: Vec<_> = m.resist_jac_pairs.iter().enumerate().filter_map(|(idx, &(n1,n2))| {
+        let s1 = dbg_node_map.get(n1 as usize).copied().unwrap_or(-1);
+        let s2 = dbg_node_map.get(n2 as usize).copied().unwrap_or(-1);
+        if s1 >= 0 && s2 >= 0 && (s1 as usize) < nt && (s2 as usize) < nt {
+            Some((idx, n1, n2, s1, s2))
+        } else { None }
+    }).collect();
+    let tt_react: Vec<_> = m.react_jac_pairs.iter().enumerate().filter_map(|(idx, &(n1,n2))| {
+        let s1 = dbg_node_map.get(n1 as usize).copied().unwrap_or(-1);
+        let s2 = dbg_node_map.get(n2 as usize).copied().unwrap_or(-1);
+        if s1 >= 0 && s2 >= 0 && (s1 as usize) < nt && (s2 as usize) < nt {
+            Some((idx, n1, n2, s1, s2))
+        } else { None }
+    }).collect();
+    println!("\n  Terminal-terminal pairs after collapsing: {} resistive, {} reactive",
+             tt_resist.len(), tt_react.len());
+    for (idx, n1, n2, s1, s2) in &tt_resist {
+        println!("    jac[{idx}] ({n1},{n2}) → slot ({s1},{s2})");
+    }
+    for (idx, n1, n2, s1, s2) in &tt_react {
+        println!("    react_jac[{idx}] ({n1},{n2}) → slot ({s1},{s2})");
+    }
+
+    println!("\n  collapsible_pairs ({}):", m.collapsible_pairs.len());
+    for (i, &(a, b)) in m.collapsible_pairs.iter().enumerate() {
+        let a_term = if a < m.num_terminals { "terminal" } else { "internal" };
+        let b_term = if b < m.num_terminals { "terminal" } else { "internal" };
+        println!("    [{i}] ({a} {a_term}, {b} {b_term})");
     }
 }
