@@ -24,7 +24,7 @@ def resistor_model():
     # Quick sanity checks on the OSDI Descriptor extraction
     assert model.num_pins == 2, f"Expected 2 pins, got {model.num_pins}"
     assert model.num_params == 2, (
-        f"Expected 2 parameters (R, m), got {model.num_params}"
+        f"Expected 2 parameters (m, R), got {model.num_params}"
     )
     assert model.num_states == 0, "Resistor should have 0 internal states"
 
@@ -41,8 +41,8 @@ def test_resistor_dc_evaluation(resistor_model):
     # V(A) = 1.0V, V(B) = 0.0V
     voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
 
-    # R = 50.0 Ohms, m = 1.0 (multiplicity)
-    params = jnp.array([[50.0, 1.0]], dtype=jnp.float64)
+    # OSDI param order for resistor_va.osdi: [m (instance), R (model)]
+    params = jnp.array([[1.0, 50.0]], dtype=jnp.float64)
 
     # No internal state
     old_state = jnp.empty((num_devices, 0), dtype=jnp.float64)
@@ -100,10 +100,11 @@ def test_resistor_batched_evaluation(resistor_model):
 
     # Create 1000 random resistance values between 10 Ohms and 1000 Ohms
     key, subkey = jax.random.split(key)
+    # OSDI param order: [m (instance), R (model)]
     params = jax.random.uniform(
         subkey, shape=(num_devices, 2), minval=10.0, maxval=1000.0
     )
-    params = params.at[:, 1].set(1.0)  # m=1.0 for all devices
+    params = params.at[:, 0].set(1.0)  # m=1.0 for all devices; params[:,1] = R
 
     old_state = jnp.empty((num_devices, 0), dtype=jnp.float64)
 
@@ -114,9 +115,9 @@ def test_resistor_batched_evaluation(resistor_model):
     assert cur.shape == (num_devices, 2)
     assert cond.shape == (num_devices, 4)
 
-    # Spot check device #42
+    # Spot check device #42 — R is at params[:,1]
     v_a, v_b = voltages[42]
-    r = params[42][0]
+    r = params[42][1]
     expected_i_a = (v_a - v_b) / r
 
     np.testing.assert_allclose(
@@ -134,7 +135,8 @@ def test_resistor_jax_jvp(resistor_model):
     """
     num_devices = 1
     voltages = jnp.array([[2.0, 0.0]], dtype=jnp.float64)
-    params = jnp.array([[100.0, 1.0]], dtype=jnp.float64)
+    # OSDI param order: [m (instance), R (model)]
+    params = jnp.array([[1.0, 100.0]], dtype=jnp.float64)
     old_state = jnp.empty((num_devices, 0), dtype=jnp.float64)
 
     # Define a pure JAX function that extracts just the current at Pin A
@@ -168,7 +170,7 @@ def capacitor_model():
 
     assert model.num_pins == 2, f"Expected 2 pins, got {model.num_pins}"
     assert model.num_params == 3, (
-        f"Expected 3 parameters (C, m, tnom), got {model.num_params}"
+        f"Expected 3 parameters ($mfactor, C, m), got {model.num_params}"
     )
     assert model.num_states == 0, "Linear capacitor should have 0 internal states"
 
@@ -183,7 +185,9 @@ def test_capacitor_dc_evaluation(capacitor_model):
     C = 1e-12  # 1 pF
 
     voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
-    params = jnp.array([[C, 1.0, 27.0]], dtype=jnp.float64)  # C, m=1, tnom=27°C
+    # OSDI param order for capacitor_va.osdi: [$mfactor (instance), C (model), m (model)]
+    # m is a grading/multiplier coefficient, default 1.0 for a linear capacitor.
+    params = jnp.array([[1.0, C, 1.0]], dtype=jnp.float64)
     old_state = jnp.empty((1, 0), dtype=jnp.float64)
 
     cur, cond, chg, cap, _ = osdi_eval(capacitor_model.id, voltages, params, old_state)
@@ -225,7 +229,8 @@ def test_capacitor_jax_jvp(capacitor_model):
     """
     C = 1e-12
     voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
-    params = jnp.array([[C, 1.0, 27.0]], dtype=jnp.float64)
+    # OSDI param order: [$mfactor (instance), C (model), m (model, default=1.0)]
+    params = jnp.array([[1.0, C, 1.0]], dtype=jnp.float64)
     old_state = jnp.empty((1, 0), dtype=jnp.float64)
 
     # d(Q_P)/d(V_P) = +C,  d(Q_P)/d(V_N) = -C
@@ -251,7 +256,8 @@ def test_resistor_jit(resistor_model):
     """
     num_devices = 1
     voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
-    params = jnp.array([[50.0, 1.0]], dtype=jnp.float64)
+    # OSDI param order: [m (instance), R (model)]
+    params = jnp.array([[1.0, 50.0]], dtype=jnp.float64)
     old_state = jnp.empty((num_devices, 0), dtype=jnp.float64)
 
     # JIT the eval function

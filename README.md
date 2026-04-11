@@ -15,6 +15,7 @@ Evaluates batches of N OSDI 0.4 device instances in parallel (via Rayon) inside 
 the OSDI model — no finite differences.
 
 ```python
+import jax
 import jax.numpy as jnp
 from osdi_loader import load_osdi_model
 from osdi_jax import osdi_eval
@@ -23,9 +24,14 @@ model = load_osdi_model("path/to/device.osdi")
 
 # Batch of N devices evaluated in parallel via Rayon
 N = 1024
-voltages   = jnp.zeros((N, model.num_terminals - 1))  # per-device bias points
-params     = jnp.tile(model.default_params, (N, 1))   # per-device parameters
-old_state  = jnp.zeros((N, model.num_states))          # per-device internal state
+voltages = jnp.zeros((N, model.num_pins), dtype=jnp.float64)
+
+# Pass NaN for parameters you want to leave at Verilog-A defaults.
+# Set only the parameters you care about.
+params = jnp.full((N, model.num_params), jnp.nan, dtype=jnp.float64)
+params = params.at[:, 0].set(1.0)   # $mfactor = 1 for all devices
+
+old_state = jnp.zeros((N, model.num_states), dtype=jnp.float64)
 
 # Returns batched outputs — one row per device
 cur, cond, chg, cap, new_state = osdi_eval(model.id, voltages, params, old_state)
@@ -47,6 +53,27 @@ Python: osdi_eval()  →  JAX XLA custom call "OsdiEvalCpu"
 - **`src/osdi_shim.cpp`** — C++ XLA FFI handler + nanobind Python bindings
 - **`src/osdi_jax.py`** — JAX wrapper with `@custom_jvp` for autodiff
 - **`src/osdi_loader.py`** — Python model loader returning metadata + buffer helpers
+
+## Parameters
+
+OSDI models order parameters as listed in the `param_opvar` table compiled into the binary. bosdi uses the OSDI
+`access()` function to write each parameter to the correct slot in the model/instance struct, so parameter ordering is
+handled automatically.
+
+Pass `jnp.nan` for any parameter you want to leave at its Verilog-A default — bosdi skips writing NaN values and lets
+`setup_model`/`setup_instance` apply the compiled-in defaults. This is the recommended approach for complex models
+(BSIM, PSP) where many parameters have safe defaults.
+
+## Outputs
+
+All outputs are terminal-only (shape `[N, num_pins]` for currents/charges, `[N, num_pins²]` for Jacobians):
+
+| Output | Shape            | Description                          |
+| ------ | ---------------- | ------------------------------------ |
+| `cur`  | `[N, num_pins]`  | Resistive currents at each terminal  |
+| `cond` | `[N, num_pins²]` | dI/dV Jacobian (flattened row-major) |
+| `chg`  | `[N, num_pins]`  | Charges at each terminal             |
+| `cap`  | `[N, num_pins²]` | dQ/dV Jacobian (flattened row-major) |
 
 ## Installation
 
@@ -75,6 +102,15 @@ pixi run pytest tests/test_osdi.py::test_resistor_dc_evaluation -v
 
 ## Limitations
 
-- Linux x86-64 only
-- Python 3.13 only
-- OSDI 0.4 ABI only
+**Platform:** Linux x86-64, Python 3.13, OSDI 0.4 ABI only.
+
+**Stateful models** (`num_states > 0`, e.g. BSIM3v3, SPICE wrappers): evaluation is skipped and outputs are zeroed.
+Stateful model support is not yet implemented.
+
+**Internal-node models:** bosdi returns terminal-to-terminal quantities only. Models that encode behaviour through
+auxiliary internal nodes (e.g. the compiled inductor, which uses a flux node) will produce zero outputs for the affected
+quantities — the inductive current is present in the full MNA stamp but not extractable through the terminal-only API.
+
+**Known crashes:** `bsim4v8.osdi` (crashes in `setup_instance`) and `vbic_vbic_1p3.osdi` (crashes in `eval`) segfault
+with default parameters. Root cause is under investigation. The equivalent 5-terminal models (`bsimbulk106`,
+`vbic_vbic_4T_et_cf`) and other complex models (PSP103, BSIM3v3) work correctly.

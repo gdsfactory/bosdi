@@ -44,6 +44,14 @@ struct AbiLayout {
     desc_num_react_jac:        usize,
     desc_fn_write_jac_resist:  usize,
     desc_fn_write_jac_react:   usize,
+    // Jacobian entry array (for mapping write_jacobian output to terminal pairs)
+    desc_num_jac_entries:      usize,  // +24: total count (resist + react)
+    desc_jac_entries:          usize,  // +32: ptr to OsdiJacobianEntry[]
+    // param_opvar and access/given_flag function pointers
+    desc_param_opvar:          usize,
+    desc_fn_access:            usize,
+    desc_fn_given_flag_model:  usize,
+    desc_fn_given_flag_inst:   usize,
     // OsdiSimInfo shape (for layout-driven construction in future versions)
     sim_info_prev_solve_off:   usize,
     sim_info_flags_off:        usize,
@@ -78,6 +86,12 @@ impl AbiLayout {
             desc_num_react_jac:        260,
             desc_fn_write_jac_resist:  264,
             desc_fn_write_jac_react:   272,
+            desc_num_jac_entries:      24,
+            desc_jac_entries:          32,
+            desc_param_opvar:          88,
+            desc_fn_access:            128,
+            desc_fn_given_flag_model:  240,
+            desc_fn_given_flag_inst:   248,
             sim_info_prev_solve_off:   40,
             sim_info_flags_off:        64,
             sim_info_total_size:       72,
@@ -144,6 +158,31 @@ impl Default for OsdiInitInfo {
     }
 }
 
+/// OsdiParamOpvar — 40 bytes on 64-bit (from osdi_0_4.h).
+/// Only the `flags` field is needed at runtime; the rest are metadata strings.
+#[repr(C)]
+struct OsdiParamOpvar {
+    name:        *const *const c_char,  // +0   ptr
+    num_alias:   u32,                   // +8
+    _pad:        u32,                   // +12  alignment padding
+    description: *const c_char,         // +16  ptr
+    units:       *const c_char,         // +24  ptr
+    pub flags:   u32,                   // +32
+    pub len:     u32,                   // +36
+}
+// Safety assertion checked in load_osdi_library via debug_assert.
+
+// OSDI 0.4 parameter flags (from osdi_0_4.h)
+const PARA_TY_MASK:    u32 = 3;
+const PARA_TY_INT:     u32 = 1;
+const PARA_TY_STR:     u32 = 2;
+const PARA_KIND_MASK:  u32 = 3 << 30;
+const PARA_KIND_MODEL: u32 = 0 << 30;
+const PARA_KIND_INST:  u32 = 1 << 30;
+const PARA_KIND_OPVAR: u32 = 2 << 30;
+const ACCESS_FLAG_SET:      u32 = 1;
+const ACCESS_FLAG_INSTANCE: u32 = 4;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. OSDI FUNCTION POINTER TYPES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,6 +222,21 @@ type LoadResidualFn = unsafe extern "C" fn(inst: *mut c_void, model: *mut c_void
 
 /// Writes the flat Jacobian array (num_resistive_jac doubles) to dst.
 type WriteJacobianFn = unsafe extern "C" fn(inst: *mut c_void, model: *mut c_void, dst: *mut f64);
+
+/// Returns a pointer to parameter slot `id` in the model or instance struct.
+/// flags: ACCESS_FLAG_SET(1) to write; OR ACCESS_FLAG_INSTANCE(4) for inst params.
+type AccessFn = unsafe extern "C" fn(
+    inst:  *mut c_void,
+    model: *mut c_void,
+    id:    u32,
+    flags: u32,
+) -> *mut c_void;
+
+/// Sets the "parameter given" bit for model parameter `id`. Returns the flag value.
+type GivenFlagModelFn = unsafe extern "C" fn(model: *mut c_void, id: u32) -> u32;
+
+/// Sets the "parameter given" bit for instance parameter `id`. Returns the flag value.
+type GivenFlagInstFn = unsafe extern "C" fn(inst: *mut c_void, id: u32) -> u32;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. OsdiDescriptor field layout  (derived from osdi_0_4.h, 64-bit ABI)
@@ -258,8 +312,23 @@ struct LoadedOsdi {
     pub load_residual:       LoadResidualFn,
     pub write_jacobian:      WriteJacobianFn,
     // Reactive functions (may be no-ops for resistive-only models):
-    pub load_residual_react: Option<LoadResidualFn>,
+    pub load_residual_react:  Option<LoadResidualFn>,
     pub write_jacobian_react: Option<WriteJacobianFn>,
+    // Parameter mapping — derived from param_opvar at load time.
+    /// access(inst, model, id, flags) → raw pointer to the parameter slot.
+    pub access:               AccessFn,
+    /// given_flag_model(model, id) — marks model parameter id as user-provided.
+    pub given_flag_model:     GivenFlagModelFn,
+    /// given_flag_inst(inst, id) — marks instance parameter id as user-provided.
+    pub given_flag_inst:      GivenFlagInstFn,
+    /// param_opvar[i].flags for i in 0..num_params (kind + type bits).
+    pub param_flags:          Vec<u32>,
+    // Jacobian entry pairs — used to route write_jacobian output to terminal
+    // pairs in the dense num_terminals^2 output matrix.
+    /// (node_1, node_2) for each resistive Jacobian entry, in write order.
+    pub resist_jac_pairs:     Vec<(u32, u32)>,
+    /// (node_1, node_2) for each reactive Jacobian entry, in write order.
+    pub react_jac_pairs:      Vec<(u32, u32)>,
 }
 unsafe impl Send for LoadedOsdi {}
 unsafe impl Sync for LoadedOsdi {}
@@ -366,6 +435,55 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     let write_jacobian_react: Option<WriteJacobianFn> =
         unsafe { read_fn(desc, layout.desc_fn_write_jac_react) };
 
+    // ── param_opvar: cache flags for each parameter ───────────────────────────
+    // Each OsdiParamOpvar entry is 40 bytes; flags is at byte +32 within each entry.
+    debug_assert_eq!(std::mem::size_of::<OsdiParamOpvar>(), 40,
+                     "OsdiParamOpvar size mismatch — check repr(C) layout");
+    let param_opvar_ptr = unsafe {
+        let ptr_val = (desc.add(layout.desc_param_opvar) as *const usize).read_unaligned();
+        ptr_val as *const u8
+    };
+    let param_flags: Vec<u32> = (0..num_params as usize).map(|i| {
+        unsafe { read_u32(param_opvar_ptr.add(i * 40), 32) }
+    }).collect();
+
+    // ── jacobian entry pairs: route write_jacobian output to terminal pairs ───
+    // OsdiJacobianEntry: {node_1: u32, node_2: u32, react: u32} = 12 bytes.
+    // react=0 → resistive entry; react=1 → reactive entry.
+    let num_jac_entries = unsafe { read_u32(desc, layout.desc_num_jac_entries) };
+    let jac_entries_ptr = unsafe {
+        let ptr_val = (desc.add(layout.desc_jac_entries) as *const usize).read_unaligned();
+        ptr_val as *const u8
+    };
+    let mut resist_jac_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut react_jac_pairs:  Vec<(u32, u32)> = Vec::new();
+    // OsdiJacobianEntry is 16 bytes: {node_1: u32, node_2: u32, field2: u32, field3: u32}.
+    // Ordering: first num_resist_jac entries are resistive, then num_react_jac reactive.
+    for i in 0..num_jac_entries as usize {
+        let node_1 = unsafe { read_u32(jac_entries_ptr.add(i * 16), 0) };
+        let node_2 = unsafe { read_u32(jac_entries_ptr.add(i * 16), 4) };
+        let react = if i < num_resist_jac as usize { 0u32 } else { 1u32 };
+        if react == 0 {
+            resist_jac_pairs.push((node_1, node_2));
+        } else {
+            react_jac_pairs.push((node_1, node_2));
+        }
+    }
+
+    // ── access and given_flag function pointers ───────────────────────────────
+    let access: AccessFn = match unsafe { read_fn(desc, layout.desc_fn_access) } {
+        Some(f) => f,
+        None    => { eprintln!("OSDI: access fn is null"); return fail(); }
+    };
+    unsafe extern "C" fn noop_given_model(_: *mut c_void, _: u32) -> u32 { 0 }
+    unsafe extern "C" fn noop_given_inst(_: *mut c_void, _: u32) -> u32 { 0 }
+    let given_flag_model: GivenFlagModelFn =
+        unsafe { read_fn(desc, layout.desc_fn_given_flag_model) }
+            .unwrap_or(noop_given_model);
+    let given_flag_inst: GivenFlagInstFn =
+        unsafe { read_fn(desc, layout.desc_fn_given_flag_inst) }
+            .unwrap_or(noop_given_inst);
+
     // ── function pointers with NULL descriptor slots — look up by name ────────
     // OpenVAF exports these as `fname_0` (index 0 = first model in the binary).
     let setup_model:    SetupModelFn    = sym!(lib, b"setup_model_0\0",    SetupModelFn);
@@ -396,6 +514,12 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         write_jacobian,
         load_residual_react,
         write_jacobian_react,
+        access,
+        given_flag_model,
+        given_flag_inst,
+        param_flags,
+        resist_jac_pairs,
+        react_jac_pairs,
     });
 
     ModelMetadata {
@@ -412,25 +536,21 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
 // 7. PHASE 2: SINGLE-DEVICE EVALUATION
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// OSDI 0.4 evaluation protocol (confirmed by disassembling the resistor binary):
+// OSDI 0.4 evaluation protocol:
 //
-//  Instance struct (104 bytes for resistor):
-//    inst[node_map_off + i*4] = u32 node index for terminal i
-//    inst[64]                 = m (multiplicity instance param)      ← given flag bit 0 at inst[0]
-//    inst[72]                 = G  = m/R  (set by setup_instance)
-//    inst[80]                 = -G        (set by setup_instance)
-//    inst[88]                 = I_A       (set by eval)
-//    inst[96]                 = I_B       (set by eval)
+//  Parameters are written to the model/instance structs via the descriptor's
+//  access() function, using the param_opvar flags cached in LoadedOsdi::param_flags
+//  to determine each parameter's kind (model vs. instance) and type (real/int/str).
+//  The given_flag_model() / given_flag_inst() functions mark each written parameter
+//  as user-provided so that setup_model/setup_instance applies model defaults only
+//  to parameters not supplied by the caller.
 //
-//  Model struct (24 bytes for resistor):
-//    model[8]  = R (resistance param)          ← given flag bit 0 at model[0]
-//    model[16] = secondary model param (tnom)  ← uses default if flag bit 1 not set
-//
-//  Param mapping from Python params array [R, m] (for resistor):
-//    params[0] = R → model[8]
-//    params[1] = m → inst[64]
-//
-// TODO: For general OSDI models, derive param→offset mapping from param_opvar.
+//  Call sequence per device:
+//    1. Write all params via access() + given_flag_*()
+//    2. setup_model()     — applies defaults, validates model params
+//    3. setup_instance()  — derives instance quantities from model params
+//    4. eval()            — computes residuals at the given operating point
+//    5. load_residual / write_jacobian — extract currents and conductances
 
 fn eval_one_device(
     m: &LoadedOsdi,
@@ -445,24 +565,11 @@ fn eval_one_device(
     let mut model_data = vec![0u8; m.model_size];
     let mut inst_data  = vec![0u8; m.instance_size];
 
-    // ── write model param: params[0] → model[8], set given flag ─────────────
-    // For resistors this is R; for capacitors this is C.
-    // TODO: For general models, derive param→struct mapping from param_opvar.
-    if param.len() > 0 {
-        unsafe {
-            *(model_data.as_mut_ptr().add(8) as *mut f64) = param[0];
-        }
-        model_data[0] |= 0x01; // bit 0 = "first model param given"
-    }
-
-    // NOTE: We intentionally do NOT write params[1] to the instance struct.
-    // Setting inst[0] bit 0 triggers the $mfactor path in setup_instance, which
-    // reads inst[96] before it is initialised and zeroes reactive outputs.
-    // params[1] (multiplicity m) defaults to 1.0 for both resistors and capacitors,
-    // which matches the values used in all existing tests.
-
-    // ── set node mapping: terminal i → node index i ───────────────────────────
-    for i in 0..m.num_terminals as usize {
+    // ── set node mapping: node i → index i for all nodes ─────────────────────
+    // We map ALL nodes (including internal ones) to their own unique index so
+    // that load_residual / write_jacobian can write to a buffer of size num_nodes
+    // without aliasing terminal entries with internal ones.
+    for i in 0..m.num_nodes as usize {
         unsafe {
             *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) = i as i32;
         }
@@ -471,13 +578,75 @@ fn eval_one_device(
     let model_ptr = model_data.as_mut_ptr() as *mut c_void;
     let inst_ptr  = inst_data.as_mut_ptr() as *mut c_void;
 
-    // ── setup_model: validates R and applies defaults ─────────────────────────
+    // ── write model params, then setup_model, then write instance params ────
+    // Params are written in two passes so that:
+    //   (a) NaN values are silently skipped → Verilog-A default is used instead.
+    //   (b) Instance params are written AFTER setup_model and BEFORE
+    //       setup_instance, because setup_instance may reinitialise the inst
+    //       block, overwriting values we pre-wrote.
+    //
+    // Call sequence:
+    //   1. write MODEL params + given_flag_model()
+    //   2. setup_model()     — fills MODEL defaults for unset params
+    //   3. write INSTANCE params + given_flag_inst()
+    //   4. setup_instance()  — fills INST defaults for unset params
+
+    // Helper closure: write one param via access() + given_flag_*().
+    // Returns false if the param should be skipped (NaN, OPVAR, STR, null ptr).
+    let write_param = |i: usize, val: f64, kind: u32, ty: u32| {
+        if val.is_nan()           { return; }   // NaN → use Verilog-A default
+        if kind == PARA_KIND_OPVAR { return; }  // output-only, never written
+        if ty   == PARA_TY_STR    { return; }   // can't map str from f64 array
+
+        let access_flags = if kind == PARA_KIND_MODEL {
+            ACCESS_FLAG_SET
+        } else {
+            ACCESS_FLAG_SET | ACCESS_FLAG_INSTANCE
+        };
+
+        let ptr = unsafe { (m.access)(inst_ptr, model_ptr, i as u32, access_flags) };
+        if ptr.is_null() { return; }
+
+        unsafe {
+            if ty == PARA_TY_INT {
+                *(ptr as *mut i32) = val as i32;
+            } else {
+                *(ptr as *mut f64) = val;
+            }
+        }
+
+        if kind == PARA_KIND_MODEL {
+            unsafe { (m.given_flag_model)(model_ptr, i as u32); }
+        } else {
+            unsafe { (m.given_flag_inst)(inst_ptr, i as u32); }
+        }
+    };
+
+    // Pass 1: model params only
+    for (i, &val) in param.iter().enumerate() {
+        let flags = match m.param_flags.get(i) { Some(&f) => f, None => break };
+        let kind = flags & PARA_KIND_MASK;
+        let ty   = flags & PARA_TY_MASK;
+        if kind != PARA_KIND_MODEL { continue; }
+        write_param(i, val, kind, ty);
+    }
+
+    // ── setup_model: applies defaults for unset params, validates ────────────
     let mut init1 = OsdiInitInfo::default();
     unsafe {
         (m.setup_model)(std::ptr::null_mut(), model_ptr, std::ptr::null_mut(), &mut init1);
     }
 
-    // ── setup_instance: precomputes G = m/R into inst[72], -G into inst[80] ──
+    // Pass 2: instance params only (after setup_model, before setup_instance)
+    for (i, &val) in param.iter().enumerate() {
+        let flags = match m.param_flags.get(i) { Some(&f) => f, None => break };
+        let kind = flags & PARA_KIND_MASK;
+        let ty   = flags & PARA_TY_MASK;
+        if kind != PARA_KIND_INST { continue; }
+        write_param(i, val, kind, ty);
+    }
+
+    // ── setup_instance: precomputes derived quantities from model params ──────
     let mut init2 = OsdiInitInfo::default();
     unsafe {
         (m.setup_instance)(
@@ -493,7 +662,15 @@ fn eval_one_device(
     if m.num_resist_jac > 0 { flags |= m.layout.flag_calc_resist_residual; }
     if m.num_react_jac  > 0 { flags |= m.layout.flag_calc_react_residual;  }
 
-    let mut vol_buf: Vec<f64> = vol.to_vec();
+    // ── voltage buffer: num_nodes entries, terminals filled, internals at 0V ──
+    // eval() reads prev_solve[node_mapping[i]] = prev_solve[i] for each node i.
+    // Terminal voltages come from the caller; internal nodes start at 0V.
+    let num_nodes = m.num_nodes as usize;
+    let num_terms = m.num_terminals as usize;
+    let mut vol_buf = vec![0.0f64; num_nodes];
+    let copy_len = vol.len().min(num_terms);
+    vol_buf[..copy_len].copy_from_slice(&vol[..copy_len]);
+
     let mut sim_info = OsdiSimInfo {
         paras:      OsdiSimParas::null(),
         abstime:    0.0,
@@ -511,18 +688,43 @@ fn eval_one_device(
     }
 
     // ── extract resistive outputs ─────────────────────────────────────────────
+    // load_residual writes to dst[node_mapping[i]] = dst[i] for each node.
+    // We use a num_nodes-sized buffer, then copy only terminal entries to cur.
     if m.num_resist_jac > 0 {
-        unsafe { (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr()); }
-        unsafe { (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr()); }
+        let mut cur_all = vec![0.0f64; num_nodes];
+        unsafe { (m.load_residual)(inst_ptr, model_ptr, cur_all.as_mut_ptr()); }
+        cur[..num_terms].copy_from_slice(&cur_all[..num_terms]);
+
+        // write_jacobian writes num_resist_jac values, one per resistive entry.
+        // We scatter only terminal-to-terminal entries into the dense output.
+        let mut jac_buf = vec![0.0f64; m.num_resist_jac as usize];
+        unsafe { (m.write_jacobian)(inst_ptr, model_ptr, jac_buf.as_mut_ptr()); }
+        for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
+            let n1 = n1 as usize;
+            let n2 = n2 as usize;
+            if n1 < num_terms && n2 < num_terms {
+                cond[n1 * num_terms + n2] += jac_buf[idx];
+            }
+        }
     }
 
     // ── extract reactive outputs ──────────────────────────────────────────────
     if m.num_react_jac > 0 {
         if let Some(lr) = m.load_residual_react {
-            unsafe { lr(inst_ptr, model_ptr, chg.as_mut_ptr()); }
+            let mut chg_all = vec![0.0f64; num_nodes];
+            unsafe { lr(inst_ptr, model_ptr, chg_all.as_mut_ptr()); }
+            chg[..num_terms].copy_from_slice(&chg_all[..num_terms]);
         }
         if let Some(wj) = m.write_jacobian_react {
-            unsafe { wj(inst_ptr, model_ptr, cap.as_mut_ptr()); }
+            let mut jac_buf = vec![0.0f64; m.num_react_jac as usize];
+            unsafe { wj(inst_ptr, model_ptr, jac_buf.as_mut_ptr()); }
+            for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
+                let n1 = n1 as usize;
+                let n2 = n2 as usize;
+                if n1 < num_terms && n2 < num_terms {
+                    cap[n1 * num_terms + n2] += jac_buf[idx];
+                }
+            }
         }
     }
 }
