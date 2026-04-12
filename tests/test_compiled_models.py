@@ -360,11 +360,6 @@ _SMOKE_CRASH_REASON = {
         "The 4-terminal VBIC model appears to access uninitialised memory during "
         "evaluation; the 5-terminal variant (vbic_4T_et_cf) does not crash."
     ),
-    "diode": (
-        "diode.osdi setup_model crashes (SIGSEGV) with default parameters. "
-        "The compiled OpenVAF diode model allocates noise parameter memory in "
-        "setup_model that segfaults; the spice_diode wrapper works correctly."
-    ),
 }
 
 
@@ -395,14 +390,8 @@ _SMOKE_CRASH_REASON = {
                 reason=_SMOKE_CRASH_REASON["vbic_vbic_1p3"], strict=True, run=False
             ),
         ),
-        pytest.param(
-            "diode",
-            [[0.6, 0.0]],
-            True,
-            marks=pytest.mark.xfail(
-                reason=_SMOKE_CRASH_REASON["diode"], strict=True, run=False
-            ),
-        ),
+        # ── diode: forward-biased → non-zero current (fixed: osdi_log + names sentinel) ──
+        ("diode", [[0.6, 0.0]], True),
         # ── Stateful models: eval skipped → all outputs are defined zeros ─────
         # bsim3v3 has num_states=5; outputs are zero until stateful eval is added.
         ("bsim3v3", [[1.0, 0.7, 0.0, 0.0]], False),

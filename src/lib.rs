@@ -133,6 +133,22 @@ impl OsdiSimParas {
             vals_str:  std::ptr::null_mut(),
         }
     }
+
+    /// Returns an empty-but-valid OsdiSimParas whose names pointer addresses the
+    /// provided null sentinel slot.  Models that read `sim_paras->names[0]` to
+    /// iterate the parameter list (e.g. the compiled OpenVAF diode) see a null
+    /// first entry and skip the lookup — instead of crashing on a null `names`.
+    ///
+    /// # Safety
+    /// `names_sentinel` must remain valid for the lifetime of the returned struct.
+    unsafe fn with_null_sentinel(names_sentinel: *mut *mut i8) -> Self {
+        Self {
+            names:     names_sentinel,
+            vals:      std::ptr::null_mut(),
+            names_str: std::ptr::null_mut(),
+            vals_str:  std::ptr::null_mut(),
+        }
+    }
 }
 
 /// OsdiSimInfo layout (confirmed by disassembly of eval_0):
@@ -180,6 +196,23 @@ struct OsdiParamOpvar {
     pub len:     u32,                   // +36
 }
 // Safety assertion checked in load_osdi_library via debug_assert.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OSDI simulator callbacks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// No-op osdi_log callback installed into models that export the `osdi_log`
+/// symbol.  Some compiled OpenVAF models (e.g. the diode) call this slot when
+/// a simulator parameter like `gmin` is not found in `OsdiSimParas.names`.
+/// They fall back to 0.0 for the missing value — which is acceptable — but they
+/// crash if the function pointer is null (its BSS-initialized default).
+///
+/// Signature (from OSDI 0.4 calling convention in disassembly):
+///   void osdi_log(void* handle, const char* message, uint32_t level)
+/// The message string is heap-allocated by the model; we deliberately do not
+/// free it here to keep this callback simple and stateless.  The leak is
+/// at most one allocation per eval() call and only when gmin is requested.
+unsafe extern "C" fn noop_osdi_log(_handle: *mut c_void, _msg: *const c_char, _level: u32) {}
 
 // OSDI 0.4 parameter flags (from osdi_0_4.h)
 const PARA_TY_MASK:    u32 = 3;
@@ -525,6 +558,21 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     let setup_instance: SetupInstanceFn = sym!(lib, b"setup_instance_0\0", SetupInstanceFn);
     let eval:           EvalFn          = sym!(lib, b"eval_0\0",           EvalFn);
 
+    // ── install simulator callbacks if the model exports them ─────────────────
+    // `osdi_log` is a BSS function-pointer slot (null by default) that some
+    // models call to report missing simulator parameters (e.g. $simparam("gmin")).
+    // Without a callback they crash; a no-op is sufficient since we fall back to
+    // 0.0 for missing params anyway.
+    unsafe {
+        if let Ok(sym) = lib.get::<*mut c_void>(b"osdi_log\0") {
+            // *sym is the BSS address cast as *mut c_void; reinterpret as *mut fn ptr.
+            let slot = *sym as *mut unsafe extern "C" fn(*mut c_void, *const c_char, u32);
+            if !slot.is_null() {
+                *slot = noop_osdi_log;
+            }
+        }
+    }
+
     let model_id = {
         let mut id = NEXT_MODEL_ID.write().unwrap();
         let cur = *id;
@@ -744,8 +792,16 @@ fn eval_one_device(
         vol_buf[slot] = v;
     }
 
+    // ── sim paras: provide a null-sentinel names array ────────────────────────
+    // Some models (e.g. the compiled OpenVAF diode) dereference sim_paras->names
+    // before checking if the pointer is null, crashing when we pass null.
+    // Providing a valid pointer to a single null entry tells the model "no
+    // simulator parameters available" without a null-pointer fault.
+    let mut names_sentinel: *mut i8 = std::ptr::null_mut();
+    let sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
+
     let mut sim_info = OsdiSimInfo {
-        paras:      OsdiSimParas::null(),
+        paras:      sim_paras,
         abstime:    0.0,
         prev_solve: vol_buf.as_mut_ptr(),
         prev_state: std::ptr::null_mut(),
