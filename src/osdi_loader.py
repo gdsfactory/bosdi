@@ -16,6 +16,7 @@ class OsdiModel:
     num_params: int
     num_states: int
     osdi_version: str
+    resistive_mask: list  # len == num_nodes; True iff G[i,:] can be non-zero at DC
 
     def allocate_jax_buffers(self, num_devices: int):
         return {
@@ -57,4 +58,5 @@ def load_osdi_model(osdi_filepath: str, version: str = "0.4") -> OsdiModel:
         num_params=meta.num_params,
         num_states=meta.num_states,
         osdi_version=version,
+        resistive_mask=list(osdi_shim_nb.get_resistive_mask(meta.model_id)),
     )

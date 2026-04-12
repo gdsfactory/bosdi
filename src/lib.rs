@@ -376,6 +376,11 @@ struct LoadedOsdi {
     /// electrically identical. bosdi always collapses them so internal node
     /// voltages match their terminal counterparts.
     pub collapsible_pairs:    Vec<(u32, u32)>,
+    /// resistive_mask[out_idx] = true iff output node out_idx appears as the row
+    /// in at least one resist_jac_pair (i.e. F[out_idx] can be non-zero at DC).
+    /// Nodes where this is false have G[i,:] = 0 always; exposing them as Newton
+    /// unknowns makes DC singular — the caller should regularise those rows.
+    pub resistive_mask:       Vec<bool>,
 }
 unsafe impl Send for LoadedOsdi {}
 unsafe impl Sync for LoadedOsdi {}
@@ -539,24 +544,59 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         Vec::new()
     };
 
-    // ── num_all_nodes: count distinct occupied slots after collapsing ─────────
-    // Run the same deterministic collapse algorithm as eval_one_device.
-    // We count distinct values in node_map (not max+1) to avoid phantom slots
-    // when collapsible pairs create a gap in the slot numbering (e.g. PSP103
-    // collapses node 12 → slot 12 while slots 5-11 are never used).
-    let num_all_nodes = {
-        let mut nm: Vec<i32> = (0..num_nodes as i32).collect();
+    // ── num_all_nodes + resistive_mask: one pass after collapsing ───────────────
+    // Run the same deterministic collapse algorithm as eval_one_device, then build
+    // the slot_to_out map to produce num_all_nodes and resistive_mask together.
+    // Phantom slots (numbered but not mapped to by any node, e.g. PSP103's gap
+    // between slots 3 and 12) are skipped in slot_to_out and never appear in the mask.
+    let (num_all_nodes, resistive_mask) = {
+        let num_terms = num_terminals as usize;
+        let num_n     = num_nodes    as usize;
+
+        // Collapse
+        let mut nm: Vec<i32> = (0..num_n as i32).collect();
         for &(n1, n2) in &collapsible_pairs {
             let (n1, n2) = (n1 as usize, n2 as usize);
-            if n1 >= num_nodes as usize || n2 >= num_nodes as usize { continue; }
+            if n1 >= num_n || n2 >= num_n { continue; }
             let s1 = nm[n1]; let s2 = nm[n2];
             let merged = s1.min(s2); let higher = s1.max(s2);
             for s in nm.iter_mut() { if *s == higher { *s = merged; } }
         }
-        // Count distinct occupied slots (not max+1, to avoid phantom gaps)
-        let mut seen = std::collections::BTreeSet::new();
-        for &s in &nm { seen.insert(s); }
-        seen.len()
+        let num_slots = nm.iter().map(|&s| s as usize + 1).max().unwrap_or(num_terms);
+
+        // Occupied slots
+        let mut slot_occupied = vec![false; num_slots];
+        for &s in &nm { slot_occupied[s as usize] = true; }
+
+        // slot → output index (terminal slots first, then internal)
+        let mut slot_to_out = vec![-1i32; num_slots];
+        for t in 0..num_terms {
+            slot_to_out[nm[t] as usize] = t as i32;
+        }
+        let mut next_out = num_terms;
+        for slot in 0..num_slots {
+            if slot_occupied[slot] && slot_to_out[slot] < 0 {
+                slot_to_out[slot] = next_out as i32;
+                next_out += 1;
+            }
+        }
+        let num_all = next_out;
+
+        // resistive_mask[out_idx] = true iff that output node appears as a row
+        // in at least one resist_jac_pair (G[row, :] can be non-zero).
+        let mut mask = vec![false; num_all];
+        for &(n1, _) in &resist_jac_pairs {
+            let n1 = n1 as usize;
+            if n1 < nm.len() {
+                let slot = nm[n1] as usize;
+                if slot < slot_to_out.len() {
+                    let out = slot_to_out[slot];
+                    if out >= 0 { mask[out as usize] = true; }
+                }
+            }
+        }
+
+        (num_all, mask)
     };
 
     // ── access and given_flag function pointers ───────────────────────────────
@@ -625,6 +665,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         resist_jac_pairs,
         react_jac_pairs,
         collapsible_pairs,
+        resistive_mask,
     });
 
     ModelMetadata {
@@ -635,6 +676,31 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         num_states:   num_states as usize,
         osdi_version: version,
         success:      true,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6b. RESISTIVE MASK FFI  (separate from ModelMetadata — Vec<bool> is not repr(C))
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the length of the resistive_mask for model_id (= num_nodes).
+/// Returns 0 for unknown model IDs.
+#[no_mangle]
+pub extern "C" fn get_resistive_mask_len(model_id: u32) -> usize {
+    OSDI_REGISTRY.read().unwrap()
+        .get(&model_id)
+        .map(|m| m.resistive_mask.len())
+        .unwrap_or(0)
+}
+
+/// Copies resistive_mask[0..n] into out[0..n] as u8 (1 = true, 0 = false).
+/// Caller must ensure out points to at least get_resistive_mask_len() bytes.
+#[no_mangle]
+pub extern "C" fn get_resistive_mask_ffi(model_id: u32, out: *mut u8) {
+    if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
+        for (i, &b) in m.resistive_mask.iter().enumerate() {
+            unsafe { *out.add(i) = b as u8; }
+        }
     }
 }
 

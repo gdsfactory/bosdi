@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 #include "xla/ffi/api/ffi.h"
@@ -27,6 +28,10 @@ extern "C" {
 
     // Diagnostic
     void dump_model_info(uint32_t model_id);
+
+    // Resistive mask (Vec<bool> not repr(C), so separate two-call pattern)
+    size_t get_resistive_mask_len(uint32_t model_id);
+    void   get_resistive_mask_ffi(uint32_t model_id, uint8_t* out);
 
     // Phase 2: The batched execution (Rayon zipper in Rust)
     void batched_osdi_eval_ffi(
@@ -134,5 +139,14 @@ NB_MODULE(osdi_shim_nb, m) {
 
     m.def("dump_model_info", [](uint32_t model_id) {
         dump_model_info(model_id);
+    }, nb::arg("model_id"));
+
+    m.def("get_resistive_mask", [](uint32_t model_id) {
+        size_t n = get_resistive_mask_len(model_id);
+        std::vector<uint8_t> buf(n, 0);
+        if (n > 0) get_resistive_mask_ffi(model_id, buf.data());
+        nb::list result;
+        for (size_t i = 0; i < n; i++) result.append(buf[i] != 0);
+        return result;
     }, nb::arg("model_id"));
 }
