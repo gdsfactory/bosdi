@@ -215,7 +215,9 @@ def test_compiled_inductor_reactive_output(compiled_inductor):
     Params: [$mfactor=1.0, l=1e-9]
     """
     m = compiled_inductor
-    voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
+    # Use num_nodes-wide voltage array: terminals first, then internal nodes at 0V
+    voltages = jnp.zeros((1, m.num_nodes), dtype=jnp.float64)
+    voltages = voltages.at[0, 0].set(1.0)  # terminal P = 1V
     params = jnp.full((1, m.num_params), jnp.nan, dtype=jnp.float64)
     params = params.at[0, 0].set(1.0)  # $mfactor = 1
     params = params.at[0, 1].set(1e-9)  # l = 1 nH
@@ -245,7 +247,15 @@ def _outputs_differ_when_param_changes(
     Returns True iff the current vectors differ.
     """
     model = load_osdi_model(str(osdi_path))
-    voltages = jnp.array(voltages_np, dtype=jnp.float64)
+    v_terminals = jnp.array(voltages_np, dtype=jnp.float64)  # (1, num_pins)
+    n_internal = model.num_nodes - model.num_pins
+    voltages = (
+        jnp.concatenate(
+            [v_terminals, jnp.zeros((1, n_internal), dtype=jnp.float64)], axis=1
+        )
+        if n_internal > 0
+        else v_terminals
+    )
     state = jnp.empty((1, model.num_states), dtype=jnp.float64)
 
     def _eval(val):
@@ -291,13 +301,13 @@ def test_compiled_inductor_l_param_affects_output():
 
     The compiled inductor uses an internal flux node (3 nodes total, 2 terminals).
     Its inductive behaviour is expressed through internal-to-terminal Jacobian
-    entries that bosdi discards (we only keep terminal-to-terminal pairs).
-    What IS observable is the resistive conductance: a real inductor model
-    typically includes a series resistance, and changing l should affect the
-    combined resistive-reactive stamp. We test that at least ONE output changes.
+    entries that are now included in the full num_nodes×num_nodes conductance matrix.
+    We test that at least ONE output changes when l changes.
     """
     model = load_osdi_model(str(compiled_dir / "inductor.osdi"))
-    voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
+    # num_nodes-wide: terminals P=1V, N=0V, internal node at 0V (initial iterate)
+    voltages = jnp.zeros((1, model.num_nodes), dtype=jnp.float64)
+    voltages = voltages.at[0, 0].set(1.0)
     state = jnp.empty((1, model.num_states), dtype=jnp.float64)
 
     def _eval(l_val):
@@ -411,7 +421,16 @@ def test_complex_model_eval_smoke(name, voltages_np, expect_nonzero):
                           with independent internal nodes stuck at 0 V.
     """
     model = load_osdi_model(str(compiled_dir / f"{name}.osdi"))
-    voltages = jnp.array(voltages_np, dtype=jnp.float64)
+    # Pad terminal voltages with zeros for internal nodes (initial Newton iterate).
+    v_terminals = jnp.array(voltages_np, dtype=jnp.float64)  # (1, num_pins)
+    n_internal = model.num_nodes - model.num_pins
+    voltages = (
+        jnp.concatenate(
+            [v_terminals, jnp.zeros((1, n_internal), dtype=jnp.float64)], axis=1
+        )
+        if n_internal > 0
+        else v_terminals
+    )
     # NaN for all params → use Verilog-A defaults; only set $mfactor=1.
     params = jnp.full((1, model.num_params), jnp.nan, dtype=jnp.float64)
     params = params.at[0, 0].set(1.0)
@@ -421,8 +440,8 @@ def test_complex_model_eval_smoke(name, voltages_np, expect_nonzero):
 
     assert jnp.all(jnp.isfinite(cur)), f"{name}: non-finite currents"
     assert jnp.all(jnp.isfinite(cond)), f"{name}: non-finite conductances"
-    assert cur.shape == (1, model.num_pins)
-    assert cond.shape == (1, model.num_pins**2)
+    assert cur.shape == (1, model.num_nodes)
+    assert cond.shape == (1, model.num_nodes**2)
 
     if expect_nonzero:
         nz = int(jnp.sum(cur != 0) + jnp.sum(cond != 0))

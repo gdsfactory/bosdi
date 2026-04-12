@@ -384,7 +384,8 @@ unsafe impl Sync for LoadedOsdi {}
 #[repr(C)]
 pub struct ModelMetadata {
     pub model_id:      u32,
-    pub num_pins:      usize,
+    pub num_pins:      usize,   // = num_terminals (external pins only)
+    pub num_nodes:     usize,   // = num_terminals + num_non_collapsed_internal
     pub num_params:    usize,
     pub num_states:    usize,
     pub osdi_version:  u32,
@@ -403,7 +404,7 @@ lazy_static::lazy_static! {
 
 fn fail() -> ModelMetadata {
     ModelMetadata {
-        model_id: 0, num_pins: 0, num_params: 0,
+        model_id: 0, num_pins: 0, num_nodes: 0, num_params: 0,
         num_states: 0, osdi_version: 0, success: false,
     }
 }
@@ -538,6 +539,26 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         Vec::new()
     };
 
+    // ── num_all_nodes: count distinct occupied slots after collapsing ─────────
+    // Run the same deterministic collapse algorithm as eval_one_device.
+    // We count distinct values in node_map (not max+1) to avoid phantom slots
+    // when collapsible pairs create a gap in the slot numbering (e.g. PSP103
+    // collapses node 12 → slot 12 while slots 5-11 are never used).
+    let num_all_nodes = {
+        let mut nm: Vec<i32> = (0..num_nodes as i32).collect();
+        for &(n1, n2) in &collapsible_pairs {
+            let (n1, n2) = (n1 as usize, n2 as usize);
+            if n1 >= num_nodes as usize || n2 >= num_nodes as usize { continue; }
+            let s1 = nm[n1]; let s2 = nm[n2];
+            let merged = s1.min(s2); let higher = s1.max(s2);
+            for s in nm.iter_mut() { if *s == higher { *s = merged; } }
+        }
+        // Count distinct occupied slots (not max+1, to avoid phantom gaps)
+        let mut seen = std::collections::BTreeSet::new();
+        for &s in &nm { seen.insert(s); }
+        seen.len()
+    };
+
     // ── access and given_flag function pointers ───────────────────────────────
     let access: AccessFn = match unsafe { read_fn(desc, layout.desc_fn_access) } {
         Some(f) => f,
@@ -609,6 +630,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     ModelMetadata {
         model_id,
         num_pins:     num_terminals as usize,
+        num_nodes:    num_all_nodes,
         num_params:   num_params as usize,
         num_states:   num_states as usize,
         osdi_version: version,
@@ -638,12 +660,12 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
 
 fn eval_one_device(
     m: &LoadedOsdi,
-    vol:   &[f64],       // voltages for this device (num_pins elements)
+    vol:   &[f64],       // voltages for this device (num_nodes elements: terminals first, then internal)
     param: &[f64],       // params for this device   (num_params elements)
-    cur:   &mut [f64],   // output currents          (num_pins elements, zeroed by caller)
-    cond:  &mut [f64],   // output conductances      (num_pins^2 elements, zeroed by caller)
-    chg:   &mut [f64],   // output charges           (num_pins elements, zeroed by caller)
-    cap:   &mut [f64],   // output capacitances      (num_pins^2 elements, zeroed by caller)
+    cur:   &mut [f64],   // output currents          (num_nodes elements, zeroed by caller)
+    cond:  &mut [f64],   // output conductances      (num_nodes^2 elements, zeroed by caller)
+    chg:   &mut [f64],   // output charges           (num_nodes elements, zeroed by caller)
+    cap:   &mut [f64],   // output capacitances      (num_nodes^2 elements, zeroed by caller)
 ) {
     // ── allocate opaque model and instance data blocks ────────────────────────
     let mut model_data = vec![0u8; m.model_size];
@@ -686,6 +708,30 @@ fn eval_one_device(
     // Effective number of distinct slots used (after collapsing).
     let num_slots = node_map.iter().max().map(|&m| m as usize + 1)
                     .unwrap_or(m.num_nodes as usize);
+
+    let num_terms = m.num_terminals as usize;
+
+    // Map each slot → output index.
+    // Terminal slots get output indices 0..num_terms.
+    // Non-terminal OCCUPIED slots get indices num_terms, num_terms+1, …
+    // Phantom slots (numbered but not mapped to by any node, e.g. gaps in PSP103's
+    // collapsing) stay at -1 and are skipped in all scatter operations.
+    let mut slot_occupied = vec![false; num_slots];
+    for &s in &node_map { slot_occupied[s as usize] = true; }
+
+    let mut slot_to_out: Vec<i32> = vec![-1; num_slots];
+    for t in 0..num_terms {
+        let slot = node_map[t] as usize;
+        slot_to_out[slot] = t as i32;
+    }
+    let mut next_out = num_terms;
+    for slot in 0..num_slots {
+        if slot_occupied[slot] && slot_to_out[slot] < 0 {
+            slot_to_out[slot] = next_out as i32;
+            next_out += 1;
+        }
+    }
+    let num_all_nodes = next_out;  // == num_terminals + num_non_collapsed_internal
 
     let model_ptr = model_data.as_mut_ptr() as *mut c_void;
     let inst_ptr  = inst_data.as_mut_ptr() as *mut c_void;
@@ -782,14 +828,14 @@ fn eval_one_device(
 
     // ── voltage buffer: num_slots entries, indexed by node_map slot ─────────
     // eval() reads prev_solve[node_map[i]] for each node i.
-    // After collapsing, collapsed internal nodes share their terminal's slot, so
-    // they see the correct terminal voltage instead of 0V.
-    let num_terms = m.num_terminals as usize;
+    // vol[0..num_terms]         → terminal voltages (from circuit node solution)
+    // vol[num_terms..num_nodes] → internal node voltages from previous Newton iterate
     let mut vol_buf = vec![0.0f64; num_slots];
-    // Fill terminal slots from caller voltages
-    for (term_idx, &v) in vol.iter().enumerate().take(num_terms) {
-        let slot = node_map[term_idx] as usize;
-        vol_buf[slot] = v;
+    for slot in 0..num_slots {
+        let out_idx = slot_to_out[slot];
+        if out_idx >= 0 && (out_idx as usize) < vol.len() {
+            vol_buf[slot] = vol[out_idx as usize];
+        }
     }
 
     // ── sim paras: provide a null-sentinel names array ────────────────────────
@@ -823,22 +869,27 @@ fn eval_one_device(
     if m.num_resist_jac > 0 {
         let mut cur_all = vec![0.0f64; num_slots];
         unsafe { (m.load_residual)(inst_ptr, model_ptr, cur_all.as_mut_ptr()); }
-        // Copy terminal slots to output. With collapsing, terminal slot = terminal index.
-        for t in 0..num_terms {
-            let slot = node_map[t] as usize;
-            cur[t] = cur_all[slot];
+        // Copy all active slots to their output index (terminals and internal nodes).
+        for slot in 0..num_slots {
+            let out = slot_to_out[slot];
+            if out >= 0 {
+                cur[out as usize] = cur_all[slot];
+            }
         }
 
-        // write_jacobian writes num_resist_jac values. After collapsing, scatter
-        // using the mapped (collapsed) node indices: pair (n1,n2) maps to
-        // (node_map[n1], node_map[n2]) and is terminal-terminal if both slots < num_terms.
+        // write_jacobian writes num_resist_jac values. Scatter all pairs into cond
+        // using slot_to_out for both axes — no terminal-only filter.
         let mut jac_buf = vec![0.0f64; m.num_resist_jac as usize];
         unsafe { (m.write_jacobian)(inst_ptr, model_ptr, jac_buf.as_mut_ptr()); }
         for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
             let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
             let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
-            if s1 >= 0 && s2 >= 0 && (s1 as usize) < num_terms && (s2 as usize) < num_terms {
-                cond[s1 as usize * num_terms + s2 as usize] += jac_buf[idx];
+            if s1 >= 0 && s2 >= 0 {
+                let o1 = slot_to_out[s1 as usize];
+                let o2 = slot_to_out[s2 as usize];
+                if o1 >= 0 && o2 >= 0 {
+                    cond[o1 as usize * num_all_nodes + o2 as usize] += jac_buf[idx];
+                }
             }
         }
     }
@@ -848,9 +899,11 @@ fn eval_one_device(
         if let Some(lr) = m.load_residual_react {
             let mut chg_all = vec![0.0f64; num_slots];
             unsafe { lr(inst_ptr, model_ptr, chg_all.as_mut_ptr()); }
-            for t in 0..num_terms {
-                let slot = node_map[t] as usize;
-                chg[t] = chg_all[slot];
+            for slot in 0..num_slots {
+                let out = slot_to_out[slot];
+                if out >= 0 {
+                    chg[out as usize] = chg_all[slot];
+                }
             }
         }
         if let Some(wj) = m.write_jacobian_react {
@@ -859,8 +912,12 @@ fn eval_one_device(
             for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
                 let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
                 let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
-                if s1 >= 0 && s2 >= 0 && (s1 as usize) < num_terms && (s2 as usize) < num_terms {
-                    cap[s1 as usize * num_terms + s2 as usize] += jac_buf[idx];
+                if s1 >= 0 && s2 >= 0 {
+                    let o1 = slot_to_out[s1 as usize];
+                    let o2 = slot_to_out[s2 as usize];
+                    if o1 >= 0 && o2 >= 0 {
+                        cap[o1 as usize * num_all_nodes + o2 as usize] += jac_buf[idx];
+                    }
                 }
             }
         }
@@ -875,7 +932,7 @@ fn eval_one_device(
 pub extern "C" fn batched_osdi_eval_ffi(
     model_id:         u32,
     num_devices:      usize,
-    num_pins:         usize,
+    num_pins:         usize,   // = num_nodes (terminals + internal); Python passes meta.num_nodes
     num_params:       usize,
     num_states:       usize,
     voltages_ptr:     *const f64,

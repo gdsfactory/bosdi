@@ -14,6 +14,7 @@ namespace ffi = xla::ffi;
 struct ModelMetadata {
     uint32_t model_id;
     size_t   num_pins;
+    size_t   num_nodes;
     size_t   num_params;
     size_t   num_states;
     uint32_t osdi_version;
@@ -117,6 +118,7 @@ NB_MODULE(osdi_shim_nb, m) {
     nb::class_<ModelMetadata>(m, "ModelMetadata")
         .def_ro("model_id",     &ModelMetadata::model_id)
         .def_ro("num_pins",     &ModelMetadata::num_pins)
+        .def_ro("num_nodes",    &ModelMetadata::num_nodes)
         .def_ro("num_params",   &ModelMetadata::num_params)
         .def_ro("num_states",   &ModelMetadata::num_states)
         .def_ro("osdi_version", &ModelMetadata::osdi_version)

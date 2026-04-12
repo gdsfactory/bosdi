@@ -11,14 +11,15 @@ class OsdiModel:
     """A Python representation of a loaded Verilog-A device model."""
 
     id: int
-    num_pins: int
+    num_pins: int  # = num_terminals (external pins only)
+    num_nodes: int  # = num_terminals + num_non_collapsed_internal (voltage array width)
     num_params: int
     num_states: int
     osdi_version: str
 
     def allocate_jax_buffers(self, num_devices: int):
         return {
-            "voltages": jnp.zeros((num_devices, self.num_pins), dtype=jnp.float64),
+            "voltages": jnp.zeros((num_devices, self.num_nodes), dtype=jnp.float64),
             "params": jnp.zeros((num_devices, self.num_params), dtype=jnp.float64),
             "states": jnp.zeros((num_devices, self.num_states), dtype=jnp.float64),
         }
@@ -52,6 +53,7 @@ def load_osdi_model(osdi_filepath: str, version: str = "0.4") -> OsdiModel:
     return OsdiModel(
         id=meta.model_id,
         num_pins=meta.num_pins,
+        num_nodes=meta.num_nodes,
         num_params=meta.num_params,
         num_states=meta.num_states,
         osdi_version=version,
