@@ -33,6 +33,17 @@ extern "C" {
     size_t get_resistive_mask_len(uint32_t model_id);
     void   get_resistive_mask_ffi(uint32_t model_id, uint8_t* out);
 
+    // Structural introspection — paired len + copy-out functions.
+    // Pair accessors write 2*len u32s (node_1, node_2, node_1, node_2, ...).
+    size_t get_resist_jac_pairs_len(uint32_t model_id);
+    void   get_resist_jac_pairs_ffi(uint32_t model_id, uint32_t* out);
+    size_t get_react_jac_pairs_len(uint32_t model_id);
+    void   get_react_jac_pairs_ffi(uint32_t model_id, uint32_t* out);
+    size_t get_collapsible_pairs_len(uint32_t model_id);
+    void   get_collapsible_pairs_ffi(uint32_t model_id, uint32_t* out);
+    size_t get_param_flags_len(uint32_t model_id);
+    void   get_param_flags_ffi(uint32_t model_id, uint32_t* out);
+
     // Phase 2: The batched execution (Rayon zipper in Rust)
     void batched_osdi_eval_ffi(
         uint32_t model_id,
@@ -147,6 +158,40 @@ NB_MODULE(osdi_shim_nb, m) {
         if (n > 0) get_resistive_mask_ffi(model_id, buf.data());
         nb::list result;
         for (size_t i = 0; i < n; i++) result.append(buf[i] != 0);
+        return result;
+    }, nb::arg("model_id"));
+
+    auto fetch_pairs = [](size_t n, auto&& filler) {
+        std::vector<uint32_t> buf(n * 2, 0);
+        if (n > 0) filler(buf.data());
+        nb::list result;
+        for (size_t i = 0; i < n; i++) {
+            result.append(nb::make_tuple((int)buf[i * 2], (int)buf[i * 2 + 1]));
+        }
+        return result;
+    };
+
+    m.def("get_resist_jac_pairs", [fetch_pairs](uint32_t model_id) {
+        size_t n = get_resist_jac_pairs_len(model_id);
+        return fetch_pairs(n, [=](uint32_t* out) { get_resist_jac_pairs_ffi(model_id, out); });
+    }, nb::arg("model_id"));
+
+    m.def("get_react_jac_pairs", [fetch_pairs](uint32_t model_id) {
+        size_t n = get_react_jac_pairs_len(model_id);
+        return fetch_pairs(n, [=](uint32_t* out) { get_react_jac_pairs_ffi(model_id, out); });
+    }, nb::arg("model_id"));
+
+    m.def("get_collapsible_pairs", [fetch_pairs](uint32_t model_id) {
+        size_t n = get_collapsible_pairs_len(model_id);
+        return fetch_pairs(n, [=](uint32_t* out) { get_collapsible_pairs_ffi(model_id, out); });
+    }, nb::arg("model_id"));
+
+    m.def("get_param_flags", [](uint32_t model_id) {
+        size_t n = get_param_flags_len(model_id);
+        std::vector<uint32_t> buf(n, 0);
+        if (n > 0) get_param_flags_ffi(model_id, buf.data());
+        nb::list result;
+        for (size_t i = 0; i < n; i++) result.append(buf[i]);
         return result;
     }, nb::arg("model_id"));
 }

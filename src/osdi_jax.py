@@ -25,7 +25,16 @@ jffi.register_ffi_target(
 @functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
 def osdi_eval(model_id, voltages, params, old_state):
     """
-    Evaluates the OSDI model via the C++ XLA FFI.
+    Evaluate the OSDI model via the C++ XLA FFI.
+
+    Shape contract: ``voltages`` must be ``(N, model.num_nodes)`` — i.e. one
+    entry per *unknown*, including internal Kirchhoff nodes and branch-current
+    auxiliaries, in OSDI node-index order (terminals first, then internals).
+    ``OsdiModel.allocate_jax_buffers()`` is the sanctioned way to get a
+    correctly-sized buffer.
+
+    Outputs ``cur`` and ``chg`` are ``(N, num_nodes)``; ``cond`` and ``cap``
+    are flattened ``(N, num_nodes**2)`` row-major Jacobians.
     """
     # Cast everything to float64, and wrap the model_id in an array for C++
     v = jnp.asarray(voltages, dtype=jnp.float64)
@@ -33,15 +42,15 @@ def osdi_eval(model_id, voltages, params, old_state):
     s = jnp.asarray(old_state, dtype=jnp.float64)
     m_id = jnp.asarray([model_id], dtype=jnp.uint32)
 
-    num_devices, num_pins = v.shape
+    num_devices, num_nodes = v.shape
     num_states = s.shape[1]
-    jac_size = num_pins * num_pins
+    jac_size = num_nodes * num_nodes
 
     # Tell JAX what shapes and types the C++ handler will return
     out_shapes = (
-        jax.ShapeDtypeStruct((num_devices, num_pins), jnp.float64),  # currents
+        jax.ShapeDtypeStruct((num_devices, num_nodes), jnp.float64),  # currents
         jax.ShapeDtypeStruct((num_devices, jac_size), jnp.float64),  # conductances
-        jax.ShapeDtypeStruct((num_devices, num_pins), jnp.float64),  # charges
+        jax.ShapeDtypeStruct((num_devices, num_nodes), jnp.float64),  # charges
         jax.ShapeDtypeStruct((num_devices, jac_size), jnp.float64),  # capacitances
         jax.ShapeDtypeStruct((num_devices, num_states), jnp.float64),  # new_state
     )
@@ -66,9 +75,9 @@ def osdi_eval_jvp(model_id, primals, tangents):
     )
 
     # Reshape the flattened Jacobians for matrix multiplication
-    num_devices, num_pins = v.shape
-    g_matrix = conductances.reshape((num_devices, num_pins, num_pins))
-    c_matrix = capacitances.reshape((num_devices, num_pins, num_pins))
+    num_devices, num_nodes = v.shape
+    g_matrix = conductances.reshape((num_devices, num_nodes, num_nodes))
+    c_matrix = capacitances.reshape((num_devices, num_nodes, num_nodes))
 
     # Calculate analytical directional derivatives using OpenVAF's Jacobian matrices
     t_currents = jnp.einsum("nij,nj->ni", g_matrix, t_v)

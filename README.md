@@ -22,9 +22,11 @@ from osdi_jax import osdi_eval
 
 model = load_osdi_model("path/to/device.osdi")
 
-# Batch of N devices evaluated in parallel via Rayon
+# Batch of N devices evaluated in parallel via Rayon.
+# Use num_nodes (not num_pins) — this includes internal Kirchhoff nodes and
+# branch-current auxiliaries that the solver exposes as unknowns.
 N = 1024
-voltages = jnp.zeros((N, model.num_pins), dtype=jnp.float64)
+voltages = jnp.zeros((N, model.num_nodes), dtype=jnp.float64)
 
 # Pass NaN for parameters you want to leave at Verilog-A defaults.
 # Set only the parameters you care about.
@@ -66,14 +68,15 @@ Pass `jnp.nan` for any parameter you want to leave at its Verilog-A default — 
 
 ## Outputs
 
-All outputs are terminal-only (shape `[N, num_pins]` for currents/charges, `[N, num_pins²]` for Jacobians):
+Outputs are one row per *unknown* — terminals first, then internal Kirchhoff nodes and branch-current auxiliaries.
+`model.num_nodes` is the width; `model.num_pins` is the terminal count (`num_pins ≤ num_nodes`).
 
-| Output | Shape            | Description                          |
-| ------ | ---------------- | ------------------------------------ |
-| `cur`  | `[N, num_pins]`  | Resistive currents at each terminal  |
-| `cond` | `[N, num_pins²]` | dI/dV Jacobian (flattened row-major) |
-| `chg`  | `[N, num_pins]`  | Charges at each terminal             |
-| `cap`  | `[N, num_pins²]` | dQ/dV Jacobian (flattened row-major) |
+| Output | Shape             | Description                          |
+| ------ | ----------------- | ------------------------------------ |
+| `cur`  | `[N, num_nodes]`  | Resistive currents at each unknown   |
+| `cond` | `[N, num_nodes²]` | dI/dV Jacobian (flattened row-major) |
+| `chg`  | `[N, num_nodes]`  | Charges at each unknown              |
+| `cap`  | `[N, num_nodes²]` | dQ/dV Jacobian (flattened row-major) |
 
 ## Installation
 
@@ -107,9 +110,10 @@ pixi run pytest tests/test_osdi.py::test_resistor_dc_evaluation -v
 **Stateful models** (`num_states > 0`, e.g. BSIM3v3, SPICE wrappers): evaluation is skipped and outputs are zeroed.
 Stateful model support is not yet implemented.
 
-**Internal-node models:** bosdi returns terminal-to-terminal quantities only. Models that encode behaviour through
-auxiliary internal nodes (e.g. the compiled inductor, which uses a flux node) will produce zero outputs for the affected
-quantities — the inductive current is present in the full MNA stamp but not extractable through the terminal-only API.
+**Branch-current auxiliary unknowns:** bosdi exposes internal *voltage* nodes as real unknowns in the solver, but models
+that define inductive or ideal-source behaviour through auxiliary *current* unknowns (e.g. the compiled inductor's flux
+node) will still produce zero outputs for the affected quantities — the Jacobian stamp is present in the full MNA system
+but requires a Newton/DAE solve that bosdi does not perform.
 
 **Known crashes:** `bsim4v8.osdi` (crashes in `setup_instance`) and `vbic_vbic_1p3.osdi` (crashes in `eval`) segfault
 with default parameters. Root cause is under investigation. The equivalent 5-terminal models (`bsimbulk106`,

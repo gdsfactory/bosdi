@@ -510,18 +510,34 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     };
     let mut resist_jac_pairs: Vec<(u32, u32)> = Vec::new();
     let mut react_jac_pairs:  Vec<(u32, u32)> = Vec::new();
-    // OsdiJacobianEntry is 16 bytes: {node_1: u32, node_2: u32, field2: u32, field3: u32}.
-    // Ordering: first num_resist_jac entries are resistive, then num_react_jac reactive.
+    // OsdiJacobianEntry (16 bytes), per the OSDI 0.4 header:
+    //     {OsdiNodePair nodes; uint32_t react_ptr_off; uint32_t flags}
+    // Flag bits: _CONST entries carry a pre-computed contribution loaded by
+    // load_jacobian_{resist,react}; the non-_CONST RESIST / REACT bits mark
+    // entries written per-iteration by write_jacobian_array_{resist,react}.
+    // Our scatter reads from the write_jacobian_array outputs, so we index
+    // only by the variable (non-_CONST) bits — those counts match the
+    // descriptor's num_resistive_jacobian_entries / num_reactive_jacobian_entries.
+    // Entries can be dual-flagged (both RESIST and REACT set).
+    const RESIST_MASK: u32 = 4;  // JACOBIAN_ENTRY_RESIST
+    const REACT_MASK:  u32 = 8;  // JACOBIAN_ENTRY_REACT
     for i in 0..num_jac_entries as usize {
         let node_1 = unsafe { read_u32(jac_entries_ptr.add(i * 16), 0) };
         let node_2 = unsafe { read_u32(jac_entries_ptr.add(i * 16), 4) };
-        let react = if i < num_resist_jac as usize { 0u32 } else { 1u32 };
-        if react == 0 {
+        let flags  = unsafe { read_u32(jac_entries_ptr.add(i * 16), 12) };
+        if flags & RESIST_MASK != 0 {
             resist_jac_pairs.push((node_1, node_2));
-        } else {
+        }
+        if flags & REACT_MASK != 0 {
             react_jac_pairs.push((node_1, node_2));
         }
     }
+    // Sanity-check against the descriptor's counts. A mismatch means either the
+    // flag layout changed or num_resist_jac/num_react_jac were miscounted.
+    debug_assert_eq!(resist_jac_pairs.len(), num_resist_jac as usize,
+        "resist_jac_pairs length disagrees with descriptor num_resist_jac");
+    debug_assert_eq!(react_jac_pairs.len(),  num_react_jac as usize,
+        "react_jac_pairs length disagrees with descriptor num_react_jac");
 
     // ── collapsible node pairs ────────────────────────────────────────────────
     // OsdiCollapsibleNode: {node_1: u32, node_2: u32} = 8 bytes.
@@ -700,6 +716,71 @@ pub extern "C" fn get_resistive_mask_ffi(model_id: u32, out: *mut u8) {
     if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
         for (i, &b) in m.resistive_mask.iter().enumerate() {
             unsafe { *out.add(i) = b as u8; }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6c. STRUCTURAL INTROSPECTION FFI
+// Jacobian and collapsible pairs use (node_1, node_2) in raw OSDI indices
+// (0..num_nodes, before collapse). Paired 2-call pattern: len first, then fill.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn copy_pairs(pairs: &[(u32, u32)], out: *mut u32) {
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        unsafe {
+            *out.add(i * 2) = a;
+            *out.add(i * 2 + 1) = b;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn get_resist_jac_pairs_len(model_id: u32) -> usize {
+    OSDI_REGISTRY.read().unwrap().get(&model_id).map(|m| m.resist_jac_pairs.len()).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_resist_jac_pairs_ffi(model_id: u32, out: *mut u32) {
+    if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
+        copy_pairs(&m.resist_jac_pairs, out);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn get_react_jac_pairs_len(model_id: u32) -> usize {
+    OSDI_REGISTRY.read().unwrap().get(&model_id).map(|m| m.react_jac_pairs.len()).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_react_jac_pairs_ffi(model_id: u32, out: *mut u32) {
+    if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
+        copy_pairs(&m.react_jac_pairs, out);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn get_collapsible_pairs_len(model_id: u32) -> usize {
+    OSDI_REGISTRY.read().unwrap().get(&model_id).map(|m| m.collapsible_pairs.len()).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_collapsible_pairs_ffi(model_id: u32, out: *mut u32) {
+    if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
+        copy_pairs(&m.collapsible_pairs, out);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn get_param_flags_len(model_id: u32) -> usize {
+    OSDI_REGISTRY.read().unwrap().get(&model_id).map(|m| m.param_flags.len()).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn get_param_flags_ffi(model_id: u32, out: *mut u32) {
+    if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
+        for (i, &f) in m.param_flags.iter().enumerate() {
+            unsafe { *out.add(i) = f; }
         }
     }
 }
