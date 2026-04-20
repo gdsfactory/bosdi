@@ -48,6 +48,8 @@ class OsdiModel:
     collapsible_pairs: list = field(default_factory=list)
     # Per-param flags from OsdiParamOpvar (see _decode_param_kind/type).
     param_flags: list = field(default_factory=list)
+    # Per-param canonical (alias 0) names in OSDI order. Length == num_params.
+    param_names: list = field(default_factory=list)
 
     @property
     def num_resist_jac(self) -> int:
@@ -111,4 +113,5 @@ def load_osdi_model(osdi_filepath: str, version: str = "0.4") -> OsdiModel:
         react_jac_pairs=list(osdi_shim_nb.get_react_jac_pairs(mid)),
         collapsible_pairs=list(osdi_shim_nb.get_collapsible_pairs(mid)),
         param_flags=list(osdi_shim_nb.get_param_flags(mid)),
+        param_names=list(osdi_shim_nb.get_param_names(mid)),
     )

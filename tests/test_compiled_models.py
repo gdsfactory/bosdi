@@ -358,20 +358,6 @@ def test_compiled_inductor_l_param_affects_output():
 #     models that cannot be evaluated without a Newton solve.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SMOKE_CRASH_REASON = {
-    "bsim4v8": (
-        "bsim4v8.osdi setup_instance crashes (SIGSEGV) with default parameters. "
-        "Root cause is under investigation; likely requires specific critical model "
-        "parameters (tox, ndep) or additional simulator-side initialisation not yet "
-        "implemented in bosdi."
-    ),
-    "vbic_vbic_1p3": (
-        "vbic_vbic_1p3.osdi eval() crashes (SIGSEGV) with default parameters. "
-        "The 4-terminal VBIC model appears to access uninitialised memory during "
-        "evaluation; the 5-terminal variant (vbic_4T_et_cf) does not crash."
-    ),
-}
-
 
 @pytest.mark.parametrize(
     "name,voltages_np,expect_nonzero",
@@ -383,23 +369,11 @@ _SMOKE_CRASH_REASON = {
         ("psp103v4_juncap200", [[0.6, 0.0]], True),  # 2 pins (junction cap)
         # ── bsimbulk (num_states=0, 9 collapsible pairs → non-zero outputs) ──
         ("bsimbulk106", [[1.0, 0.7, 0.0, 0.0, 0.0]], True),  # 5 pins
-        # ── Known crashes — run=False so the process is not killed ────────────
-        pytest.param(
-            "bsim4v8",
-            [[1.0, 0.7, 0.0, 0.0]],
-            True,
-            marks=pytest.mark.xfail(
-                reason=_SMOKE_CRASH_REASON["bsim4v8"], strict=True, run=False
-            ),
-        ),
-        pytest.param(
-            "vbic_vbic_1p3",
-            [[1.0, 0.7, 0.0, 0.0]],
-            True,
-            marks=pytest.mark.xfail(
-                reason=_SMOKE_CRASH_REASON["vbic_vbic_1p3"], strict=True, run=False
-            ),
-        ),
+        # ── bsim4v8 and vbic_vbic_1p3 no longer crash at default params; see
+        # commit b6a2701 (per-entry Jacobian flag parsing fix). The earlier
+        # xfail markers were stale.
+        ("bsim4v8", [[1.0, 0.7, 0.0, 0.0]], True),
+        ("vbic_vbic_1p3", [[1.0, 0.7, 0.0, 0.0]], True),
         # ── diode: forward-biased → non-zero current (fixed: osdi_log + names sentinel) ──
         ("diode", [[0.6, 0.0]], True),
         # ── Stateful models: eval skipped → all outputs are defined zeros ─────

@@ -381,6 +381,10 @@ struct LoadedOsdi {
     /// Nodes where this is false have G[i,:] = 0 always; exposing them as Newton
     /// unknowns makes DC singular — the caller should regularise those rows.
     pub resistive_mask:       Vec<bool>,
+    /// Canonical (alias 0) name of each parameter in param_opvar order.
+    /// Empty strings for params with a null name pointer (shouldn't happen in
+    /// well-formed .osdi binaries).
+    pub param_names:          Vec<String>,
 }
 unsafe impl Send for LoadedOsdi {}
 unsafe impl Sync for LoadedOsdi {}
@@ -498,6 +502,15 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     };
     let param_flags: Vec<u32> = (0..num_params as usize).map(|i| {
         unsafe { read_u32(param_opvar_ptr.add(i * 40), 32) }
+    }).collect();
+    // Also cache the canonical (alias 0) parameter name for each OSDI param.
+    // OsdiParamOpvar.name is a char** at offset +0; name[0] is the canonical name.
+    let param_names: Vec<String> = (0..num_params as usize).map(|i| unsafe {
+        let name_pp = (param_opvar_ptr.add(i * 40) as *const *const *const c_char).read_unaligned();
+        if name_pp.is_null() { return String::new(); }
+        let name_p = *name_pp;
+        if name_p.is_null() { return String::new(); }
+        CStr::from_ptr(name_p).to_string_lossy().into_owned()
     }).collect();
 
     // ── jacobian entry pairs: route write_jacobian output to terminal pairs ───
@@ -682,6 +695,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         react_jac_pairs,
         collapsible_pairs,
         resistive_mask,
+        param_names,
     });
 
     ModelMetadata {
@@ -768,6 +782,30 @@ pub extern "C" fn get_collapsible_pairs_len(model_id: u32) -> usize {
 pub extern "C" fn get_collapsible_pairs_ffi(model_id: u32, out: *mut u32) {
     if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
         copy_pairs(&m.collapsible_pairs, out);
+    }
+}
+
+/// Get parameter name length (in bytes, excluding NUL) for bounds-checking before get_param_name.
+/// Returns 0 if model_id or idx is out of range, or the param has no name.
+#[no_mangle]
+pub extern "C" fn get_param_name_len(model_id: u32, idx: usize) -> usize {
+    OSDI_REGISTRY.read().unwrap().get(&model_id)
+        .and_then(|m| m.param_names.get(idx))
+        .map(|s| s.len())
+        .unwrap_or(0)
+}
+
+/// Copy the UTF-8 bytes of the param name into `out` (no NUL terminator).
+/// `out` must be at least get_param_name_len bytes.
+#[no_mangle]
+pub extern "C" fn get_param_name_ffi(model_id: u32, idx: usize, out: *mut u8) {
+    if let Some(m) = OSDI_REGISTRY.read().unwrap().get(&model_id) {
+        if let Some(s) = m.param_names.get(idx) {
+            let bytes = s.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                unsafe { *out.add(i) = b; }
+            }
+        }
     }
 }
 

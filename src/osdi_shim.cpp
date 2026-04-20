@@ -43,6 +43,8 @@ extern "C" {
     void   get_collapsible_pairs_ffi(uint32_t model_id, uint32_t* out);
     size_t get_param_flags_len(uint32_t model_id);
     void   get_param_flags_ffi(uint32_t model_id, uint32_t* out);
+    size_t get_param_name_len(uint32_t model_id, size_t idx);
+    void   get_param_name_ffi(uint32_t model_id, size_t idx, uint8_t* out);
 
     // Phase 2: The batched execution (Rayon zipper in Rust)
     void batched_osdi_eval_ffi(
@@ -192,6 +194,27 @@ NB_MODULE(osdi_shim_nb, m) {
         if (n > 0) get_param_flags_ffi(model_id, buf.data());
         nb::list result;
         for (size_t i = 0; i < n; i++) result.append(buf[i]);
+        return result;
+    }, nb::arg("model_id"));
+
+    m.def("get_param_name", [](uint32_t model_id, size_t idx) {
+        size_t n = get_param_name_len(model_id, idx);
+        if (n == 0) return std::string();
+        std::vector<uint8_t> buf(n, 0);
+        get_param_name_ffi(model_id, idx, buf.data());
+        return std::string(reinterpret_cast<const char*>(buf.data()), n);
+    }, nb::arg("model_id"), nb::arg("idx"));
+
+    m.def("get_param_names", [](uint32_t model_id) {
+        size_t total = get_param_flags_len(model_id);
+        nb::list result;
+        for (size_t i = 0; i < total; i++) {
+            size_t n = get_param_name_len(model_id, i);
+            if (n == 0) { result.append(std::string()); continue; }
+            std::vector<uint8_t> buf(n, 0);
+            get_param_name_ffi(model_id, i, buf.data());
+            result.append(std::string(reinterpret_cast<const char*>(buf.data()), n));
+        }
         return result;
     }, nb::arg("model_id"));
 }
