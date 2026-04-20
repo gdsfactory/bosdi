@@ -181,6 +181,34 @@ will converge.
 
 Either way, bosdi's outputs are the same. Only the assembly recipe on the host side changes.
 
+### Debug helpers for host developers
+
+`src/osdi_debug.py` ships two post-processing utilities for host-simulator authors who need to audit how bosdi's stamp
+translates into their own assembly. Neither is on the hot path.
+
+```python
+from osdi_debug import schur_reduce, dump_jacobian, format_jacobian_table, classify_rows
+
+# 1. Reduce a device's (num_nodes × num_nodes) stamp onto its terminals.
+#    Pass alpha=0 for a DC Schur reduction on G; pass the host's per-step
+#    integrator coefficient for the transient Newton stamp.
+result = schur_reduce(cur[0], G, chg[0], C, num_pins=model.num_pins, alpha=0.0)
+print(result.j_eff)      # (num_pins, num_pins) reduced Jacobian
+print(result.r_eff)      # (num_pins,)          reduced residual
+print(result.singular)   # True iff A_II was near-singular before gmin
+
+# 2. Dump all non-zero (row, col) entries of a single device's stamp, with
+#    a heuristic flag for Lagrange-style ±1 identity constraint rows
+#    (useful for catching hosts that misread a constraint as a 1 S conductance).
+print(format_jacobian_table(G, C))
+rows = classify_rows(G, C)  # one of: physics / constraint / reactive_only / empty
+```
+
+`schur_reduce` works on both single-device and batched `(N, num_nodes, num_nodes)` arrays and is JAX-compatible, so you
+can `jax.vmap` or `jax.jit` it over a batch of devices. The α-reduced Jacobian is not decomposed back into
+`(G_eff, C_eff)` — the Schur complement of `G + α·C` is nonlinear in α in general, so there's no clean split. Call at
+two α values and finite-difference if you really need a separated capacitance.
+
 ## Installation
 
 ### Using Pixi (recommended for development)
