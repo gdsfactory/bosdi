@@ -62,6 +62,64 @@ extern "C" {
         double* capacitances,
         double* new_state
     );
+
+    // Phase 2 (residual-only): skips Jacobian work; returns only
+    // (currents, charges, new_state). For Newton inner iterations that reuse
+    // a frozen Jacobian from the first iter of the timestep.
+    void batched_osdi_residual_eval_ffi(
+        uint32_t model_id,
+        size_t num_devices,
+        size_t num_pins,
+        size_t num_params,
+        size_t num_states,
+        const double* voltages,
+        const double* params,
+        const double* old_state,
+        double* currents,
+        double* charges,
+        double* new_state
+    );
+
+    // Batch handle API: runs setup_model + setup_instance once for N devices
+    // and stores the resulting snapshots keyed by a handle id. Eval calls
+    // against the handle skip setup entirely.
+    uint64_t osdi_setup_batch_ffi(
+        uint32_t model_id,
+        size_t num_devices,
+        size_t num_params,
+        const double* params
+    );
+    void osdi_free_handle_ffi(uint64_t handle_id);
+    size_t osdi_handle_num_devices(uint64_t handle_id);
+
+    // Handle-based full eval: skips setup entirely. Rust tiles the handle's
+    // snapshots across num_devices (must be a multiple of handle.num_devices).
+    void batched_osdi_eval_handle_ffi(
+        uint64_t handle_id,
+        size_t num_devices,
+        size_t num_pins,
+        size_t num_states,
+        const double* voltages,
+        const double* old_state,
+        double* currents,
+        double* conductances,
+        double* charges,
+        double* capacitances,
+        double* new_state
+    );
+
+    // Handle-based residual-only eval: skips setup + Jacobian pass.
+    void batched_osdi_residual_eval_handle_ffi(
+        uint64_t handle_id,
+        size_t num_devices,
+        size_t num_pins,
+        size_t num_states,
+        const double* voltages,
+        const double* old_state,
+        double* currents,
+        double* charges,
+        double* new_state
+    );
 }
 
 // ---------------------------------------------------------
@@ -127,6 +185,154 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiEvalCpu, batched_osdi_eval_impl,
 );
 
 // ---------------------------------------------------------
+// 3b. RESIDUAL-ONLY XLA FFI HANDLER
+// ---------------------------------------------------------
+
+ffi::Error batched_osdi_residual_eval_impl(
+    ffi::Buffer<ffi::DataType::U32> model_id_buf,
+    ffi::Buffer<ffi::DataType::F64> voltages,
+    ffi::Buffer<ffi::DataType::F64> params,
+    ffi::Buffer<ffi::DataType::F64> old_state,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> currents,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> charges,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> new_state
+) {
+    uint32_t model_id = model_id_buf.typed_data()[0];
+
+    auto v_dims = voltages.dimensions();
+    auto p_dims = params.dimensions();
+    auto s_dims = old_state.dimensions();
+
+    size_t num_devices = v_dims[0];
+    size_t num_pins    = v_dims[1];
+    size_t num_params  = p_dims[1];
+    size_t num_states  = s_dims[1];
+
+    batched_osdi_residual_eval_ffi(
+        model_id,
+        num_devices,
+        num_pins,
+        num_params,
+        num_states,
+        voltages.typed_data(),
+        params.typed_data(),
+        old_state.typed_data(),
+        currents->typed_data(),
+        charges->typed_data(),
+        new_state->typed_data()
+    );
+
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiResidualEvalCpu, batched_osdi_residual_eval_impl,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::U32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+);
+
+// ---------------------------------------------------------
+// 3c. HANDLE-BASED XLA FFI HANDLERS
+// ---------------------------------------------------------
+//
+// The handle_id is a scalar u64 passed as a 1-element U64 buffer — XLA FFI
+// doesn't have scalar attribute support that works cleanly from ffi_call, so
+// we wrap it in a buffer like we do for model_id.
+
+ffi::Error batched_osdi_eval_handle_impl(
+    ffi::Buffer<ffi::DataType::U64> handle_id_buf,
+    ffi::Buffer<ffi::DataType::F64> voltages,
+    ffi::Buffer<ffi::DataType::F64> old_state,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> currents,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> conductances,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> charges,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> capacitances,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> new_state
+) {
+    uint64_t handle_id = handle_id_buf.typed_data()[0];
+
+    auto v_dims = voltages.dimensions();
+    auto s_dims = old_state.dimensions();
+
+    size_t num_devices = v_dims[0];
+    size_t num_pins    = v_dims[1];
+    size_t num_states  = s_dims[1];
+
+    batched_osdi_eval_handle_ffi(
+        handle_id,
+        num_devices,
+        num_pins,
+        num_states,
+        voltages.typed_data(),
+        old_state.typed_data(),
+        currents->typed_data(),
+        conductances->typed_data(),
+        charges->typed_data(),
+        capacitances->typed_data(),
+        new_state->typed_data()
+    );
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiEvalHandleCpu, batched_osdi_eval_handle_impl,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+);
+
+ffi::Error batched_osdi_residual_eval_handle_impl(
+    ffi::Buffer<ffi::DataType::U64> handle_id_buf,
+    ffi::Buffer<ffi::DataType::F64> voltages,
+    ffi::Buffer<ffi::DataType::F64> old_state,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> currents,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> charges,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> new_state
+) {
+    uint64_t handle_id = handle_id_buf.typed_data()[0];
+
+    auto v_dims = voltages.dimensions();
+    auto s_dims = old_state.dimensions();
+
+    size_t num_devices = v_dims[0];
+    size_t num_pins    = v_dims[1];
+    size_t num_states  = s_dims[1];
+
+    batched_osdi_residual_eval_handle_ffi(
+        handle_id,
+        num_devices,
+        num_pins,
+        num_states,
+        voltages.typed_data(),
+        old_state.typed_data(),
+        currents->typed_data(),
+        charges->typed_data(),
+        new_state->typed_data()
+    );
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiResidualEvalHandleCpu, batched_osdi_residual_eval_handle_impl,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+);
+
+// ---------------------------------------------------------
 // 4. NANOBIND EXPORT
 // ---------------------------------------------------------
 
@@ -149,6 +355,35 @@ NB_MODULE(osdi_shim_nb, m) {
     m.def("batched_osdi_eval", []() {
         return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET");
     });
+
+    m.def("batched_osdi_residual_eval", []() {
+        return nb::capsule((void*)&OsdiResidualEvalCpu, "xla._CUSTOM_CALL_TARGET");
+    });
+
+    m.def("batched_osdi_eval_handle", []() {
+        return nb::capsule((void*)&OsdiEvalHandleCpu, "xla._CUSTOM_CALL_TARGET");
+    });
+
+    m.def("batched_osdi_residual_eval_handle", []() {
+        return nb::capsule((void*)&OsdiResidualEvalHandleCpu, "xla._CUSTOM_CALL_TARGET");
+    });
+
+    m.def("osdi_setup_batch", [](uint32_t model_id, size_t num_devices,
+                                  size_t num_params, uintptr_t params_addr) {
+        return osdi_setup_batch_ffi(
+            model_id, num_devices, num_params,
+            reinterpret_cast<const double*>(params_addr)
+        );
+    }, nb::arg("model_id"), nb::arg("num_devices"),
+       nb::arg("num_params"), nb::arg("params_addr"));
+
+    m.def("osdi_free_handle", [](uint64_t handle_id) {
+        osdi_free_handle_ffi(handle_id);
+    }, nb::arg("handle_id"));
+
+    m.def("osdi_handle_num_devices", [](uint64_t handle_id) {
+        return osdi_handle_num_devices(handle_id);
+    }, nb::arg("handle_id"));
 
     m.def("dump_model_info", [](uint32_t model_id) {
         dump_model_info(model_id);
