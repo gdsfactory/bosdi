@@ -7,6 +7,38 @@ use std::os::raw::{c_char, c_void};
 use std::sync::RwLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 0. RAYON DISPATCH POLICY
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Rayon's task-stealing scheduler has a fixed per-task overhead (∼5–20 µs on
+// typical x86_64 desktops) that dominates when the per-item work is small.
+// For PSP103 N=9 ring (18 devices) on 8 cores, ``par_chunks_exact_mut`` is
+// 25 % SLOWER than sequential — the scheduling cost exceeds the work being
+// distributed.  Empirical measurements (2026-04-27, PSP103 ring, OSDI handle
+// path):
+//
+//     N=9   (18 devices)   1-thr 219, 2-thr 193, 4-thr 211, 8-thr 241 µs/step
+//     N=27  (54 devices)   1-thr 514, 2-thr 366, 4-thr 329, 8-thr 357 µs/step
+//
+// Below ~32 devices, sequential beats any parallelism.  Above that, parallelism
+// wins but defaults still over-schedule for moderate sizes.  Switch
+// ``par_chunks_exact_mut`` for ``chunks_exact_mut`` when ``num_devices`` is
+// below ``RAYON_DEVICE_THRESHOLD``.  Override at runtime via the
+// ``BOSDI_RAYON_THRESHOLD`` env var (handy for benchmarking).
+const RAYON_DEVICE_THRESHOLD_DEFAULT: usize = 32;
+
+fn rayon_threshold() -> usize {
+    std::env::var("BOSDI_RAYON_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RAYON_DEVICE_THRESHOLD_DEFAULT)
+}
+
+fn use_parallel(num_devices: usize) -> bool {
+    num_devices >= rayon_threshold()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 1. OSDI VERSION ABSTRACTION
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1156,19 +1188,38 @@ pub extern "C" fn batched_osdi_eval_ffi(
 
     // State slices (num_states=0 for the resistor — avoid par_chunks_exact(0) panic).
     if num_states == 0 {
-        currents.par_chunks_exact_mut(num_pins)
-            .zip(conductances.par_chunks_exact_mut(jac_size))
-            .zip(charges.par_chunks_exact_mut(num_pins))
-            .zip(capacitances.par_chunks_exact_mut(jac_size))
-            .zip(voltages.par_chunks_exact(num_pins))
-            .zip(params.par_chunks_exact(num_params))
-            .for_each(|(((((cur, cond), chg), cap), vol), param)| {
-                cur.fill(0.0);
-                cond.fill(0.0);
-                chg.fill(0.0);
-                cap.fill(0.0);
-                eval_one_device(m, vol, param, cur, cond, chg, cap, false);
-            });
+        // Adaptive parallelism: small ``num_devices`` runs sequentially to
+        // avoid Rayon's per-task scheduling overhead — see the
+        // ``RAYON_DEVICE_THRESHOLD_DEFAULT`` comment for measurements.
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(conductances.par_chunks_exact_mut(jac_size))
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(capacitances.par_chunks_exact_mut(jac_size))
+                .zip(voltages.par_chunks_exact(num_pins))
+                .zip(params.par_chunks_exact(num_params))
+                .for_each(|(((((cur, cond), chg), cap), vol), param)| {
+                    cur.fill(0.0);
+                    cond.fill(0.0);
+                    chg.fill(0.0);
+                    cap.fill(0.0);
+                    eval_one_device(m, vol, param, cur, cond, chg, cap, false);
+                });
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(conductances.chunks_exact_mut(jac_size))
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(capacitances.chunks_exact_mut(jac_size))
+                .zip(voltages.chunks_exact(num_pins))
+                .zip(params.chunks_exact(num_params))
+                .for_each(|(((((cur, cond), chg), cap), vol), param)| {
+                    cur.fill(0.0);
+                    cond.fill(0.0);
+                    chg.fill(0.0);
+                    cap.fill(0.0);
+                    eval_one_device(m, vol, param, cur, cond, chg, cap, false);
+                });
+        }
     } else {
         // Stateful model support is not yet implemented.
         // Zero all output buffers so callers receive defined (zero) values rather
@@ -1219,20 +1270,35 @@ pub extern "C" fn batched_osdi_residual_eval_ffi(
     let charges  = unsafe { std::slice::from_raw_parts_mut(charges_ptr,  num_devices * num_pins) };
 
     if num_states == 0 {
-        currents.par_chunks_exact_mut(num_pins)
-            .zip(charges.par_chunks_exact_mut(num_pins))
-            .zip(voltages.par_chunks_exact(num_pins))
-            .zip(params.par_chunks_exact(num_params))
-            .for_each(|(((cur, chg), vol), param)| {
-                cur.fill(0.0);
-                chg.fill(0.0);
-                // Dummy Jacobian buffers — eval_one_device ignores them when
-                // residual_only = true (neither the CALC_*_JACOBIAN flag nor
-                // the write_jacobian_* calls fire).
-                let mut cond_ignored: [f64; 0] = [];
-                let mut cap_ignored:  [f64; 0] = [];
-                eval_one_device(m, vol, param, cur, &mut cond_ignored, chg, &mut cap_ignored, true);
-            });
+        // See ``use_parallel`` rationale at top of file.
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(voltages.par_chunks_exact(num_pins))
+                .zip(params.par_chunks_exact(num_params))
+                .for_each(|(((cur, chg), vol), param)| {
+                    cur.fill(0.0);
+                    chg.fill(0.0);
+                    // Dummy Jacobian buffers — eval_one_device ignores them when
+                    // residual_only = true (neither the CALC_*_JACOBIAN flag nor
+                    // the write_jacobian_* calls fire).
+                    let mut cond_ignored: [f64; 0] = [];
+                    let mut cap_ignored:  [f64; 0] = [];
+                    eval_one_device(m, vol, param, cur, &mut cond_ignored, chg, &mut cap_ignored, true);
+                });
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(voltages.chunks_exact(num_pins))
+                .zip(params.chunks_exact(num_params))
+                .for_each(|(((cur, chg), vol), param)| {
+                    cur.fill(0.0);
+                    chg.fill(0.0);
+                    let mut cond_ignored: [f64; 0] = [];
+                    let mut cap_ignored:  [f64; 0] = [];
+                    eval_one_device(m, vol, param, cur, &mut cond_ignored, chg, &mut cap_ignored, true);
+                });
+        }
     } else {
         eprintln!("OSDI: stateful models not yet supported (num_states={})", num_states);
         currents.fill(0.0);
@@ -1300,12 +1366,21 @@ pub extern "C" fn osdi_setup_batch_ffi(
     let mut model_data_flat = vec![0u8; num_devices * m.model_size];
     let mut inst_data_flat  = vec![0u8; num_devices * m.instance_size];
 
-    model_data_flat.par_chunks_exact_mut(m.model_size)
-        .zip(inst_data_flat.par_chunks_exact_mut(m.instance_size))
-        .zip(params.par_chunks_exact(num_params))
-        .for_each(|((model_data, inst_data), param)| {
-            setup_device(m, param, model_data, inst_data);
-        });
+    if use_parallel(num_devices) {
+        model_data_flat.par_chunks_exact_mut(m.model_size)
+            .zip(inst_data_flat.par_chunks_exact_mut(m.instance_size))
+            .zip(params.par_chunks_exact(num_params))
+            .for_each(|((model_data, inst_data), param)| {
+                setup_device(m, param, model_data, inst_data);
+            });
+    } else {
+        model_data_flat.chunks_exact_mut(m.model_size)
+            .zip(inst_data_flat.chunks_exact_mut(m.instance_size))
+            .zip(params.chunks_exact(num_params))
+            .for_each(|((model_data, inst_data), param)| {
+                setup_device(m, param, model_data, inst_data);
+            });
+    }
 
     drop(registry);
 
@@ -1462,35 +1537,66 @@ fn run_handle_eval(
     // no-op; when vmap has flattened B replicas on top, this broadcasts the
     // handle's snapshots across the replica axis.
 
+    // Per-device work bodies are inlined into each branch (sequential vs
+    // parallel) — extracting them into a closure measurably hurt parallel
+    // throughput at N=54 (rayon's task-stealing scheduler doesn't always
+    // inline closures cleanly, leaving an indirect call per work item).
     if residual_only {
-        currents.par_chunks_exact_mut(num_pins)
-            .zip(charges.par_chunks_exact_mut(num_pins))
-            .zip(voltages.par_chunks_exact(num_pins))
-            .enumerate()
-            .for_each(|(device_idx, ((cur, chg), vol))| {
-                cur.fill(0.0);
-                chg.fill(0.0);
-                let snap_idx = device_idx % handle_n_devs;
-                let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
-                let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
-                SCRATCH.with(|s| {
-                    let mut scratch = s.borrow_mut();
-                    // Restore the pristine snapshot into scratch — eval may
-                    // mutate inst_data (op-vars) so we can't reuse it in-place.
-                    scratch.model_data.clear();
-                    scratch.model_data.extend_from_slice(model_snap);
-                    scratch.inst_data.clear();
-                    scratch.inst_data.extend_from_slice(inst_snap);
-                    let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                    let mut cond_ignored: [f64; 0] = [];
-                    let mut cap_ignored:  [f64; 0] = [];
-                    eval_device_from_setup(
-                        m, model_data, inst_data, vol,
-                        cur, &mut cond_ignored, chg, &mut cap_ignored,
-                        true, small,
-                    );
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(voltages.par_chunks_exact(num_pins))
+                .enumerate()
+                .for_each(|(device_idx, ((cur, chg), vol))| {
+                    cur.fill(0.0);
+                    chg.fill(0.0);
+                    let snap_idx = device_idx % handle_n_devs;
+                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
+                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
+                    SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.model_data.clear();
+                        scratch.model_data.extend_from_slice(model_snap);
+                        scratch.inst_data.clear();
+                        scratch.inst_data.extend_from_slice(inst_snap);
+                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
+                        let mut cond_ignored: [f64; 0] = [];
+                        let mut cap_ignored:  [f64; 0] = [];
+                        eval_device_from_setup(
+                            m, model_data, inst_data, vol,
+                            cur, &mut cond_ignored, chg, &mut cap_ignored,
+                            true, small,
+                        );
+                    });
                 });
-            });
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(voltages.chunks_exact(num_pins))
+                .enumerate()
+                .for_each(|(device_idx, ((cur, chg), vol))| {
+                    cur.fill(0.0);
+                    chg.fill(0.0);
+                    let snap_idx = device_idx % handle_n_devs;
+                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
+                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
+                    SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.model_data.clear();
+                        scratch.model_data.extend_from_slice(model_snap);
+                        scratch.inst_data.clear();
+                        scratch.inst_data.extend_from_slice(inst_snap);
+                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
+                        let mut cond_ignored: [f64; 0] = [];
+                        let mut cap_ignored:  [f64; 0] = [];
+                        eval_device_from_setup(
+                            m, model_data, inst_data, vol,
+                            cur, &mut cond_ignored, chg, &mut cap_ignored,
+                            true, small,
+                        );
+                    });
+                });
+        }
     } else {
         let conductances = unsafe {
             std::slice::from_raw_parts_mut(conductances_ptr.unwrap(), num_devices * jac_size)
@@ -1499,34 +1605,65 @@ fn run_handle_eval(
             std::slice::from_raw_parts_mut(capacitances_ptr.unwrap(), num_devices * jac_size)
         };
 
-        currents.par_chunks_exact_mut(num_pins)
-            .zip(conductances.par_chunks_exact_mut(jac_size))
-            .zip(charges.par_chunks_exact_mut(num_pins))
-            .zip(capacitances.par_chunks_exact_mut(jac_size))
-            .zip(voltages.par_chunks_exact(num_pins))
-            .enumerate()
-            .for_each(|(device_idx, ((((cur, cond), chg), cap), vol))| {
-                cur.fill(0.0);
-                cond.fill(0.0);
-                chg.fill(0.0);
-                cap.fill(0.0);
-                let snap_idx = device_idx % handle_n_devs;
-                let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
-                let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
-                SCRATCH.with(|s| {
-                    let mut scratch = s.borrow_mut();
-                    scratch.model_data.clear();
-                    scratch.model_data.extend_from_slice(model_snap);
-                    scratch.inst_data.clear();
-                    scratch.inst_data.extend_from_slice(inst_snap);
-                    let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                    eval_device_from_setup(
-                        m, model_data, inst_data, vol,
-                        cur, cond, chg, cap,
-                        false, small,
-                    );
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(conductances.par_chunks_exact_mut(jac_size))
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(capacitances.par_chunks_exact_mut(jac_size))
+                .zip(voltages.par_chunks_exact(num_pins))
+                .enumerate()
+                .for_each(|(device_idx, ((((cur, cond), chg), cap), vol))| {
+                    cur.fill(0.0);
+                    cond.fill(0.0);
+                    chg.fill(0.0);
+                    cap.fill(0.0);
+                    let snap_idx = device_idx % handle_n_devs;
+                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
+                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
+                    SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.model_data.clear();
+                        scratch.model_data.extend_from_slice(model_snap);
+                        scratch.inst_data.clear();
+                        scratch.inst_data.extend_from_slice(inst_snap);
+                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
+                        eval_device_from_setup(
+                            m, model_data, inst_data, vol,
+                            cur, cond, chg, cap,
+                            false, small,
+                        );
+                    });
                 });
-            });
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(conductances.chunks_exact_mut(jac_size))
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(capacitances.chunks_exact_mut(jac_size))
+                .zip(voltages.chunks_exact(num_pins))
+                .enumerate()
+                .for_each(|(device_idx, ((((cur, cond), chg), cap), vol))| {
+                    cur.fill(0.0);
+                    cond.fill(0.0);
+                    chg.fill(0.0);
+                    cap.fill(0.0);
+                    let snap_idx = device_idx % handle_n_devs;
+                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
+                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
+                    SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.model_data.clear();
+                        scratch.model_data.extend_from_slice(model_snap);
+                        scratch.inst_data.clear();
+                        scratch.inst_data.extend_from_slice(inst_snap);
+                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
+                        eval_device_from_setup(
+                            m, model_data, inst_data, vol,
+                            cur, cond, chg, cap,
+                            false, small,
+                        );
+                    });
+                });
+        }
     }
 }
 
