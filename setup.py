@@ -115,7 +115,15 @@ setup(
     version=_version,
     # --- THIS IS THE KEY CHANGE ---
     package_dir={"": "src"},
-    py_modules=["osdi_loader", "osdi_jax"],
+    # Top-level modules (back-compat): existing callers do
+    # ``import osdi_loader`` / ``import osdi_jax`` directly.
+    py_modules=["osdi_loader", "osdi_jax", "osdi_debug"],
+    # Verilog-A → JAX-traceable lowering (the differentiable backend).
+    # Imported as ``from bosdi.va import compile_va, lower, ...``.  Optional
+    # at runtime — needs the ``openvaf_py`` PyO3 binding to compile ``.va``
+    # sources directly; the legacy text-MIR path (``parse_dump``) stays
+    # available for environments without it.
+    packages=["bosdi", "bosdi.va"],
     ext_modules=[osdi_extension],
     cmdclass={"build_ext": BuildExt},
     zip_safe=False,
