@@ -428,6 +428,9 @@ struct LoadedOsdi {
     pub num_slots:             usize,
     /// num_terminals + num_non_collapsed_internal.
     pub num_all_nodes:         usize,
+    /// Number of NQS charge-partition state variables (e.g. 5 for BSIM3v3/4).
+    /// Zero for purely resistive models like the diode.
+    pub num_states:            usize,
 }
 unsafe impl Send for LoadedOsdi {}
 unsafe impl Sync for LoadedOsdi {}
@@ -711,6 +714,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         slot_to_out,
         num_slots,
         num_all_nodes,
+        num_states: num_states as usize,
     });
 
     ModelMetadata {
@@ -911,6 +915,10 @@ struct SmallScratch {
     node_buf: Vec<f64>,
     /// num_resist_jac or num_react_jac f64s — written by write_jacobian_*.
     jac_buf: Vec<f64>,
+    /// 2 * num_states f64s — prev_state (first half) and next_state (second half)
+    /// for stateful models (BSIM3v3/4, etc.).  Both halves are zeroed before each
+    /// eval so DC analysis starts from zero charges.
+    state_buf: Vec<f64>,
 }
 
 thread_local! {
@@ -1043,12 +1051,26 @@ fn eval_device_from_setup(
     let mut names_sentinel: *mut i8 = std::ptr::null_mut();
     let sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
 
+    // Stateful models (BSIM3v3/4, etc.) write NQS charge-partition states to
+    // next_state and may read prev_state.  Pass zero-initialised scratch buffers
+    // so the model has valid pointers.  For DC analysis the states start at zero
+    // and the written values are discarded; for transient the caller propagates
+    // them explicitly (future work).
+    let (prev_state_ptr, next_state_ptr) = if m.num_states > 0 {
+        scratch.state_buf.clear();
+        scratch.state_buf.resize(2 * m.num_states as usize, 0.0);
+        let mid = m.num_states as usize;
+        (scratch.state_buf[..mid].as_mut_ptr(), scratch.state_buf[mid..].as_mut_ptr())
+    } else {
+        (std::ptr::null_mut(), std::ptr::null_mut())
+    };
+
     let mut sim_info = OsdiSimInfo {
         paras:      sim_paras,
         abstime:    0.0,
         prev_solve: scratch.vol_buf.as_mut_ptr(),
-        prev_state: std::ptr::null_mut(),
-        next_state: std::ptr::null_mut(),
+        prev_state: prev_state_ptr,
+        next_state: next_state_ptr,
         flags,
         _pad:       0,
     };
@@ -1221,19 +1243,47 @@ pub extern "C" fn batched_osdi_eval_ffi(
                 });
         }
     } else {
-        // Stateful model support is not yet implemented.
-        // Zero all output buffers so callers receive defined (zero) values rather
-        // than uninitialized memory.  The XLA runtime does NOT guarantee that
-        // output buffers are zeroed before calling the FFI handler.
-        eprintln!("OSDI: stateful models not yet supported (num_states={})", num_states);
-        currents.fill(0.0);
-        conductances.fill(0.0);
-        charges.fill(0.0);
-        capacitances.fill(0.0);
+        // Stateful models: initialise state to zero and evaluate.
+        // States (NQS charge-partition variables in BSIM3v3/4, etc.) are not yet
+        // carried across Newton steps — they start at zero each call.  This gives
+        // correct resistive (DC / low-frequency) behaviour and is sufficient for
+        // operating-point finding and ring-oscillator frequency benchmarking.
+        // Reactive (capacitive) accuracy requires state propagation; that is a
+        // future enhancement.
         let new_state = unsafe {
             std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
         };
         new_state.fill(0.0);
+
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(conductances.par_chunks_exact_mut(jac_size))
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(capacitances.par_chunks_exact_mut(jac_size))
+                .zip(voltages.par_chunks_exact(num_pins))
+                .zip(params.par_chunks_exact(num_params))
+                .for_each(|(((((cur, cond), chg), cap), vol), param)| {
+                    cur.fill(0.0);
+                    cond.fill(0.0);
+                    chg.fill(0.0);
+                    cap.fill(0.0);
+                    eval_one_device(m, vol, param, cur, cond, chg, cap, false);
+                });
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(conductances.chunks_exact_mut(jac_size))
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(capacitances.chunks_exact_mut(jac_size))
+                .zip(voltages.chunks_exact(num_pins))
+                .zip(params.chunks_exact(num_params))
+                .for_each(|(((((cur, cond), chg), cap), vol), param)| {
+                    cur.fill(0.0);
+                    cond.fill(0.0);
+                    chg.fill(0.0);
+                    cap.fill(0.0);
+                    eval_one_device(m, vol, param, cur, cond, chg, cap, false);
+                });
+        }
     }
 }
 
@@ -1300,13 +1350,35 @@ pub extern "C" fn batched_osdi_residual_eval_ffi(
                 });
         }
     } else {
-        eprintln!("OSDI: stateful models not yet supported (num_states={})", num_states);
-        currents.fill(0.0);
-        charges.fill(0.0);
         let new_state = unsafe {
             std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
         };
         new_state.fill(0.0);
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(voltages.par_chunks_exact(num_pins))
+                .zip(params.par_chunks_exact(num_params))
+                .for_each(|(((cur, chg), vol), param)| {
+                    cur.fill(0.0);
+                    chg.fill(0.0);
+                    let mut cond_ignored: [f64; 0] = [];
+                    let mut cap_ignored:  [f64; 0] = [];
+                    eval_one_device(m, vol, param, cur, &mut cond_ignored, chg, &mut cap_ignored, true);
+                });
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(voltages.chunks_exact(num_pins))
+                .zip(params.chunks_exact(num_params))
+                .for_each(|(((cur, chg), vol), param)| {
+                    cur.fill(0.0);
+                    chg.fill(0.0);
+                    let mut cond_ignored: [f64; 0] = [];
+                    let mut cap_ignored:  [f64; 0] = [];
+                    eval_one_device(m, vol, param, cur, &mut cond_ignored, chg, &mut cap_ignored, true);
+                });
+        }
     }
 }
 
@@ -1515,21 +1587,12 @@ fn run_handle_eval(
     let currents = unsafe { std::slice::from_raw_parts_mut(currents_ptr, num_devices * num_pins) };
     let charges  = unsafe { std::slice::from_raw_parts_mut(charges_ptr,  num_devices * num_pins) };
 
+    // Stateful models: states initialised to zero, continue with normal eval.
     if num_states != 0 {
-        eprintln!("OSDI: stateful models not yet supported (num_states={})", num_states);
-        currents.fill(0.0);
-        charges.fill(0.0);
-        if let Some(p) = conductances_ptr {
-            unsafe { std::slice::from_raw_parts_mut(p, num_devices * jac_size) }.fill(0.0);
-        }
-        if let Some(p) = capacitances_ptr {
-            unsafe { std::slice::from_raw_parts_mut(p, num_devices * jac_size) }.fill(0.0);
-        }
         let new_state = unsafe {
             std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
         };
         new_state.fill(0.0);
-        return;
     }
 
     // Per-device snapshot indexing (inlined below): device k uses snapshot
