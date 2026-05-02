@@ -353,6 +353,10 @@ def _literal_expr(val: int | float | bool) -> Expr:
     if isinstance(val, bool):
         return Expr("True" if val else "False")
     if isinstance(val, int):
+        # Emit large integers as float literals — Python ints beyond 2^53
+        # cannot be represented exactly in float64 and overflow JAX tracers.
+        if abs(val) > 2**53:
+            return Expr(_float_literal(float(val)))
         return Expr(str(val))
     return Expr(_float_literal(val))
 
@@ -515,6 +519,7 @@ def _sccp_initial_constants(
     fn: Function,
     interner: HirInterner,
     static_params: dict[str, int | float] | None,
+    sentinel_params: set[str] | None = None,
 ) -> dict[str, object]:
     """Resolve ``static_params`` to per-SSA initial constants for the given function.
 
@@ -523,13 +528,32 @@ def _sccp_initial_constants(
     corresponds to each ``ParamRef``, then feed the value in.  The same
     approach as ``_inject_static_params`` but producing a dict for SCCP
     rather than mutating an Expr env.
+
+    Seeds ``$param_given(X) = False`` only for params explicitly flagged in
+    ``sentinel_params`` (typically the auto-detected sentinel-defaulted
+    floats).  Models like BSIM3v3 use ``$param_given`` to choose between
+    user-supplied and computed parameter values — flagging sentinels as
+    "not given" lets SCCP eliminate the dead "given" branches and prevents
+    sentinel values (−9.9999e−99) from reaching sqrt / log in the inactive
+    branch and producing NaN through JAX's both-branches-evaluated semantics.
+
+    For non-sentinel params, ``$param_given`` is left unseeded — the lowering
+    treats it as a runtime value.  This matches PSP103's expectation that
+    instance params (W, L, AD, …) are always "given" via the user's settings.
     """
-    if not static_params:
-        return {}
     out: dict[str, object] = {}
     for ssa, kind in interner.parameters.items():
-        if isinstance(kind, ParamRef) and kind.name in static_params:
+        if isinstance(kind, ParamRef) and static_params and kind.name in static_params:
             out[ssa] = static_params[kind.name]
+        elif isinstance(kind, ParamGivenRef):
+            # Only force False for known sentinels; leave others unseeded so
+            # the runtime value (effectively True for concrete user values)
+            # is used.  Static-param-listed names are also "given" → True.
+            if sentinel_params is not None and kind.name in sentinel_params:
+                out[ssa] = False
+            elif static_params is not None and kind.name in static_params:
+                out[ssa] = True
+            # else: leave unseeded
     return out
 
 
@@ -643,6 +667,50 @@ def lower(
     # blow-up but the DFS still recurses once per SSA in the worst case.
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 200_000))
 
+    # Auto-detect sentinel-default float params and add them to the SCCP seed.
+    #
+    # BSIM-family models (BSIM3v3, BSIM4, PSP103 JUNCAP …) use −9.9999e−99 as
+    # a sentinel meaning "I was not given by the user; compute me from other
+    # params."  Their guard pattern is:
+    #
+    #     if (poxedge <= −1e−99) { use_tox_instead; } else { use poxedge; }
+    #
+    # In C/SPICE this is a real branch — the ``use poxedge`` path never runs.
+    # In JAX, jnp.where evaluates *both* sides: ``x / poxedge`` with
+    # poxedge ≈ −1e−98 produces ~1e98, which overflows downstream and gives NaN.
+    #
+    # Seeding the sentinel value into SCCP tells it the branch condition is
+    # always True, so the dead ``use poxedge`` block is eliminated from the
+    # rewritten MIR before the Python lowering ever sees it.
+    #
+    # Which params get auto-seeded?  Any float param whose .va default is the
+    # sentinel AND that is not listed in ``differentiable_params`` (the caller
+    # explicitly wants gradients through the primary physics params like nch,
+    # tox, vth0 — not through derived quantities like poxedge).
+    _SENTINEL = -9.9999e-99
+    _diff_set: set[str] = set(differentiable_params) if differentiable_params else set()
+    _sentinel_seed: dict[str, float] = {}
+    if va_defaults is not None:
+        for _name, _spec in va_defaults.items():
+            if _spec.type_ != "float":
+                continue
+            _val = float(_spec.default)
+            # Exact sentinel check (tolerance allows for float-repr rounding).
+            if abs(_val - _SENTINEL) > abs(_SENTINEL) * 1e-4:
+                continue
+            # Don't override explicit static_params or differentiable_params.
+            if _name in _diff_set:
+                continue
+            if static_params and _name in static_params:
+                continue
+            _sentinel_seed[_name] = _val
+
+    # Effective static params for SCCP: explicit overrides take precedence,
+    # sentinel auto-seeds fill in the rest.
+    effective_static: dict[str, int | float] | None = (
+        {**_sentinel_seed, **(static_params or {})} if _sentinel_seed else static_params
+    )
+
     if collapse_nodes:
         _collapse_trivial_nodes(cm)
 
@@ -686,9 +754,14 @@ def lower(
     # collapse to unconditional jumps.
     from .sccp import rewrite_function, run_sccp  # noqa: PLC0415
 
+    _sentinel_set: set[str] | None = (
+        set(_sentinel_seed.keys()) if _sentinel_seed else None
+    )
     init_sccp = run_sccp(
         cm.init_fn,
-        _sccp_initial_constants(cm.init_fn, cm.init_interner, static_params),
+        _sccp_initial_constants(
+            cm.init_fn, cm.init_interner, effective_static, _sentinel_set
+        ),
     )
     init_fn = rewrite_function(cm.init_fn, init_sccp)
 
@@ -698,7 +771,8 @@ def lower(
         cm.init_interner,
         branch_state_name,
         internal_name,
-        static_params,
+        effective_static,
+        _sentinel_set,
     )
     init_defs = _defining_insts(init_fn)
     init_cfg = _build_cfg(init_fn)
@@ -749,8 +823,8 @@ def lower(
     # Inject static-param literals before the eval walk so every downstream
     # SSA expression that reads a static param gets the literal value and
     # binary ops (TYPE == 1, SWGIDL != 0, …) constant-fold to True/False.
-    if static_params:
-        _inject_static_params(static_params, init_env, cm, interner=cm.init_interner)
+    if effective_static:
+        _inject_static_params(effective_static, init_env, cm, interner=cm.init_interner)
 
     # Map each eval arg to its source expression (interner input or cslot).
     eval_env = _initial_env_for_function(
@@ -758,7 +832,8 @@ def lower(
         cm.eval_interner,
         branch_state_name,
         internal_name,
-        static_params,
+        effective_static,
+        _sentinel_set,
     )
     _bind_cslot_args(cm, eval_env, init_env)
 
@@ -770,7 +845,8 @@ def lower(
     eval_sccp_init: dict[str, object] = _sccp_initial_constants(
         cm.eval_fn,
         cm.eval_interner,
-        static_params,
+        effective_static,
+        _sentinel_set,
     )
     for init_val, eval_arg in zip(
         list(cm.cached.mapping)[
@@ -801,8 +877,8 @@ def lower(
             _seen_cache_ref[ref] = len(_init_cache_refs)
             _init_cache_refs.append(ref)
 
-    if static_params:
-        _inject_static_params(static_params, eval_env, cm, interner=cm.eval_interner)
+    if effective_static:
+        _inject_static_params(effective_static, eval_env, cm, interner=cm.eval_interner)
 
     # Residual SSAs must resolve — failure here is a real lowering bug.
     eval_defs = _defining_insts(eval_fn)
@@ -854,7 +930,7 @@ def lower(
         internal_name,
         va_defaults or {},
         used_simparams,
-        static_params=static_params or {},
+        static_params=effective_static or {},
     )
     f_exprs, q_exprs = _collect_residuals(
         cm, eval_env, const_table, ports, states, branch_state_name, internal_name
@@ -878,7 +954,7 @@ def lower(
         q_expressions=q_exprs,
         jacobian_resist=jac_resist,
         jacobian_react=jac_react,
-        static_params=static_params or {},
+        static_params=effective_static or {},
         init_hoist_count=_init_hoist_end,
         init_cache_refs=_init_cache_refs,
         differentiable_params=differentiable_params,
@@ -1131,23 +1207,28 @@ def _build_internal_node_name_map(cm: CompiledModule) -> dict[str, str]:
 def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
     """``BranchId -> circulax state variable name`` for every branch-current unknown.
 
-    Prefers the user's ``.va`` branch name when known (``i_br`` from ``branch
-    (A,B) br``), falls back to ``i_br<id>``. Consulted by both the input-kind
-    lowering (``s.i_br``) and the residual-collection pass (``states=("i_br",)``).
+    Covers both named branches (``Branch``) and unnamed substrate-network
+    probes (``Unnamed``) that carry a ``branch_id`` from the JSON IR client.
+    Prefers the user's ``.va`` branch name for named branches, falls back to
+    ``i_br<id>``.
     """
     mapping: dict[int, str] = {}
     for interner in (cm.eval_interner, cm.init_interner, cm.setup_interner):
         for kind in interner.parameters.values():
-            if (
-                isinstance(kind, CurrentKind)
-                and kind.kind == "Branch"
-                and kind.branch_id is not None
-            ):
-                if kind.branch_id in mapping:
-                    continue
+            if not isinstance(kind, CurrentKind) or kind.branch_id is None:
+                continue
+            if kind.branch_id in mapping:
+                continue
+            if kind.kind == "Branch":
                 mapping[kind.branch_id] = (
                     f"i_{kind.branch}" if kind.branch else f"i_br{kind.branch_id}"
                 )
+            elif kind.kind == "Unnamed":
+                # Unnamed substrate-network probes get a synthetic state name
+                # keyed on the stable BranchId assigned by the JSON IR client.
+                hi = kind.hi or ""
+                lo = kind.lo or ""
+                mapping[kind.branch_id] = f"i_un_{hi}_{lo}_{kind.branch_id}"
     return mapping
 
 
@@ -1171,6 +1252,7 @@ def _initial_env_for_function(
     branch_state_name: dict[int, str],
     internal_name: dict[str, str],
     static_params: dict[str, int | float] | None = None,
+    sentinel_params: set[str] | None = None,
 ) -> dict[str, Expr]:
     """Seed the SSA environment with each argument's semantic source expression.
 
@@ -1189,7 +1271,7 @@ def _initial_env_for_function(
     for val, kind in interner.parameters.items():
         try:
             env[val] = _input_kind_expr(
-                kind, branch_state_name, internal_name, static_params
+                kind, branch_state_name, internal_name, static_params, sentinel_params
             )
         except LoweringError:
             continue
@@ -1363,6 +1445,14 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
             py_op, prec = _BINOPS[op]
             left = resolve(inst.operands[0])
             right = resolve(inst.operands[1])
+            # Identical-operand subtraction: X - X = 0 regardless of X's value.
+            # Detects collapsed internal-node voltage differences (e.g. V(DI,S) and
+            # V(D,S) both resolve to the same expression after node collapse) before
+            # they reach downstream multiplications and produce 0 × ∞ = NaN.
+            if py_op == "-" and left.text == right.text:
+                zero = Expr("0.0")
+                env[ssa] = zero
+                return zero
             lv = _try_literal(left)
             rv = _try_literal(right)
             if lv is not None and rv is not None:
@@ -1374,6 +1464,21 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                         return folded
                     except (ZeroDivisionError, OverflowError, TypeError):
                         pass
+            # Half-literal zero folding for multiplication: when one operand is the
+            # literal 0.0 (e.g. from X-X node-collapse subtraction), fold to "0.0".
+            # The structural-zero path means the product is topologically zero;
+            # emitting the Python literal "0.0" (not a JAX expression) is safe and
+            # prevents the ``inf * 0 = NaN`` IEEE 754 artifact that would appear if
+            # the non-zero operand overflows through a safe-divide-by-zero fallback.
+            if py_op == "*":
+                if lv == 0.0 and rv is None:
+                    zero = Expr("0.0")
+                    env[ssa] = zero
+                    return zero
+                if rv == 0.0 and lv is None:
+                    zero = Expr("0.0")
+                    env[ssa] = zero
+                    return zero
             expr = Expr(
                 f"{_paren(left, prec)} {py_op} {_paren_right(right, prec, py_op)}", prec
             )
@@ -1892,7 +1997,12 @@ def _const_expr(c: Constant) -> Expr:
         assert c.fconst is not None  # noqa: S101 — parser invariant
         return Expr(_float_literal(c.fconst))
     if c.kind == "iconst":
-        return Expr(str(c.iconst))
+        # Emit as float when the value is too large for safe integer tracing
+        # in JAX (e.g. 1e20 from BSIM3v3's internal formulas).
+        v = c.iconst
+        if v is not None and abs(v) > 2**53:
+            return Expr(_float_literal(float(v)))
+        return Expr(str(v))
     if c.kind == "bconst":
         return Expr("True" if c.bconst else "False")
     if c.kind == "sconst":
@@ -1949,6 +2059,7 @@ def _input_kind_expr(  # noqa: C901, PLR0911
     branch_state_name: dict[int, str],
     internal_name: dict[str, str],
     static_params: dict[str, int | float] | None = None,
+    sentinel_params: set[str] | None = None,
 ) -> Expr:
     if isinstance(kind, Voltage):
         if kind.hi is None:
@@ -1963,21 +2074,20 @@ def _input_kind_expr(  # noqa: C901, PLR0911
     if isinstance(kind, ParamRef):
         return Expr(kind.name)
     if isinstance(kind, ParamGivenRef):
-        # $param_given(X) is True only when the user explicitly supplied X
-        # — i.e. baked it via ``static_params``.  Returning ``True``
-        # unconditionally activates Verilog-A branches that should be
-        # gated off by default (e.g. PSP103's breakdown current
-        # ``Ib = ... lexp((-Vf-BV)/(N*VT), ...)`` which assumes the user
-        # set BV; with default ``BV=1e20`` and the gate stuck at True,
-        # the resulting Jacobian destabilises KLU during DC).  Returning
-        # ``False`` here is the correct default for circulax's flow:
-        # parameters not in ``static_params`` are runtime-supplied
-        # (treated as defaulted from the Verilog-A perspective unless
-        # the netlist explicitly overrides them, which we currently
-        # can't distinguish from defaults).
+        # $param_given(X) — was the param explicitly provided by the user?
+        #   * In static_params (baked at compile time): True
+        #   * In sentinel_params (auto-detected sentinel default): False
+        #     The model's else-branch (computed default) is taken.
+        #   * Otherwise (non-sentinel default, runtime-supplied): True
+        #     The user gave a concrete value via the netlist.
+        # The third case fixes PSP103: instance params W, L, AD, … are
+        # always given via netlist settings; returning False there made
+        # the model ignore them and use VA defaults instead.
         if static_params and kind.name in static_params:
             return Expr("True")
-        return Expr("False")
+        if sentinel_params and kind.name in sentinel_params:
+            return Expr("False")
+        return Expr("True")
     if isinstance(kind, TemperatureInput):
         return Expr("_temperature")
     if isinstance(kind, ParamSysFunInput):
@@ -1990,7 +2100,7 @@ def _input_kind_expr(  # noqa: C901, PLR0911
         # Verilog-A variable identifier.
         return Expr(kind.var)
     if isinstance(kind, CurrentKind):
-        if kind.kind == "Branch" and kind.branch_id is not None:
+        if kind.branch_id is not None and kind.kind in ("Branch", "Unnamed"):
             state = branch_state_name.get(kind.branch_id)
             if state is None:
                 msg = f"branch-current input refers to BranchId({kind.branch_id}) with no state mapping"
