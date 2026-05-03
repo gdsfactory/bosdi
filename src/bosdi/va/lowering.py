@@ -1952,9 +1952,32 @@ def _find_simple_diamond(
             return None
         cond_ssa = term.operands[0]
         t_true, t_false = term.targets
-        edges_by_from = {from_a: phi_edges[0].value, from_b: phi_edges[1].value}
-        true_ssa = edges_by_from.get(t_true)
-        false_ssa = edges_by_from.get(t_false)
+        # Special case: when one br target IS the merge block, the
+        # corresponding phi-edge's predecessor IS the decision block —
+        # so ``from_x == dec_a`` instead of matching t_true / t_false.
+        # Two-pass resolution: first match the edges that DO land on
+        # t_true / t_false, then fill the remaining target by elimination.
+        from_blocks = [from_a, from_b]
+        edge_vals = [phi_edges[0].value, phi_edges[1].value]
+        true_ssa: str | None = None
+        false_ssa: str | None = None
+        unassigned: list[int] = []
+        for i, f in enumerate(from_blocks):
+            if f == t_true:
+                true_ssa = edge_vals[i]
+            elif f == t_false:
+                false_ssa = edge_vals[i]
+            else:
+                unassigned.append(i)
+        for i in unassigned:
+            if from_blocks[i] != dec_a:
+                continue
+            if true_ssa is None and false_ssa is not None:
+                true_ssa = edge_vals[i]
+            elif false_ssa is None and true_ssa is not None:
+                false_ssa = edge_vals[i]
+            else:
+                return None
         if true_ssa is None or false_ssa is None:
             return None
         return cond_ssa, true_ssa, false_ssa
