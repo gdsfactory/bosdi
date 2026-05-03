@@ -44,7 +44,14 @@ class ParamSpec:
 
 
 _PARAM_RE = re.compile(
-    r"parameter\s+(real|integer|string)\s+(\w+)\s*=\s*([^;]+?)\s*(?:from\s|exclude\s|;)",
+    # Match `parameter TYPE NAME = default` followed by any of:
+    #   - `from <range>`  (whitespace), `from[lwr:upr]`, `from(lwr:upr)`
+    #   - `exclude <expr>`
+    #   - `;`  (terminator)
+    # IHP's MP* macros emit `from[-1:1]` with no space, so anchor `from`
+    # on a lookahead allowing whitespace OR an opening bracket / paren.
+    r"parameter\s+(real|integer|string)\s+(\w+)\s*=\s*"
+    r"([^;]+?)\s*(?:from(?=[\s\[(])|exclude\s|;)",
     re.MULTILINE,
 )
 
@@ -125,12 +132,26 @@ def _maybe_int_literal(raw: str) -> str | None:
     space between the sign and the digits), so we strip internal
     whitespace before converting. Un-parseable defaults fall back to the
     emitter's ``0`` fallback.
+
+    IHP's MP* parameter macros invoke integer params with float-style
+    literals, e.g. ``MPIty(TYPE, 1.0, ...)`` expands to
+    ``parameter integer TYPE = 1.0 ...``.  ``int("1.0")`` raises, so we
+    parse via ``float`` first and round-trip when the value is integral —
+    otherwise we'd silently drop the parameter and the lowering would
+    emit a wrong default of 0.
     """
     compact = re.sub(r"\s+", "", raw)
     try:
         return str(int(compact))
     except ValueError:
+        pass
+    try:
+        f = float(compact)
+    except ValueError:
         return None
+    if f != int(f):
+        return None
+    return str(int(f))
 
 
 def _maybe_string_literal(raw: str) -> str | None:
