@@ -1806,6 +1806,37 @@ def _lower_phi(  # noqa: C901
                     f"jnp.where({cond.text}, {true_expr.text}, {false_expr.text})"
                 )
 
+    # Case 1b: 3-edge nested diamond (e.g. PSP103's ``expll`` macro).
+    # Pattern: outer if/else where the false-branch contains another
+    # if/else, producing a 3-way merge.  Emit nested ``jnp.where``.
+    if cfg is not None and len(inst.phi_edges) == 3:
+        nested = _find_nested_diamond(inst.phi_edges, cfg)
+        if nested is not None:
+            outer_cond_ssa, inner_cond_ssa, e_outer, e_in_true, e_in_false = nested
+            outer_negated = outer_cond_ssa.startswith("!")
+            if outer_negated:
+                outer_cond_ssa = outer_cond_ssa[1:]
+            outer_cond = resolve_edge(outer_cond_ssa)
+            inner_cond = resolve_edge(inner_cond_ssa)
+            outer_expr = resolve_edge(e_outer)
+            inner_true = resolve_edge(e_in_true)
+            inner_false = resolve_edge(e_in_false)
+            if (
+                outer_cond is not None
+                and inner_cond is not None
+                and outer_expr is not None
+                and inner_true is not None
+                and inner_false is not None
+            ):
+                inner_where = f"jnp.where({inner_cond.text}, {inner_true.text}, {inner_false.text})"
+                if outer_negated:
+                    return Expr(
+                        f"jnp.where({outer_cond.text}, {inner_where}, {outer_expr.text})"
+                    )
+                return Expr(
+                    f"jnp.where({outer_cond.text}, {outer_expr.text}, {inner_where})"
+                )
+
     # Case 2: fallback — pick the most-informative edge.
     #
     # The original heuristic was "first resolvable non-zero edge", which
@@ -1952,6 +1983,163 @@ def _find_simple_diamond(
     if from_ok == t_false:
         return cond_ssa, failed_edge_ssa, ok_edge_ssa
     return None
+
+
+def _find_nested_diamond(
+    phi_edges: list, cfg: _FunctionCfg
+) -> tuple[str, str, str, str, str] | None:
+    """Detect a 3-edge phi from a nested if/else (e.g. PSP103's ``expll``).
+
+    Pattern (from ``expll(x, xlow, …, xhigh, …)``)::
+
+        outer_dec: br(outer_cond, T0, inner_dec)
+            T0 → jmp merge                              # edge 0
+        inner_dec: br(inner_cond, T1, T2)
+            T1 → jmp merge                              # edge 1
+            T2 → jmp merge                              # edge 2
+
+    Returns ``(outer_cond, inner_cond, edge0, edge1, edge2)`` ordered so
+    that the result is::
+
+        jnp.where(outer_cond, edge0,
+                  jnp.where(inner_cond, edge1, edge2))
+
+    Or ``None`` if the pattern doesn't match.
+    """
+    if len(phi_edges) != 3:
+        return None
+
+    def climb(start: str) -> tuple[str, str] | None:
+        cur = start
+        seen: set[str] = set()
+        while cur not in seen:
+            seen.add(cur)
+            term = cfg.terminators.get(cur)
+            if term is not None and term.opcode == "br":
+                return (cur, cur)
+            preds = cfg.preds.get(cur, [])
+            if len(preds) != 1:
+                return None
+            p = preds[0]
+            p_term = cfg.terminators.get(p)
+            if p_term is None:
+                return None
+            if p_term.opcode == "br":
+                return (p, cur)
+            if p_term.opcode == "jmp":
+                cur = p
+                continue
+            return None
+        return None
+
+    climbs = [climb(e.block) for e in phi_edges]
+    if any(c is None for c in climbs):
+        return None
+    # Type narrowing for mypy / readability: c is (decision_block, arrived_from)
+    decisions = [c[0] for c in climbs]  # type: ignore[index]
+    arrived = [c[1] for c in climbs]  # type: ignore[index]
+
+    # Find the unique decision (outer) and the shared one (inner).
+    from collections import Counter
+
+    cnt = Counter(decisions)
+    if sorted(cnt.values()) != [1, 2]:
+        return None
+    outer_dec = next(d for d, n in cnt.items() if n == 1)
+    inner_dec = next(d for d, n in cnt.items() if n == 2)
+    outer_idx = decisions.index(outer_dec)
+    inner_indices = [i for i, d in enumerate(decisions) if d == inner_dec]
+
+    outer_term = cfg.terminators.get(outer_dec)
+    inner_term = cfg.terminators.get(inner_dec)
+    if (
+        outer_term is None
+        or outer_term.opcode != "br"
+        or len(outer_term.targets) != 2
+        or inner_term is None
+        or inner_term.opcode != "br"
+        or len(inner_term.targets) != 2
+    ):
+        return None
+
+    # Confirm that ``inner_dec`` is reachable from ``outer_dec`` via a single
+    # br target (the false-side in PSP103's ``expll`` lowering, but we accept
+    # either side and let the orientation logic below sort it out).
+    o_true, o_false = outer_term.targets
+    inner_chain_target = None
+    for t in (o_true, o_false):
+        # Walk down jmp-only chains from ``t`` to see if it reaches ``inner_dec``.
+        cur = t
+        seen: set[str] = set()
+        while cur not in seen:
+            seen.add(cur)
+            if cur == inner_dec:
+                inner_chain_target = t
+                break
+            term = cfg.terminators.get(cur)
+            if term is None or term.opcode != "jmp" or len(term.targets) != 1:
+                break
+            cur = term.targets[0]
+        if inner_chain_target is not None:
+            break
+    if inner_chain_target is None:
+        return None
+
+    # The "outer" edge of the phi is the one whose climb landed on ``outer_dec``.
+    outer_cond_ssa = outer_term.operands[0]
+    inner_cond_ssa = inner_term.operands[0]
+
+    # Decide outer-edge orientation: which branch of outer_term leads
+    # away from inner_dec (= directly to the merge).  That branch's
+    # ``arrived`` block is in {o_true, o_false} \ {inner_chain_target}.
+    direct_outer_target = o_false if inner_chain_target == o_true else o_true
+    outer_arrived = arrived[outer_idx]
+    if outer_arrived != direct_outer_target:
+        return None
+    # Sense: outer's edge0 takes value when outer_cond == (T → True / F → False).
+    outer_takes_true = direct_outer_target == o_true
+
+    # Inner: assign the two inner-edge SSAs to inner-true / inner-false.
+    i_true, i_false = inner_term.targets
+    inner_true_idx = None
+    inner_false_idx = None
+    for idx in inner_indices:
+        ar = arrived[idx]
+        if ar == i_true:
+            inner_true_idx = idx
+        elif ar == i_false:
+            inner_false_idx = idx
+    if inner_true_idx is None or inner_false_idx is None:
+        return None
+
+    edge_outer = phi_edges[outer_idx].value
+    edge_inner_true = phi_edges[inner_true_idx].value
+    edge_inner_false = phi_edges[inner_false_idx].value
+
+    # Normalise to: jnp.where(outer_cond, edge_outer_when_true,
+    #                          jnp.where(inner_cond, edge_inner_true, edge_inner_false))
+    # If outer's "direct" target is the false branch, we need to flip the outer sense
+    # by emitting the inner-where in the true slot instead.
+    if outer_takes_true:
+        # outer_cond=True → edge_outer; False → enters inner diamond
+        return (
+            outer_cond_ssa,
+            inner_cond_ssa,
+            edge_outer,
+            edge_inner_true,
+            edge_inner_false,
+        )
+    # outer_cond=False → edge_outer; True → enters inner diamond.
+    # Emit as: where(outer_cond, where(inner_cond, e1, e2), edge_outer)
+    # Encoded by setting "outer takes true == False" via a special tag: we
+    # flip caller's sense by negating outer_cond using ``jnp.logical_not``.
+    return (
+        f"!{outer_cond_ssa}",
+        inner_cond_ssa,
+        edge_outer,
+        edge_inner_true,
+        edge_inner_false,
+    )
 
 
 def _residual_ssa_names(cm: CompiledModule) -> list[str]:
