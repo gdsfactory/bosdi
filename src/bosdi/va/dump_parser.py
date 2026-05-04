@@ -1,10 +1,32 @@
-"""Parser for ``openvaf-r --dump-mir`` textual output.
+"""Parser for ``openvaf-r --dump-mir`` and ``--dump-unopt-mir`` textual output.
 
 The dump format is stable (it round-trips through OpenVAF's own
 ``mir_reader`` crate) but is not a formal grammar — this parser is
 regex-driven and pragmatic. It handles exactly the shapes observed in
 ``tests/data/va/resistor.mir.txt``; unrecognised input raises ``DumpParseError``
 rather than silently dropping data.
+
+Both optimized and unoptimized text dumps share the function-body
+syntax. They differ in section headers:
+
+- ``--dump-mir`` emits three split functions per module:
+  ``Optimized model setup MIR of <NAME>``,
+  ``Optimized instance setup MIR of <NAME>``, and
+  ``Optimized evaluation MIR of <NAME>``.
+- ``--dump-unopt-mir`` emits two combined functions:
+  ``Unoptimized MIR (no DAE) of <NAME>`` (pre-DAE-construction analog
+  body) and ``Partially optimized MIR (with DAE) of <NAME>`` (post-DAE
+  but pre-MIR-optimization).
+
+For unopt mode we route the partially-optimized-with-DAE function into
+``eval_fn`` since it carries the DAE residual/jacobian outputs via
+``optbarrier``. ``init_fn`` and ``setup_fn`` are left empty — the
+combined function does init+eval together; the lowering's emitter then
+re-derives the cache-vs-eval split from signal-dependency analysis.
+This sacrifices some pre-instance hoisting but preserves the full
+chain of 2-edge phis (the structural detail that the MIR optimizer
+collapses into N-way phis on deeply-nested conditional inits, which
+in turn breaks the lowering's diamond detection).
 
 The output is a :class:`circulax.va.mir.DumpFile`, a faithful in-memory
 representation. No lowering or opinion applied here.
@@ -153,6 +175,22 @@ def parse_dump(text: str) -> DumpFile:  # noqa: C901, PLR0912, PLR0915
             lines.advance()
             fn = _parse_function(lines)
             eval_fns[mod] = fn
+        elif line.startswith("Partially optimized MIR (with DAE) of "):
+            # ``--dump-unopt-mir`` mode: this function combines init+eval
+            # logic with rich (uncollapsed) phi structure. Route it into
+            # eval_fn; init_fn / setup_fn stay empty so the lowering's
+            # signal-dependency analysis can re-derive the split.
+            mod = line[len("Partially optimized MIR (with DAE) of ") :].strip()
+            lines.advance()
+            fn = _parse_function(lines)
+            eval_fns[mod] = fn
+        elif line.startswith("Unoptimized MIR (no DAE) of "):
+            # ``--dump-unopt-mir`` mode also emits a pre-DAE form of the
+            # same function; we don't need it (the with-DAE version has
+            # everything plus the residual annotations), but we must
+            # consume it so the parser doesn't choke on its body.
+            lines.advance()
+            _ = _parse_function(lines)
         elif line.startswith("Compilation unit:"):
             compilation_unit = line.split(":", 1)[1].strip()
             lines.advance()
