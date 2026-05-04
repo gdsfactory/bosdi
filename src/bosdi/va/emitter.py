@@ -129,15 +129,20 @@ def _emit_physics(device: LoweredDevice) -> str:
     body = _render_body(device)
     decorator = "@source" if device.uses_time else "@component"
 
-    if device.init_cache_refs:
-        decorator_args += f", setup_fn=_{device.class_name}_compute_cache"
-
-    return (
+    block = (
         f"\n{decorator}({decorator_args})\n"
         f"def {device.class_name}({signature}) -> PhysicsReturn:\n"
         f'    """Auto-generated from Verilog-A."""\n'
         f"{body}\n"
     )
+    if device.init_cache_refs:
+        # Register the cache-compute function via ``@<Name>.setup``.
+        block += (
+            f"\n@{device.class_name}.setup\n"
+            f"def _{device.class_name}_register_setup(*_a, **_kw):\n"
+            f"    return _{device.class_name}_setup(*_a, **_kw)\n"
+        )
+    return block
 
 
 def _emit_physics_wrapper(device: LoweredDevice) -> str:
@@ -148,6 +153,11 @@ def _emit_physics_wrapper(device: LoweredDevice) -> str:
     the Newton hot path the custom JVP installed by ``@va_component``
     bypasses this wrapper entirely and calls ``_combined`` once per
     Newton iteration to get all four outputs in a single trace.
+
+    When the device has an init cache, the public physics function
+    declares ``init`` as the first non-reserved positional argument and
+    a separate ``@<Name>.setup`` decorator registers the
+    ``_<Name>_setup`` cache-compute function on the resulting class.
     """
     decorator_args = _render_decorator_args(device)
     signature = _render_signature(device)
@@ -159,8 +169,6 @@ def _emit_physics_wrapper(device: LoweredDevice) -> str:
         f" jacobian_fn=_{device.class_name}_jacobian,"
         f" combined_fn=_{device.class_name}_combined"
     )
-    if device.init_cache_refs:
-        decorator_args += f", setup_fn=_{device.class_name}_compute_cache"
     # Forward ``differentiable_params`` to the decorator so the caller's
     # choice of which params remain JAX leaves vs eqx-static is honoured
     # in the emitted source.  Default ``()`` — all-static, fastest.
@@ -172,13 +180,20 @@ def _emit_physics_wrapper(device: LoweredDevice) -> str:
     # ``differentiable_params=()`` is the @va_component default — no need
     # to render it explicitly.
 
-    return (
+    block = (
         f"\n{decorator}({decorator_args})\n"
         f"def {device.class_name}({signature}) -> PhysicsReturn:\n"
         f'    """Auto-generated from Verilog-A — thin wrapper over ``_combined``."""\n'
         f"    f, q, _j_f, _j_q = _{device.class_name}_combined({arg_forward})\n"
         f"    return f, q\n"
     )
+    if device.init_cache_refs:
+        block += (
+            f"\n@{device.class_name}.setup\n"
+            f"def _{device.class_name}_register_setup(*_a, **_kw):\n"
+            f"    return _{device.class_name}_setup(*_a, **_kw)\n"
+        )
+    return block
 
 
 def _try_eval_literal(expr: str) -> str | None:
@@ -597,13 +612,16 @@ def _hoist_lines(device: LoweredDevice) -> list[str]:
     """
     live = _live_ssas(device)
     if device.init_cache_refs:
-        n = len(device.init_cache_refs)
-        lines: list[str] = [f"    if _init_cache is None: _init_cache = jnp.zeros({n})"]
+        # ``init`` is always provided by the framework (either positionally
+        # via ``@<Name>.setup``-registered cache fn, or as the empty-dict
+        # placeholder during the circulax-side dry-run, where the body's
+        # KeyError is caught and suppressed). No guard needed.
+        lines: list[str] = []
         seen: set[str] = set()
         for i, ref in enumerate(device.init_cache_refs):
             if ref in seen or ref not in live:
                 continue
-            lines.append(f"    {ref} = _init_cache[{i}]")
+            lines.append(f"    {ref} = init[{i}]")
             seen.add(ref)
         for ssa, expr in device.cse_hoists[device.init_hoist_count :]:
             if ssa not in live:
@@ -626,12 +644,16 @@ def _render_hoists(device: LoweredDevice) -> str:
 
 
 def _emit_cache_fn(device: LoweredDevice) -> str:
-    """Render the ``_<Name>_compute_cache`` function when the device has init hoists.
+    """Render the ``_<Name>_setup`` function when the device has init hoists.
 
     This function takes the same parameters as the physics function (minus
-    ``signals``, ``s``, and ``_init_cache`` itself) and returns a
+    ``signals``, ``s``, and ``init`` itself) and returns a
     ``jnp.ndarray`` of shape ``(N,)`` containing the cslot-output values
-    computed once at device-instantiation time.
+    that the eval body indexes into via ``init[i]``.
+
+    Registered onto the component class via ``@<Name>.setup`` so circulax
+    invokes it inside the JAX trace each evaluation — XLA constant-folds
+    when params are static, AD flows when they aren't.
 
     Runs the same constprop / DCE / single-use-inlining passes the
     eval body gets — for PSP103 this collapses a chunk of the 8 k-line
@@ -676,7 +698,7 @@ def _emit_cache_fn(device: LoweredDevice) -> str:
     hoist_block = "\n".join(f"    {ssa} = {expr}" for ssa, expr in init_hoists)
     refs_str = ", ".join(roots)
     return (
-        f"\ndef _{device.class_name}_compute_cache({sig}) -> jnp.ndarray:\n"
+        f"\ndef _{device.class_name}_setup({sig}) -> jnp.ndarray:\n"
         f"{hoist_block}\n"
         f"    return jnp.array([{refs_str}])\n"
     )
@@ -755,7 +777,7 @@ def _prep_combined_body(
     init_cache_lookup: dict[str, str] = {}
     live_refs = _live_init_cache_slots(device)
     for compact_i, ref in enumerate(live_refs):
-        init_cache_lookup[ref] = f"_init_cache[{compact_i}]"
+        init_cache_lookup[ref] = f"init[{compact_i}]"
 
     eval_hoists: list[tuple[str, str]] = []
     # Init-cache lookups come first so the inliner sees them as defs.
@@ -833,15 +855,11 @@ def _prep_combined_body(
     cursor += n_jq
     pre_subst = roots[cursor:]
 
-    # Phase 5: render the surviving hoists.  Cache size is the live-only
-    # count (post-DCE), not the original ``init_cache_refs`` length.
-    if device.init_cache_refs:
-        n_cache = len(live_refs)
-        hoist_lines: list[str] = [
-            f"    if _init_cache is None: _init_cache = jnp.zeros({n_cache})"
-        ]
-    else:
-        hoist_lines = []
+    # Phase 5: render the surviving hoists. ``init`` is always provided
+    # positionally by the framework (or by the empty-dict dry-run, whose
+    # KeyError on integer indexing is caught and suppressed by circulax's
+    # decorator dry-run wrapper). No fallback needed.
+    hoist_lines: list[str] = []
     hoist_lines.extend(f"    {ssa} = {expr}" for ssa, expr in eval_hoists)
 
     return hoist_lines, f_subst, q_subst, jr_subst, jq_subst, pre_subst
@@ -914,17 +932,17 @@ def _render_signature(device: LoweredDevice) -> str:
     fixed: list[str] = ["signals: Signals", "s: States"]
     if device.uses_time:
         fixed.append("t: float")
+    # ``init`` goes between the reserved positionals and the param kwargs
+    # so circulax's signature introspection picks it up as the first
+    # non-reserved positional — that's the trigger for ``@<Name>.setup``
+    # injection. No default: the framework always provides a value
+    # (either the registered setup result, or the empty-dict placeholder
+    # during the decorator dry-run).
+    init_slot = ["init"] if device.init_cache_refs else []
     kwargs = [
         _render_param_kwarg(name, ty, default) for name, ty, default in device.params
     ]
-    if device.init_cache_refs:
-        # Use ``None`` as the sentinel default to avoid dataclasses'
-        # mutable-default rejection of JAX arrays.  The custom ``__init__``
-        # built by ``_build_component`` always replaces this with the
-        # pre-computed array; ``None`` is only seen during the decorator's
-        # dry-run, where the physics body falls back to ``jnp.zeros``.
-        kwargs.append("_init_cache: jnp.ndarray = None")
-    return ", ".join(fixed + kwargs)
+    return ", ".join(fixed + init_slot + kwargs)
 
 
 def _render_forwarded_args(device: LoweredDevice) -> str:
@@ -938,9 +956,11 @@ def _render_forwarded_args(device: LoweredDevice) -> str:
     parts = ["signals", "s"]
     if device.uses_time:
         parts.append("t")
-    parts.extend(f"{name}={name}" for name, _ty, _d in device.params)
+    # ``init`` is positional, matching its position in the public physics
+    # signature emitted by ``_render_signature``.
     if device.init_cache_refs:
-        parts.append("_init_cache=_init_cache")
+        parts.append("init")
+    parts.extend(f"{name}={name}" for name, _ty, _d in device.params)
     return ", ".join(parts)
 
 
