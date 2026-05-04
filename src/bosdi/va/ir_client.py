@@ -169,6 +169,39 @@ def compile_va_unopt(va_path: str | Path) -> DumpFile:
     return dumped
 
 
+def compile_va_opt_mir(va_path: str | Path) -> DumpFile:
+    """Compile via ``openvaf-r --dump-mir`` (optimised text MIR) and parse.
+
+    Unlike ``compile_va`` (``--dump-json``), this uses the textual MIR dump
+    format that has been part of openvaf-r since its initial release — no
+    upstream format changes needed.
+
+    The optimised MIR **has** the init/eval split and ``CachedValues``
+    metadata intact, making it useful as a **validation reference** for the
+    unopt-MIR dependency-analysis partition: compare the number of cache
+    slots openvaf reports here against the number of ``i_``-prefixed hoists
+    the unopt partition produces.
+
+    The eval_fn physics from this path may still have collapsed N-edge phis
+    for complex models (PSP103 ``expll`` macro) — use ``compile_va_unopt``
+    for the actual lowering. This function is for structural metadata only.
+    """
+    from .dump_parser import parse_dump  # local import: optional dep
+
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, "--dump-mir", str(va_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DumpParseError(
+            f"openvaf-r exited {result.returncode} for {va_path}:\n{result.stderr}"
+        )
+    return parse_dump(result.stdout)
+
+
 # ---------------------------------------------------------------------------
 # Module-level parser.
 # ---------------------------------------------------------------------------

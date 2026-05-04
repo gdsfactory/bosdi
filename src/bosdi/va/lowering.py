@@ -214,6 +214,10 @@ class CseState:
     hoist_defs: dict[str, str] = field(default_factory=dict)
     hoist_order: list[str] = field(default_factory=list)
     ssa_prefix: str = ""
+    # When non-empty, any MIR SSA whose name is in this set gets hoisted
+    # with the "i_" prefix regardless of ``ssa_prefix``. Used by the
+    # unopt-MIR init/eval partition path (see ``_partition_init_eval``).
+    init_eligible: frozenset[str] = frozenset()
 
 
 def _compute_refcount(fn: Function, roots: list[str]) -> dict[str, int]:
@@ -621,6 +625,157 @@ def _inject_sccp_constants(
 
 
 # ---------------------------------------------------------------------------
+# Unopt-MIR init/eval partition.
+# ---------------------------------------------------------------------------
+
+
+def _partition_init_eval(
+    fn: "Function",
+    interner: "HirInterner",
+) -> frozenset[str]:
+    """Identify MIR SSA names that are *init-eligible* in a combined function.
+
+    An SSA is init-eligible iff every value it transitively depends on is
+    either a model parameter, temperature, or a numeric/boolean constant —
+    i.e. it has **no dependence on port voltages or branch currents**.  These
+    are exactly the quantities that Verilog-A's ``analog initial`` block
+    computes: device-physics constants that depend only on geometry and doping,
+    not on bias.
+
+    Used by the ``--dump-unopt-mir`` path where ``analog initial`` and
+    ``analog`` are merged into one function: we recover the split by
+    dependency analysis rather than relying on the structured init/eval
+    boundary that ``--dump-json`` / ``--dump-mir`` expose.
+
+    Args:
+        fn:       The combined MIR function (``eval_fn`` from unopt ingestion).
+        interner: Describes what each function argument represents.
+
+    Returns:
+        Frozenset of MIR SSA names whose computation is purely parameter /
+        temperature dependent.  All other SSAs are implicitly eval-only.
+    """
+    # Seed: tag each function argument as param-safe or voltage-polluted.
+    init_safe: set[str] = set()
+    for arg in fn.args:
+        kind = interner.parameters.get(arg)
+        if isinstance(
+            kind, (ParamRef, TemperatureInput, ParamGivenRef, ParamSysFunInput)
+        ):
+            init_safe.add(arg)
+        # Voltage, CurrentKind, AbstimeInput, HiddenStateInput, etc. → eval-only.
+
+    # Constants (literals) are always init-safe.
+    for c in fn.constants:
+        init_safe.add(c.name)
+
+    # Forward propagation: an SSA is init-safe iff ALL its operands are.
+    # Iterate until stable (handles back-edges from loops, though PSP103
+    # has none at this MIR level).
+    changed = True
+    while changed:
+        changed = False
+        for block in fn.blocks:
+            for inst in block.insts:
+                if inst.result is None or inst.result in init_safe:
+                    continue
+                if inst.opcode == "phi":
+                    operands = [edge.value for edge in (inst.phi_edges or [])]
+                else:
+                    operands = list(inst.operands or [])
+                # call operands: target is not an SSA, skip it
+                if inst.opcode == "call":
+                    operands = list(inst.operands or [])
+                if all(op in init_safe for op in operands):
+                    init_safe.add(inst.result)
+                    changed = True
+
+    return frozenset(init_safe)
+
+
+def _compute_unopt_init_cache_refs(
+    cse_hoist_order: list[str],
+    hoist_defs: dict[str, str],
+) -> tuple[int, list[str]]:
+    """From the post-walk hoist list, derive a clean init/eval boundary.
+
+    After a unified eval walk with ``cse.init_eligible`` set, the hoist list
+    contains a mix of ``i_vN`` (init-prefixed) and plain ``vN`` (eval) names
+    in DFS post-order.  Because the shared CSE table can pull plain eval SSAs
+    into the expression of an init hoist (when two SSAs share a sub-expression
+    that was first hoisted as eval), some ``i_vN`` hoists may reference plain
+    ``vN`` names.  Those cannot move to the setup function — demote them to
+    eval by stripping the ``i_`` prefix.
+
+    Algorithm (iterative until stable):
+    1. Any ``i_vN`` whose expression references a plain ``vN`` is demoted to
+       eval (renamed to ``vN`` in hoist_defs and hoist_order).
+    2. Any ``i_vN`` that now references a just-demoted (was ``i_vM``, now
+       ``vM``) name is demoted in the next pass.
+    3. Repeat until no demotions occur.
+
+    After demotion, perform a stable partition: remaining ``i_vN`` hoists
+    first (they only reference each other), then plain ``vN`` hoists.
+    Identify boundary refs (``i_vN`` names referenced in eval expressions).
+
+    Returns:
+        ``(init_hoist_count, init_cache_refs)``.
+    """
+    import re as _re
+
+    _I_NAME = _re.compile(r"\bi_v\d+\b")
+    _V_NAME = _re.compile(r"\bv\d+\b")
+
+    # Work with the caller's lists/dicts directly (mutations propagate back).
+    hoist_order = list(cse_hoist_order)  # local copy of order; written back at end
+
+    # Build a name→expression index for fast lookup.
+    # Iteratively demote i_vN hoists that reference plain vN names.
+    plain_names: set[str] = {h for h in hoist_order if not h.startswith("i_")}
+    changed = True
+    while changed:
+        changed = False
+        new_order: list[str] = []
+        for name in hoist_order:
+            if not name.startswith("i_"):
+                new_order.append(name)
+                continue
+            expr = hoist_defs.get(name, "")
+            # Check if this i_vN expression references any plain vN name.
+            if any(v in plain_names for v in _V_NAME.findall(expr)):
+                # Demote: rename i_vN → vN throughout.
+                plain = name[2:]  # strip "i_"
+                hoist_defs[plain] = hoist_defs.pop(name)
+                # Rewrite any other expression that referenced the old name.
+                for k in list(hoist_defs):
+                    if name in hoist_defs[k]:
+                        hoist_defs[k] = hoist_defs[k].replace(name, plain)
+                plain_names.add(plain)
+                new_order.append(plain)
+                changed = True
+            else:
+                new_order.append(name)
+        hoist_order = new_order
+
+    # Stable partition: all surviving i_vN hoists first, then plain vN.
+    i_order = [h for h in hoist_order if h.startswith("i_")]
+    v_order = [h for h in hoist_order if not h.startswith("i_")]
+    hoist_order = i_order + v_order
+    init_hoist_count = len(i_order)
+
+    # Boundary: i_vN names referenced in eval expressions.
+    eval_exprs = " ".join(hoist_defs.get(h, "") for h in v_order)
+    boundary_set = set(_I_NAME.findall(eval_exprs))
+    cache_refs = [h for h in hoist_order if h in boundary_set]
+
+    # Write corrected order back to the caller's list (hoist_defs was mutated
+    # in-place above so cse.hoist_defs is already up to date).
+    cse_hoist_order[:] = hoist_order
+
+    return init_hoist_count, cache_refs
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry point.
 # ---------------------------------------------------------------------------
 
@@ -747,7 +902,24 @@ def lower(
     # same ``i_v42`` name in scope. Init hoists use the ``i_`` prefix so
     # ``i_v42`` and eval's own ``v42`` never collide.
     all_roots = _residual_ssa_names(cm) + _jacobian_ssa_names(cm)
-    cse = CseState(refcount=_compute_refcount(cm.eval_fn, all_roots), ssa_prefix="i_")
+
+    # Unopt-MIR path: ``--dump-unopt-mir`` merges the analog-initial and
+    # analog blocks into one function, so ``cached.mapping`` is empty and
+    # there is no separate init_fn walk.  Recover the split by dependency
+    # analysis: any SSA whose value depends only on model parameters /
+    # temperature (not port voltages or branch currents) is init-eligible
+    # and will be hoisted with the ``i_`` prefix during the unified walk,
+    # exactly as if it had been resolved in a separate init pass.
+    _is_unopt_combined = not cm.cached.mapping
+    _unopt_init_eligible: frozenset[str] = frozenset()
+    if _is_unopt_combined:
+        _unopt_init_eligible = _partition_init_eval(cm.eval_fn, cm.eval_interner)
+
+    cse = CseState(
+        refcount=_compute_refcount(cm.eval_fn, all_roots),
+        ssa_prefix="i_",
+        init_eligible=_unopt_init_eligible,
+    )
 
     # Run SCCP on the init function, then rewrite it: dead blocks dropped,
     # phi nodes whose dead predecessors are pruned simplify to single-edge
@@ -948,7 +1120,43 @@ def lower(
     else:
         jac_resist, jac_react = {}, {}
 
+    # --- Unopt-MIR post-walk: recover init/eval split from unified walk -----
+    # The unified walk (no separate init_fn pass) interleaves ``i_``-prefixed
+    # init hoists with plain eval hoists in DFS traversal order.  The emitter
+    # expects all init hoists to come first (as ``cse_hoists[:init_hoist_count]``)
+    # followed by eval hoists.  Since init hoists only reference other init
+    # hoists and eval hoists may reference init hoists, a stable partition
+    # (init first, eval second, relative order preserved within each group)
+    # is always a valid topological ordering.
+    if _is_unopt_combined and _unopt_init_eligible:
+        # Demote any i_-prefixed hoist that references a plain eval hoist,
+        # then stable-partition (init first, eval second) and derive the
+        # boundary refs. _compute_unopt_init_cache_refs updates cse.hoist_order
+        # and cse.hoist_defs in-place.
+        _init_hoist_end, _init_cache_refs = _compute_unopt_init_cache_refs(
+            cse.hoist_order, cse.hoist_defs
+        )
+    # -------------------------------------------------------------------------
+
     cse_hoists = [(ssa, cse.hoist_defs[ssa]) for ssa in cse.hoist_order]
+
+    # For the unopt path: the boundary-ref scan in _compute_unopt_init_cache_refs
+    # only searched eval hoist expressions, but residual expressions (f/q) can also
+    # reference i_v... names directly. Add any such names that are missing.
+    if _is_unopt_combined and _init_cache_refs is not None:
+        _i_name_re = re.compile(r"\bi_v\d+\b")
+        _all_residual = " ".join(
+            list(f_exprs.values())
+            + list(q_exprs.values())
+            + [e for _, e in (jac_resist or {}).items()]
+            + [e for _, e in (jac_react or {}).items()]
+        )
+        _init_ref_set = set(_init_cache_refs)
+        _i_order_set = {h for h in cse.hoist_order if h.startswith("i_")}
+        for name in _i_name_re.findall(_all_residual):
+            if name not in _init_ref_set and name in _i_order_set:
+                _init_cache_refs.append(name)
+                _init_ref_set.add(name)
 
     return LoweredDevice(
         class_name=class_name or _camel_case(cm.name),
@@ -1706,7 +1914,12 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
         op in _PASSTHROUGH or op in _CAST_OPS or bool(_TRIVIAL_EXPR_RE.match(expr.text))
     )
     if cse is not None and not skip_hoist:
-        hoist_name = f"{cse.ssa_prefix}{ssa}" if cse.ssa_prefix else ssa
+        # Per-SSA prefix: init-eligible SSAs always use "i_" even during a
+        # unified eval walk (unopt-MIR path where init and eval share one fn).
+        if cse.init_eligible and ssa in cse.init_eligible:
+            hoist_name = f"i_{ssa}"
+        else:
+            hoist_name = f"{cse.ssa_prefix}{ssa}" if cse.ssa_prefix else ssa
         if hoist_name not in cse.hoist_defs:
             cse.hoist_defs[hoist_name] = expr.text
             cse.hoist_order.append(hoist_name)
