@@ -332,6 +332,38 @@ def _eval_inst(
     if op == "abs" or op == "fabs":
         env[inst.result] = abs(_resolve(inst.operands[0], env))
         return
+    if op == "log10":
+        x = _resolve(inst.operands[0], env)
+        env[inst.result] = math.log10(max(x, 1e-300))
+        return
+    if op == "floor":
+        env[inst.result] = math.floor(_resolve(inst.operands[0], env))
+        return
+    if op == "ceil":
+        env[inst.result] = math.ceil(_resolve(inst.operands[0], env))
+        return
+    if op in {"sin", "cos", "tan", "sinh", "cosh", "tanh"}:
+        env[inst.result] = getattr(math, op)(_resolve(inst.operands[0], env))
+        return
+    if op in {"asin", "acos", "atan", "asinh", "acosh", "atanh"}:
+        x = _resolve(inst.operands[0], env)
+        # Clamp inverse-trig domains to avoid ValueErrors at edge cases.
+        if op == "asin" or op == "acos":
+            x = min(max(x, -1.0), 1.0)
+        elif op == "acosh":
+            x = max(x, 1.0)
+        elif op == "atanh":
+            x = min(max(x, -0.999999999), 0.999999999)
+        env[inst.result] = getattr(math, op)(x)
+        return
+    if op == "hypot":
+        a, b = _resolve(inst.operands[0], env), _resolve(inst.operands[1], env)
+        env[inst.result] = math.hypot(a, b)
+        return
+    if op == "atan2":
+        a, b = _resolve(inst.operands[0], env), _resolve(inst.operands[1], env)
+        env[inst.result] = math.atan2(a, b)
+        return
     if op == "pow":
         a, b = _resolve(inst.operands[0], env), _resolve(inst.operands[1], env)
         try:

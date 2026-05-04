@@ -2596,7 +2596,11 @@ def _plan_component_surface(  # noqa: C901, PLR0912
         and "_temperature" not in seen
     ):
         seen.add("_temperature")
-        specs.append(("_temperature", "float", "300.0"))
+        # SPICE / OSDI / VACASK convention: tnom = 27 °C = 300.15 K.
+        # Our prior default of 300.0 K (26.85 °C) introduces a 0.05 %
+        # phitd offset that propagates as ~30x error in sub-threshold
+        # MOSFET currents (exp(Vgs/(n*phitd)) amplification).
+        specs.append(("_temperature", "float", "300.15"))
     if (
         any(isinstance(k, ParamSysFunInput) and k.name == "mfactor" for k in eval_kinds)
         and "_mfactor" not in seen
