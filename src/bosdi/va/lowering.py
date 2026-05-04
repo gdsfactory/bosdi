@@ -113,7 +113,13 @@ _BINOPS: dict[str, tuple[str, int]] = {
 _UNARYOPS: dict[str, str] = {
     "fneg": "-",
     "ineg": "-",
-    "bnot": "not ",
+    # ``bnot`` is the MIR's boolean-NOT opcode. Emitting Python ``not``
+    # raises ``TracerBoolConversionError`` when the operand is a traced
+    # JAX array (the ``not`` operator forces a Python-bool conversion).
+    # ``~`` on a JAX bool array does bitwise-NOT, which equals logical-NOT
+    # for booleans — works under JIT/vmap. Same operator as ``inot`` since
+    # JAX treats them uniformly per-dtype.
+    "bnot": "~",
     "inot": "~",
 }
 
