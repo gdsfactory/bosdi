@@ -921,7 +921,12 @@ _VOLTAGE_RE = re.compile(
 )
 _HIDDEN_RE = re.compile(r"^HiddenState\(VarId\((\d+)\)\)\s*\.\.\s*\"([^\"]+)\"$")
 _SYSFUN_RE = re.compile(r"^ParamSysFun\((\w+)\)$")
-_PORT_CONN_RE = re.compile(r"^PortConnected\s*\{\s*port:\s*(\w+)\s*\}$")
+# IHP r3_cmc renders PortConnected with a trailing label suffix like
+# ``PortConnected { port: node3 } .. "dt"``; juncap200 / mosvar render
+# without the suffix.  Accept both; the label is metadata only.
+_PORT_CONN_RE = re.compile(
+    r'^PortConnected\s*\{\s*port:\s*(\w+)\s*\}(?:\s*\.\.\s*"[^"]*")?$'
+)
 _CURRENT_BRANCH_RE = re.compile(
     r"^Current\(Branch\(BranchId\((\d+)\)\)\)\s*\.\.\s*\"([^\"]+)\"$"
 )
