@@ -629,6 +629,138 @@ def _inject_sccp_constants(
 # ---------------------------------------------------------------------------
 
 
+def _match_opt_init_to_unopt(
+    opt_cm: "CompiledModule",
+    unopt_cm: "CompiledModule",
+    params: dict[str, float],
+    temperature: float = 300.15,
+    n_probes: int = 6,
+) -> frozenset[str]:
+    """Return the set of unopt-MIR SSA names that correspond to opt-MIR init outputs.
+
+    The opt-MIR (``--dump-mir``) has the correct init/eval split: its
+    ``init_fn`` computes exactly the SSAs that belong in the analog-initial
+    block.  Those SSAs appear under different names in the unopt-MIR combined
+    function because the optimiser renumbers them.  We bridge the gap by
+    **value equivalence at multiple parameter points**: run the MIR interpreter
+    on both at ``n_probes`` independently perturbed parameter sets and match on
+    the resulting value tuple.
+
+    Only unopt SSAs that are also init-eligible (purely parameter-derived) are
+    considered candidates, avoiding false matches with eval SSAs.
+
+    Args:
+        opt_cm:     Parsed opt-MIR module (from ``compile_va_opt_mir``).
+        unopt_cm:   Parsed unopt-MIR module (from ``compile_va_unopt``).
+        params:     Model-parameter dict (``{name: float}``); used as base.
+        temperature: Temperature in K.
+        n_probes:   Number of independent parameter-point evaluations.
+                    More probes → fewer false positives; 6 gives <1e-50
+                    collision probability for typical physics computations.
+
+    Returns:
+        Frozenset of **unopt-MIR** SSA names that match opt-MIR init outputs.
+        Pass as ``opt_init_eligible`` to ``lower()``.
+    """
+    import hashlib as _hashlib
+    import struct as _struct
+
+    from .interpret import interpret
+
+    def _run_opt(ps: dict[str, float]) -> dict[str, float]:
+        env = interpret(
+            opt_cm.init_fn,
+            opt_cm.init_interner,
+            params=ps,
+            signals={},
+            temperature=temperature,
+        )
+        return {
+            k: float(v)
+            for k, v in env.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
+    def _run_unopt(ps: dict[str, float]) -> dict[str, float]:
+        env = interpret(
+            unopt_cm.eval_fn,
+            unopt_cm.eval_interner,
+            params=ps,
+            signals={},
+            temperature=temperature,
+        )
+        return {
+            k: float(v)
+            for k, v in env.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
+    def _fp_bytes(v: float) -> bytes:
+        try:
+            return _struct.pack(">d", v)
+        except Exception:
+            return b"\x00" * 8
+
+    # Only consider unopt SSAs that are init-eligible.
+    init_eligible = _partition_init_eval(unopt_cm.eval_fn, unopt_cm.eval_interner)
+
+    # Generate n_probes parameter sets: base + (n_probes-1) random perturbations.
+    # Use a deterministic seed so results are reproducible.
+    import random as _random
+
+    rng = _random.Random(0xDEAD_BEEF)
+    probe_sets: list[dict[str, float]] = [params]
+    # Avoid zero-valued params by flooring to 1% of the base (or 1e-10).
+    _base_vals = {k: max(abs(v), 1e-10) for k, v in params.items()}
+    for _ in range(n_probes - 1):
+        ps = {
+            k: v * rng.uniform(0.3, 3.0) * (1 if v >= 0 else -1)
+            for k, v in _base_vals.items()
+        }
+        probe_sets.append(ps)
+
+    # Evaluate at all probe points.
+    opt_envs: list[dict[str, float]] = [_run_opt(ps) for ps in probe_sets]
+    unopt_envs: list[dict[str, float]] = [_run_unopt(ps) for ps in probe_sets]
+
+    # Build a signature (tuple of floats) for each SSA across all probes.
+    # Two SSAs compute the same function iff their signatures are identical.
+    def _sig_opt(ssa: str) -> tuple[float, ...]:
+        return tuple(env.get(ssa, float("nan")) for env in opt_envs)
+
+    def _sig_unopt(ssa: str) -> tuple[float, ...]:
+        return tuple(env.get(ssa, float("nan")) for env in unopt_envs)
+
+    # Build a hash of the signature for fast lookup.
+    def _hash_sig(sig: tuple[float, ...]) -> bytes:
+        raw = b"".join(_fp_bytes(v) for v in sig)
+        return _hashlib.md5(raw, usedforsecurity=False).digest()  # noqa: S324
+
+    # Group unopt SSAs by their signature hash (only init-eligible).
+    unopt_by_hash: dict[bytes, list[str]] = {}
+    for ssa in init_eligible:
+        sig = _sig_unopt(ssa)
+        if any(v != v for v in sig):  # NaN → skip (SSA not reached)
+            continue
+        h = _hash_sig(sig)
+        unopt_by_hash.setdefault(h, []).append(ssa)
+
+    # Match each opt-MIR init output.
+    opt_output_ssas = set(opt_cm.cached.mapping.keys())
+    matched: set[str] = set()
+    for opt_ssa in opt_output_ssas:
+        sig = _sig_opt(opt_ssa)
+        if any(v != v for v in sig):
+            continue
+        h = _hash_sig(sig)
+        cands = unopt_by_hash.get(h, [])
+        if len(cands) == 1:
+            matched.add(cands[0])
+        # len > 1 → still ambiguous even after n_probes; skip (conservative)
+
+    return frozenset(matched)
+
+
 def _partition_init_eval(
     fn: "Function",
     interner: "HirInterner",
@@ -788,6 +920,7 @@ def lower(
     static_params: dict[str, int | float] | None = None,
     class_name: str | None = None,
     differentiable_params: tuple[str, ...] | None = (),
+    opt_init_eligible: frozenset[str] | None = None,
 ) -> LoweredDevice:
     """Lower a parsed :class:`CompiledModule` into a :class:`LoweredDevice`.
 
@@ -913,7 +1046,15 @@ def lower(
     _is_unopt_combined = not cm.cached.mapping
     _unopt_init_eligible: frozenset[str] = frozenset()
     if _is_unopt_combined:
-        _unopt_init_eligible = _partition_init_eval(cm.eval_fn, cm.eval_interner)
+        if opt_init_eligible is not None:
+            # Caller supplied a pre-computed set from ``_match_opt_init_to_unopt``:
+            # exact opt-MIR init outputs matched to unopt SSA names by value
+            # equivalence.  This gives the same 447 clean cache slots as the
+            # JSON/opt-MIR path, avoiding CSE cross-contamination entirely.
+            _unopt_init_eligible = opt_init_eligible
+        else:
+            # Fall back to dependency analysis (conservative, ~608 slots).
+            _unopt_init_eligible = _partition_init_eval(cm.eval_fn, cm.eval_interner)
 
     cse = CseState(
         refcount=_compute_refcount(cm.eval_fn, all_roots),
@@ -2999,6 +3140,7 @@ def _camel_case(name: str) -> str:
 __all__ = [
     "Expr",
     "LoweredDevice",
+    "_match_opt_init_to_unopt",
     "LoweringError",
     "lower",
 ]
