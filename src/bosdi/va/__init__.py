@@ -5,6 +5,7 @@ MIR dataclasses. Lowering and code emission are follow-on stages.
 """
 
 from .binding import compile_va
+from .ir_client import compile_va_unopt
 from .dump_parser import DumpParseError, parse_dump
 from .emitter import emit_source, write_source
 from .lowering import LoweredDevice, LoweringError, lower
@@ -65,6 +66,7 @@ __all__ = [
     "Value",
     "Voltage",
     "compile_va",
+    "compile_va_unopt",
     "emit_source",
     "lower",
     "parse_dump",
