@@ -1581,25 +1581,29 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                 fn = "jnp.log" if op == "ln" else "jnp.log10"
                 expr = Expr(f"{fn}(jnp.maximum({inner.text}, 1e-300))")
             elif op == "sqrt":
-                # Floor sqrt argument to 1e-30 rather than 0. Using 0 causes
-                # `0.5 / sqrt(0) = inf` in JAX's derivative path (the JVP of
-                # sqrt is 0.5/sqrt(x), which diverges at x=0), and `inf * 0`
-                # propagates as NaN through subsequent ops. A 1e-30 floor keeps
-                # the derivative finite (0.5/sqrt(1e-30) ≈ 5e14) while the
-                # gradient of jnp.maximum(x, 1e-30) w.r.t. x is 0 for x<1e-30,
-                # so the chain rule gives 5e14 * 0 = 0 — no NaN. The primal
-                # change (sqrt(1e-30) ≈ 3e-16 instead of 0) is negligible for
-                # dead-branch values that would have been masked by jnp.where.
-                # Verilog-A physics guards sqrt() calls with conditional branches
-                # (e.g. JUNCAP200's `if (V < VMAX) ... else { zinv = sqrt(idmult) }`
-                # — the else branch is only valid when V >= VMAX). The diamond-phi
-                # lifter emits jnp.where for simple diamonds but falls back to
-                # picking one edge when nested if/else defeats the single-
-                # predecessor walk. JAX
-                # evaluates all paths eagerly, so sqrt of a large negative from
-                # the dead else-branch produces NaN that poisons downstream ops.
-                # Flooring to 1e-30 (rather than 0) prevents inf gradients.
-                expr = Expr(f"jnp.sqrt(jnp.maximum({inner.text}, 1e-30))")
+                # Floor sqrt argument to 1e-300 (the float64 normal-min floor)
+                # rather than 0. Using 0 causes `0.5 / sqrt(0) = inf` in
+                # JAX's derivative path (the JVP of sqrt is 0.5/sqrt(x),
+                # which diverges at x=0), and `inf * 0` propagates as NaN
+                # through subsequent ops.
+                #
+                # Originally floored to 1e-30, but that's way too high for
+                # IHP juncap200's tunneling-physics prefactors:
+                #     btatpartbot = sqrt(32 * meff * m_e * q * vbi^3) / hbar
+                # has a sqrt argument around 1e-49 at default IHP params
+                # (MEFFTATBOT=0.25, vbi≈0.55V). Clamping that to 1e-30
+                # gives sqrt = 1e-15 instead of the true ~4.4e-25 — a 10
+                # orders of magnitude error that propagates downstream and
+                # blows the residual current up by ~1e10. The 1e-300 floor
+                # is small enough that no realistic physics value gets
+                # clamped, while keeping the gradient finite (5e149 — large
+                # but representable in float64).
+                #
+                # The dead-branch concern (sqrt of a large-negative-from-
+                # discarded-else producing NaN) is addressed by jnp.maximum
+                # itself, which clamps any negative input back to the
+                # floor regardless of magnitude.
+                expr = Expr(f"jnp.sqrt(jnp.maximum({inner.text}, 1e-300))")
             else:
                 expr = Expr(f"{_MATH1[op]}({inner.text})")
         elif op in _MATH2:
