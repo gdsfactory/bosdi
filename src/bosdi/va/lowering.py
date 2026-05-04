@@ -1331,6 +1331,8 @@ class _FunctionCfg:
 
     terminators: dict[str, Inst]  # block label -> its terminator instruction
     preds: dict[str, list[str]]  # block label -> predecessor block labels
+    entry: str | None  # entry block label (first block of the function)
+    idom: dict[str, str]  # immediate dominator of each reachable block
 
 
 def _build_cfg(fn: Function) -> _FunctionCfg:
@@ -1346,7 +1348,79 @@ def _build_cfg(fn: Function) -> _FunctionCfg:
         terminators[b.label] = term
         for tgt in term.targets:
             preds.setdefault(tgt, []).append(b.label)
-    return _FunctionCfg(terminators=terminators, preds=preds)
+    entry = fn.blocks[0].label if fn.blocks else None
+    idom = _compute_idom(entry, preds, terminators) if entry is not None else {}
+    return _FunctionCfg(terminators=terminators, preds=preds, entry=entry, idom=idom)
+
+
+def _compute_idom(
+    entry: str,
+    preds: dict[str, list[str]],
+    terminators: dict[str, Inst],
+) -> dict[str, str]:
+    """Cooper-Harvey-Kennedy iterative immediate-dominator analysis.
+
+    Returns ``{block: idom(block)}`` for every reachable block.  The entry
+    block has no idom and is omitted from the result.  ``idom[b]`` is the
+    closest strict dominator of ``b`` — the unique block that every path
+    from entry to ``b`` must pass through, that itself doesn't dominate
+    any other strict dominator of ``b``.
+
+    For a diamond merge block, ``idom[merge]`` is the decision block —
+    even when the branches between contain arbitrary internal control
+    flow.  Climb-based detection in ``_find_simple_diamond`` fails when
+    both branches have nested if/elses (juncap200's express vs full-
+    junction physics path is the canonical case); idom handles it
+    natively because every path from entry to merge still goes through
+    the outer decision.
+    """
+    # Reverse-postorder traversal of reachable blocks.
+    rpo: list[str] = []
+    visited: set[str] = set()
+
+    def dfs(blk: str) -> None:
+        if blk in visited:
+            return
+        visited.add(blk)
+        term = terminators.get(blk)
+        if term is not None:
+            for tgt in term.targets:
+                dfs(tgt)
+        rpo.append(blk)
+
+    dfs(entry)
+    rpo.reverse()
+    rpo_idx = {b: i for i, b in enumerate(rpo)}
+
+    # Standard CHK iterative algorithm.
+    idom: dict[str, str] = {entry: entry}
+
+    def _intersect(b1: str, b2: str) -> str:
+        finger1, finger2 = b1, b2
+        while finger1 != finger2:
+            while rpo_idx[finger1] > rpo_idx[finger2]:
+                finger1 = idom[finger1]
+            while rpo_idx[finger2] > rpo_idx[finger1]:
+                finger2 = idom[finger2]
+        return finger1
+
+    changed = True
+    while changed:
+        changed = False
+        for blk in rpo[1:]:  # skip entry
+            block_preds = [p for p in preds.get(blk, []) if p in idom]
+            if not block_preds:
+                continue
+            new_idom = block_preds[0]
+            for other in block_preds[1:]:
+                new_idom = _intersect(other, new_idom)
+            if idom.get(blk) != new_idom:
+                idom[blk] = new_idom
+                changed = True
+
+    # Drop the self-mapping for the entry block — it has no strict idom.
+    idom.pop(entry, None)
+    return idom
 
 
 def _defining_insts(fn: Function) -> dict[str, Inst]:
@@ -1764,9 +1838,17 @@ def _lower_phi(  # noqa: C901
     # static-condition phis still fold; runtime-condition phis still
     # emit ``jnp.where``.
 
-    # Case 1: try diamond.
+    # Case 1: try diamond detection.  Try the cheap climb-based detector
+    # first (handles trivial pure-diamond and one-sided cases), then fall
+    # back to the dominator-based detector for diamonds where both
+    # branches contain internal control flow (e.g. juncap200's express
+    # vs full-junction-physics if/else, where each branch has nested
+    # if-blocks for SRH / BBT / avalanche corrections — the climb can't
+    # walk through the internal phi-merges).
     if cfg is not None and len(inst.phi_edges) == 2:
         diamond = _find_simple_diamond(inst.phi_edges, cfg)
+        if diamond is None:
+            diamond = _find_dominator_diamond(inst.phi_edges, cfg)
         if diamond is not None:
             cond_ssa, true_edge_ssa, false_edge_ssa = diamond
 
@@ -1891,6 +1973,97 @@ def _lower_phi(  # noqa: C901
             return e
     # Priority 4: last-resort.
     return resolved[0]
+
+
+def _find_dominator_diamond(
+    phi_edges: list, cfg: _FunctionCfg
+) -> tuple[str, str, str] | None:
+    """Detect a 2-edge diamond using the immediate-dominator tree.
+
+    Used as a fallback when ``_find_simple_diamond``'s climb-based
+    detection fails because both branches contain internal control flow
+    (nested if/else, internal phi-merges).
+
+    Strategy: locate the merge block (the unique block whose predecessor
+    set is a superset of both phi-edge predecessor blocks). The
+    immediate dominator of the merge block is the outer decision —
+    every path from entry to the merge passes through it, regardless of
+    internal control flow within each branch. If that dominator is
+    ``br``-terminated, we have a clean diamond. Map the phi edges to
+    true / false sides via forward reachability from each br target,
+    bounded by the decision block (so we don't cycle back).
+
+    Returns ``(cond_ssa, true_edge_ssa, false_edge_ssa)`` or ``None``.
+    """
+    if len(phi_edges) != 2:
+        return None
+
+    # Find the merge block: the unique block whose predecessor set
+    # contains both edge-predecessor blocks. (For a pure diamond the
+    # merge block's preds == {edge0.block, edge1.block} but for
+    # asymmetric diamonds where one edge-block is itself the merge's
+    # parent there can be additional preds.)
+    edge_blocks = {e.block for e in phi_edges}
+    merge: str | None = None
+    for blk, blk_preds in cfg.preds.items():
+        if edge_blocks.issubset(set(blk_preds)):
+            merge = blk
+            break
+    if merge is None:
+        return None
+
+    decision = cfg.idom.get(merge)
+    if decision is None:
+        return None
+    term = cfg.terminators.get(decision)
+    if term is None or term.opcode != "br" or len(term.targets) != 2:
+        return None
+
+    cond_ssa = term.operands[0]
+    t_true, t_false = term.targets
+
+    # Forward-reachability from each br target, stopping at ``decision``
+    # (don't cycle back through it) and at ``merge`` (don't cross over).
+    def _reach(start: str) -> set[str]:
+        seen: set[str] = set()
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            if cur in seen or cur == decision or cur == merge:
+                continue
+            seen.add(cur)
+            term_cur = cfg.terminators.get(cur)
+            if term_cur is None:
+                continue
+            for tgt in term_cur.targets:
+                if tgt not in seen and tgt != decision:
+                    stack.append(tgt)
+        return seen
+
+    reach_true = _reach(t_true) | {t_true}
+    reach_false = _reach(t_false) | {t_false}
+
+    true_ssa: str | None = None
+    false_ssa: str | None = None
+    for edge in phi_edges:
+        in_t = edge.block in reach_true
+        in_f = edge.block in reach_false
+        if in_t and not in_f:
+            if true_ssa is not None:
+                return None
+            true_ssa = edge.value
+        elif in_f and not in_t:
+            if false_ssa is not None:
+                return None
+            false_ssa = edge.value
+        else:
+            # Edge predecessor is reachable from both sides, or neither
+            # — can't unambiguously assign.
+            return None
+
+    if true_ssa is None or false_ssa is None:
+        return None
+    return cond_ssa, true_ssa, false_ssa
 
 
 def _find_simple_diamond(
