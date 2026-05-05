@@ -1270,10 +1270,10 @@ def lower(
     # (init first, eval second, relative order preserved within each group)
     # is always a valid topological ordering.
     if _is_unopt_combined and _unopt_init_eligible:
-        # Demote any i_-prefixed hoist that references a plain eval hoist,
-        # then stable-partition (init first, eval second) and derive the
-        # boundary refs. _compute_unopt_init_cache_refs updates cse.hoist_order
-        # and cse.hoist_defs in-place.
+        # Single-phase walk + post-walk demotion: init hoists with eval
+        # cross-references get demoted to eval; remaining i_v... become
+        # init cache slots. Two-phase walk was tried but has SCCP/constant-
+        # injection interactions that need more careful work.
         _init_hoist_end, _init_cache_refs = _compute_unopt_init_cache_refs(
             cse.hoist_order, cse.hoist_defs
         )
