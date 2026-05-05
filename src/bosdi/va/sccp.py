@@ -242,9 +242,24 @@ class SccpResult:
     # callers (the lowering walk's PHI handler in particular) can ask
     # ``live_phi_value`` without rebuilding the index themselves.
     ssa_block: dict[str, str] = field(default_factory=dict)
+    # ``voltage_tainted`` contains every SSA whose computation chain
+    # involved at least one runtime input (Voltage / CurrentKind /
+    # HiddenStateInput / etc. — any function arg seeded as BOTTOM).
+    # An SSA can be both ``is_constant`` and voltage-tainted: this means
+    # the value happens to be constant at SCCP analysis time (e.g. a
+    # multiplication with a structural-zero) but only because of how
+    # the runtime inputs cancel.  Such "structural-zero" constants are
+    # NOT safe to bake into a setup function: at runtime the underlying
+    # voltage chain still needs to produce intermediate non-zero values
+    # for downstream computations to be correct.
+    voltage_tainted: set[str] = field(default_factory=set)
 
     def lattice_value(self, ssa: str) -> LatticeValue:
         return self.lattice.get(ssa, _TOP)
+
+    def is_voltage_tainted(self, ssa: str) -> bool:
+        """True if SSA's computation involved any runtime (BOTTOM-seeded) input."""
+        return ssa in self.voltage_tainted
 
     def is_block_dead(self, label: str) -> bool:
         return label not in self.visited_blocks
@@ -294,6 +309,7 @@ class _Sccp:
 
     fn: Function
     initial_constants: dict[str, Any]
+    voltage_arg_names: set[str] = field(default_factory=set)
 
     lattice: dict[str, LatticeValue] = field(default_factory=dict)
     executable_edges: set[tuple[str, str]] = field(default_factory=set)
@@ -319,7 +335,53 @@ class _Sccp:
             executable_edges=self.executable_edges,
             visited_blocks=self.visited_blocks,
             ssa_block=self.inst_block,
+            voltage_tainted=self._compute_voltage_taint(),
         )
+
+    def _compute_voltage_taint(self) -> set[str]:
+        """Forward-propagate voltage-input taint through the def-use graph.
+
+        An SSA is voltage-tainted iff at least one of its dependencies is a
+        Voltage / CurrentKind / HiddenStateInput (or other runtime-only
+        input).  Param args that happen to be BOTTOM at SCCP analysis time
+        (because they're runtime-supplied) are NOT taint sources — they're
+        legitimate setup-function inputs.
+
+        The caller distinguishes these via ``voltage_arg_names`` (passed
+        through ``run_sccp``); only those args seed the taint set.
+
+        Use case: lowering must NOT bake a voltage-tainted constant into a
+        setup function — even if SCCP proves it constant via cancellation
+        like ``V(D,D) * coeff = 0``, the runtime computation chain still
+        needs to flow through the voltage operands for downstream
+        intermediates to be correct.
+        """
+        # Seed: only explicitly-tagged voltage args.
+        tainted: set[str] = set(self.voltage_arg_names)
+
+        # Iterate to fixpoint: any inst whose result depends on a tainted
+        # operand becomes tainted.
+        changed = True
+        while changed:
+            changed = False
+            for block in self.fn.blocks:
+                if block.label not in self.visited_blocks:
+                    continue
+                for inst in block.insts:
+                    if inst.result is None or inst.result in tainted:
+                        continue
+                    if inst.opcode == "phi":
+                        operands = [
+                            edge.value
+                            for edge in (inst.phi_edges or [])
+                            if (edge.block, block.label) in self.executable_edges
+                        ]
+                    else:
+                        operands = list(inst.operands or [])
+                    if any(op in tainted for op in operands):
+                        tainted.add(inst.result)
+                        changed = True
+        return tainted
 
     # ------------------------------------------------------------------
     # Setup
@@ -503,6 +565,8 @@ def _const_to_lattice(c: Constant) -> LatticeValue:
 def run_sccp(
     fn: Function,
     initial_constants: dict[str, Any] | None = None,
+    *,
+    voltage_arg_names: set[str] | None = None,
 ) -> SccpResult:
     """Run SCCP on a single MIR :class:`Function`.
 
@@ -523,7 +587,11 @@ def run_sccp(
         constants, prune dead blocks, and short-circuit PHIs without
         having to reproduce the analysis itself.
     """
-    driver = _Sccp(fn=fn, initial_constants=dict(initial_constants or {}))
+    driver = _Sccp(
+        fn=fn,
+        initial_constants=dict(initial_constants or {}),
+        voltage_arg_names=set(voltage_arg_names or ()),
+    )
     return driver.run()
 
 

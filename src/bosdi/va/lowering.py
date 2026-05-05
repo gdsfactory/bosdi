@@ -49,6 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .mir import (
+    AbstimeInput,
     CachedValues,
     CompiledModule,
     Constant,
@@ -568,7 +569,11 @@ def _sccp_initial_constants(
 
 
 def _inject_sccp_constants(
-    env: dict[str, Expr], sccp_result: object, fn: Function | None = None
+    env: dict[str, Expr],
+    sccp_result: object,
+    fn: Function | None = None,
+    *,
+    skip_voltage_tainted: bool = False,
 ) -> int:
     """Pre-load *env* with literal Exprs for every SSA SCCP marked CONSTANT.
 
@@ -590,6 +595,12 @@ def _inject_sccp_constants(
     runtime ``jnp.where`` that evaluates both branches at JAX time.
     Skipping phi-result injection costs a few literals but avoids
     eliminating valid voltage chains.
+
+    When ``skip_voltage_tainted=True`` (used by the unopt two-phase init
+    walk), SSAs marked as voltage-tainted in the SCCP result are also
+    skipped.  These are constants whose value depends on runtime input
+    cancellation (e.g. ``V(D,D) * coeff = 0`` after node collapse) — they
+    must NOT be baked into a setup function.
     """
     from .sccp import (
         SccpResult,
@@ -611,6 +622,8 @@ def _inject_sccp_constants(
         if ssa in env:
             continue
         if ssa in phi_results:
+            continue
+        if skip_voltage_tainted and ssa in sccp_result.voltage_tainted:
             continue
         # Skip non-numeric constants — strings don't take part in the
         # binop folder and the lowering's existing handling of ``sconst``
@@ -1177,7 +1190,30 @@ def lower(
         lat = init_sccp.lattice_value(init_val)
         if lat.is_constant:
             eval_sccp_init[eval_arg] = lat.value
-    eval_sccp = run_sccp(cm.eval_fn, eval_sccp_init)
+    # Identify "voltage" args (Voltage, CurrentKind, HiddenStateInput, etc.)
+    # by interner kind so SCCP can compute voltage-taint provenance for the
+    # unopt two-phase init walk's ``skip_voltage_tainted`` filter.
+    _voltage_arg_names: set[str] = set()
+    for _arg in cm.eval_fn.args:
+        _kind = cm.eval_interner.parameters.get(_arg)
+        if isinstance(
+            _kind,
+            (
+                Voltage,
+                CurrentKind,
+                HiddenStateInput,
+                AbstimeInput,
+                PrevStateInput,
+                NewStateInput,
+                EnableLimInput,
+                PortConnectedInput,
+            ),
+        ):
+            _voltage_arg_names.add(_arg)
+
+    eval_sccp = run_sccp(
+        cm.eval_fn, eval_sccp_init, voltage_arg_names=_voltage_arg_names
+    )
     eval_fn = rewrite_function(cm.eval_fn, eval_sccp)
     _inject_sccp_constants(eval_env, eval_sccp, eval_fn)
 
@@ -1272,8 +1308,7 @@ def lower(
     if _is_unopt_combined and _unopt_init_eligible:
         # Single-phase walk + post-walk demotion: init hoists with eval
         # cross-references get demoted to eval; remaining i_v... become
-        # init cache slots. Two-phase walk was tried but has SCCP/constant-
-        # injection interactions that need more careful work.
+        # init cache slots.
         _init_hoist_end, _init_cache_refs = _compute_unopt_init_cache_refs(
             cse.hoist_order, cse.hoist_defs
         )
