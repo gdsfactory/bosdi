@@ -1306,9 +1306,10 @@ def lower(
     # (init first, eval second, relative order preserved within each group)
     # is always a valid topological ordering.
     if _is_unopt_combined and _unopt_init_eligible:
-        # Single-phase walk + post-walk demotion: init hoists with eval
-        # cross-references get demoted to eval; remaining i_v... become
-        # init cache slots.
+        # Single-phase walk + post-walk demotion. (Two-phase walk attempts
+        # are documented in commit history but consistently produce wrong
+        # physics due to SCCP rewriter / resolve-walk interactions; needs
+        # more targeted work.)
         _init_hoist_end, _init_cache_refs = _compute_unopt_init_cache_refs(
             cse.hoist_order, cse.hoist_defs
         )
