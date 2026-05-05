@@ -169,6 +169,42 @@ def compile_va_unopt(va_path: str | Path) -> DumpFile:
     return dumped
 
 
+def compile_va_unopt_with_split(va_path: str | Path) -> DumpFile:
+    """Compile via ``openvaf-r --dump-unopt-mir-with-split`` and parse.
+
+    Returns a ``DumpFile`` with **both** the analog-initial / analog
+    function split (separate ``init_fn`` and ``eval_fn``, populated
+    ``CachedValues`` bridge) **and** the unoptimized phi structure that
+    keeps nested-conditional patterns (PSP103's ``expll``, BSIM4 limit
+    macros, etc.) round-tripping correctly.
+
+    This is the recommended ingestion path: it gives the lowering
+    correct physics (no phi-collapse breakage) without forcing the
+    eval_fn to recompute the ~600 device-physics constants on every
+    Newton step (as ``compile_va_unopt`` does). The trade-off is a
+    larger emitted setup function than ``compile_va_opt_mir`` would
+    produce, since none of OpenVAF's value-level passes (SCCP, CSE,
+    DCE, phi-collapse) have run.
+
+    Requires the ``--dump-unopt-mir-with-split`` flag, added in
+    OpenVAF post-23.5.0 (feat/dump-json branch and successors).
+    """
+    from .dump_parser import parse_dump
+
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, "--dump-unopt-mir-with-split", str(va_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DumpParseError(
+            f"openvaf-r exited {result.returncode} for {va_path}:\n{result.stderr}"
+        )
+    return parse_dump(result.stdout)
+
+
 def compile_va_opt_mir(va_path: str | Path) -> DumpFile:
     """Compile via ``openvaf-r --dump-mir`` (optimised text MIR) and parse.
 
