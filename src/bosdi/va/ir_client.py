@@ -77,6 +77,37 @@ def _find_binary() -> str:
     )
 
 
+def _run_json_flag(va_path: str | Path, flag: str) -> DumpFile:
+    """Shell out to ``openvaf-r <flag> <va_path>`` and parse the JSON output."""
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, flag, str(va_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise DumpParseError(
+            f"openvaf-r exited {result.returncode} for {va_path}:\n{result.stderr}"
+        )
+    try:
+        docs = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DumpParseError(f"Invalid JSON from openvaf-r ({flag}): {exc}") from exc
+    if not isinstance(docs, list):
+        raise DumpParseError(f"Expected JSON array at top level (flag={flag})")
+    schema_ver = docs[0].get("schema_version", 0) if docs else 0
+    if schema_ver != 1:
+        raise DumpParseError(
+            f"Unsupported schema version {schema_ver} from {flag}; expected 1"
+        )
+    return DumpFile(
+        compilation_unit=str(va_path),
+        literals={},
+        modules=[_parse_module(doc) for doc in docs],
+    )
+
+
 def compile_va(
     va_path: str | Path,
     *,
@@ -89,37 +120,45 @@ def compile_va(
     ``allow_analog_in_cond`` and ``allow_builtin_primitives`` are accepted
     for API compatibility but are currently ignored (openvaf-r applies its
     own defaults).
+
+    Uses ``--dump-json``: post-MIR-optimization, clean init/eval split, but
+    the optimizer collapses N-edge phis.  For models with nested conditional
+    inits prefer :func:`compile_va_unopt_json_with_split`.
     """
-    binary = _find_binary()
-    result = subprocess.run(
-        [binary, "--dump-json", str(va_path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise DumpParseError(
-            f"openvaf-r exited {result.returncode} for {va_path}:\n{result.stderr}"
-        )
-    try:
-        docs = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise DumpParseError(f"Invalid JSON from openvaf-r: {exc}") from exc
+    return _run_json_flag(va_path, "--dump-json")
 
-    if not isinstance(docs, list):
-        raise DumpParseError("Expected JSON array at top level")
 
-    schema_ver = docs[0].get("schema_version", 0) if docs else 0
-    if schema_ver != 1:
-        raise DumpParseError(
-            f"Unsupported --dump-json schema version {schema_ver}; expected 1"
-        )
+def compile_va_unopt_json(va_path: str | Path) -> DumpFile:
+    """Compile via ``openvaf-r --dump-unopt-json`` and return a ``DumpFile``.
 
-    return DumpFile(
-        compilation_unit=str(va_path),
-        literals={},
-        modules=[_parse_module(doc) for doc in docs],
-    )
+    Emits the same JSON schema as ``--dump-json`` but from the raw
+    unoptimized split — no ADCE, no SCCP, no GVN, no phi-collapse.
+    Produces the maximum number of cache slots (~2086 for PSP103) and fully
+    preserves pre-optimization structure including all 2-edge phis.
+
+    Use this when you need the rawest possible IR for debugging or when
+    downstream analysis is sensitive to optimizer-introduced phi merges.
+    For most production use :func:`compile_va_unopt_json_with_split` is
+    preferable: ADCE prunes dead slots (~467 for PSP103) while still
+    preserving 2-edge phi structure.
+    """
+    return _run_json_flag(va_path, "--dump-unopt-json")
+
+
+def compile_va_unopt_json_with_split(va_path: str | Path) -> DumpFile:
+    """Compile via ``openvaf-r --dump-unopt-json-with-split`` and return a ``DumpFile``.
+
+    Emits JSON from the ADCE-only refined split — the same pipeline as
+    ``--dump-unopt-mir-with-split`` (ADCE + simplify_cfg_no_phi_merge, no
+    SCCP/GVN/phi-collapse) but in structured JSON rather than text MIR.
+    Produces ~467 cache slots for PSP103 and preserves the 2-edge phi
+    structure that the full optimizer collapses.
+
+    This is the recommended replacement for :func:`compile_va_unopt` and
+    :func:`compile_va_unopt_with_split`: it gives correct physics for
+    nested-conditional models without the 991-line text dump parser.
+    """
+    return _run_json_flag(va_path, "--dump-unopt-json-with-split")
 
 
 def compile_va_unopt(va_path: str | Path) -> DumpFile:
@@ -504,4 +543,11 @@ def _parse_dae(doc: dict) -> DaeInfo:
     return info
 
 
-__all__ = ["compile_va"]
+__all__ = [
+    "compile_va",
+    "compile_va_unopt_json",
+    "compile_va_unopt_json_with_split",
+    "compile_va_unopt",
+    "compile_va_unopt_with_split",
+    "compile_va_opt_mir",
+]
