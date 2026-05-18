@@ -17,7 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .lowering import LoweredDevice
+from .lowering import LoweredDevice, PhiResolution
 
 # Matches the SSA names the lowering emits — bare ``v123`` / ``i_v123``,
 # the ``_init_cache[N]`` indices, and any local prefixed with ``v``.
@@ -33,6 +33,7 @@ Regenerate with: ``python -m circulax.va <path/to/device.va>``
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 """
 
@@ -43,7 +44,7 @@ HEADER_EQX_IMPORT = "import equinox as eqx\n"
 HEADER_COMPONENT_IMPORT = "from circulax.components.base_component import PhysicsReturn, Signals, States, component\n"
 HEADER_VA_COMPONENT_IMPORT = (
     "from circulax.components.base_component import PhysicsReturn, Signals, States\n"
-    "from circulax.components.va_component import va_component\n"
+    "from bosdi.circulax.va_component import va_component\n"
 )
 
 
@@ -595,6 +596,144 @@ def _live_ssas(device: LoweredDevice) -> set[str]:
     return live
 
 
+def _split_where_args(inner: str) -> list[str]:
+    """Split 'cond, true, false' on commas at parenthesis depth 0.
+
+    Handles nested function calls such as ``jnp.where(a, jnp.exp(b), c)``
+    where a naive comma-split would yield the wrong result.
+    """
+    depth = 0
+    parts: list[str] = []
+    cur: list[str] = []
+    for ch in inner:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    return parts
+
+
+_WHERE_PREFIX = "jnp.where("
+
+
+def _batch_where_hoists(hoists: list[tuple[str, str]]) -> list[str]:
+    """Render hoist assignments as lines, batching consecutive same-condition ``jnp.where`` calls.
+
+    Works on the FINAL (post-transform) hoist list.  Groups consecutive
+    entries whose expression is ``jnp.where(cond, true, false)`` with the
+    SAME condition string into a single ``jax.tree_util.tree_map`` call.
+    All other entries are rendered as plain ``    ssa = expr`` lines.
+
+    Two consecutive PHIs with the same condition become:
+    ``(v1, v2,) = jax.tree_util.tree_map(lambda _t, _f: jnp.where(cond, _t, _f), (t1, t2,), (f1, f2,))``
+
+    Singleton groups fall through to individual ``jnp.where`` lines.
+    """
+    lines: list[str] = []
+    batch: list[tuple[str, str, str]] = []  # (ssa, true_expr, false_expr)
+    batch_cond: str | None = None
+
+    def flush() -> None:
+        if not batch:
+            return
+        if len(batch) == 1:
+            ssa, t, f = batch[0]
+            lines.append(f"    {ssa} = jnp.where({batch_cond}, {t}, {f})")
+        else:
+            lhs = "(" + ", ".join(b[0] for b in batch) + ",)"
+            true_tup = "(" + ", ".join(b[1] for b in batch) + ",)"
+            false_tup = "(" + ", ".join(b[2] for b in batch) + ",)"
+            lines.append(
+                f"    {lhs} = jax.tree_util.tree_map("
+                f"lambda _t, _f: jnp.where({batch_cond}, _t, _f), "
+                f"{true_tup}, {false_tup})"
+            )
+        batch.clear()
+
+    for ssa, expr in hoists:
+        if expr.startswith(_WHERE_PREFIX) and expr.endswith(")"):
+            args = _split_where_args(expr[len(_WHERE_PREFIX) : -1])
+            if len(args) == 3:
+                cond, true_e, false_e = args
+                if cond != batch_cond:
+                    flush()
+                    batch_cond = cond
+                batch.append((ssa, true_e, false_e))
+                continue
+        flush()
+        batch_cond = None
+        lines.append(f"    {ssa} = {expr}")
+
+    flush()
+    return lines
+
+
+def _emit_hoists_batched(
+    hoists: list[tuple[str, str]],
+    phi_resolutions: dict[str, PhiResolution],
+    live: set[str],
+    out: list[str],
+) -> None:
+    """Emit hoist assignments into ``out``, batching consecutive diamond PHIs.
+
+    Consecutive ``jnp.where`` calls that share the same condition are grouped
+    into a single ``jax.tree_util.tree_map`` call, which reduces emitted
+    source size and JAX trace overhead for models with many PHI nodes at the
+    same merge point (e.g. PSP103 has 200-400 diamond PHIs, many sharing
+    a common ``if (SW... > 0)`` guard).
+
+    Non-consecutive same-condition PHIs and non-batchable PHIs (Case 1b
+    nested diamonds, Case 1.5 SCCP shortcuts, Case 2 fallback) are emitted
+    as individual ``ssa = <expr>`` lines in their original SSA order.
+    """
+    batch: list[tuple[str, PhiResolution]] = []
+    batch_key: tuple[str, bool] | None = None
+
+    def flush() -> None:
+        if not batch:
+            return
+        if len(batch) == 1:
+            ssa, phi_res = batch[0]
+            out.append(
+                f"    {ssa} = jnp.where({phi_res.cond_ssa}, {phi_res.true_expr}, {phi_res.false_expr})"
+            )
+        else:
+            cond = batch[0][1].cond_ssa
+            lhs = "(" + ", ".join(b[0] for b in batch) + ",)"
+            true_tup = "(" + ", ".join(b[1].true_expr for b in batch) + ",)"
+            false_tup = "(" + ", ".join(b[1].false_expr for b in batch) + ",)"
+            out.append(
+                f"    {lhs} = jax.tree_util.tree_map("
+                f"lambda _t, _f: jnp.where({cond}, _t, _f), "
+                f"{true_tup}, {false_tup})"
+            )
+        batch.clear()
+
+    for ssa, expr in hoists:
+        if ssa not in live:
+            continue
+        if ssa in phi_resolutions:
+            phi_res = phi_resolutions[ssa]
+            key = (phi_res.cond_ssa, phi_res.cond_negated)
+            if key != batch_key:
+                flush()
+                batch_key = key
+            batch.append((ssa, phi_res))
+        else:
+            flush()
+            batch_key = None
+            out.append(f"    {ssa} = {expr}")
+
+    flush()
+
+
 def _hoist_lines(device: LoweredDevice) -> list[str]:
     """Return the ``    ssa = expr`` lines for the physics / Jacobian preamble.
 
@@ -611,6 +750,7 @@ def _hoist_lines(device: LoweredDevice) -> list[str]:
     expression are dropped.
     """
     live = _live_ssas(device)
+    phi_resolutions = device.phi_resolutions
     if device.init_cache_refs:
         # ``init`` is always provided by the framework (either positionally
         # via ``@<Name>.setup``-registered cache fn, or as the empty-dict
@@ -623,12 +763,13 @@ def _hoist_lines(device: LoweredDevice) -> list[str]:
                 continue
             lines.append(f"    {ref} = init[{i}]")
             seen.add(ref)
-        for ssa, expr in device.cse_hoists[device.init_hoist_count :]:
-            if ssa not in live:
-                continue
-            lines.append(f"    {ssa} = {expr}")
+        _emit_hoists_batched(
+            device.cse_hoists[device.init_hoist_count :], phi_resolutions, live, lines
+        )
         return lines
-    return [f"    {ssa} = {expr}" for ssa, expr in device.cse_hoists if ssa in live]
+    lines = []
+    _emit_hoists_batched(device.cse_hoists, phi_resolutions, live, lines)
+    return lines
 
 
 def _render_hoists(device: LoweredDevice) -> str:
@@ -695,7 +836,7 @@ def _emit_cache_fn(device: LoweredDevice) -> str:
     )
     kwargs = [f"{name}: {ty} = {default}" for name, ty, default in device.params]
     sig = ", ".join(kwargs)
-    hoist_block = "\n".join(f"    {ssa} = {expr}" for ssa, expr in init_hoists)
+    hoist_block = "\n".join(_batch_where_hoists(init_hoists))
     refs_str = ", ".join(roots)
     return (
         f"\ndef _{device.class_name}_setup({sig}) -> jnp.ndarray:\n"
@@ -855,12 +996,10 @@ def _prep_combined_body(
     cursor += n_jq
     pre_subst = roots[cursor:]
 
-    # Phase 5: render the surviving hoists. ``init`` is always provided
-    # positionally by the framework (or by the empty-dict dry-run, whose
-    # KeyError on integer indexing is caught and suppressed by circulax's
-    # decorator dry-run wrapper). No fallback needed.
-    hoist_lines: list[str] = []
-    hoist_lines.extend(f"    {ssa} = {expr}" for ssa, expr in eval_hoists)
+    # Phase 5: render the surviving hoists with phi batching.  Consecutive
+    # ``jnp.where(cond, …)`` lines sharing the same condition are folded into
+    # a single ``jax.tree_util.tree_map`` call, reducing trace overhead.
+    hoist_lines = _batch_where_hoists(eval_hoists)
 
     return hoist_lines, f_subst, q_subst, jr_subst, jq_subst, pre_subst
 

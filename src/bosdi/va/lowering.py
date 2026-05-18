@@ -191,6 +191,23 @@ class Expr:
 
 
 @dataclass
+class PhiResolution:
+    """Structured metadata for a diamond-pattern phi node.
+
+    Emitted by ``_lower_phi`` for Case 1 diamonds where the condition is
+    dynamic (runtime-dependent).  Stored alongside the fallback
+    ``jnp.where(...)`` expression so the emitter can group consecutive
+    same-condition PHIs into a single ``jax.tree_util.tree_map`` call,
+    reducing emitted source size and JAX trace overhead.
+    """
+
+    cond_ssa: str  # hoisted SSA name (or expr text) of the branch condition
+    cond_negated: bool  # True when the condition was inverted in the original branch
+    true_expr: str  # expression text for the true branch
+    false_expr: str  # expression text for the false branch
+
+
+@dataclass
 class CseState:
     """Common-subexpression-elimination bookkeeping for one ``lower()`` run.
 
@@ -219,6 +236,10 @@ class CseState:
     # with the "i_" prefix regardless of ``ssa_prefix``. Used by the
     # unopt-MIR init/eval partition path (see ``_partition_init_eval``).
     init_eligible: frozenset[str] = frozenset()
+    # Structured metadata for batchable diamond-pattern PHIs.  Keys match
+    # entries in ``hoist_defs`` (same ``hoist_name``).  Populated by
+    # ``_resolve_ssa`` when ``_lower_phi`` returns a ``PhiResolution``.
+    phi_resolutions: dict[str, PhiResolution] = field(default_factory=dict)
 
 
 def _compute_refcount(fn: Function, roots: list[str]) -> dict[str, int]:
@@ -317,6 +338,10 @@ class LoweredDevice:
     # parameter-fitting use case where a small subset of model parameters
     # need gradients but the bulk should remain folded for speed.
     differentiable_params: tuple[str, ...] | None = ()
+    # PHI node batching: structured resolutions for diamond-pattern PHIs
+    # that can be grouped into ``jax.tree_util.tree_map`` batches.  Keys
+    # are the same ``hoist_name`` strings that appear in ``cse_hoists``.
+    phi_resolutions: dict[str, PhiResolution] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1349,6 +1374,7 @@ def lower(
         init_hoist_count=_init_hoist_end,
         init_cache_refs=_init_cache_refs,
         differentiable_params=differentiable_params,
+        phi_resolutions=dict(cse.phi_resolutions),
     )
 
 
@@ -1872,6 +1898,7 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
     # on set allocations (observed OOM at > 50 GB RSS before this fix).
     # The ``try/finally`` ensures we always clean up on both normal return
     # and exception paths.
+    _phi_res: PhiResolution | None = None
     visiting.add(ssa)
     try:
 
@@ -1891,7 +1918,7 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
             )
 
         if op == "phi":
-            expr = _lower_phi(
+            _phi_result = _lower_phi(
                 inst,
                 defs,
                 const_table,
@@ -1904,6 +1931,13 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                 cse,
                 sccp,
             )
+            if isinstance(_phi_result, PhiResolution):
+                _phi_res = _phi_result
+                expr = Expr(
+                    f"jnp.where({_phi_res.cond_ssa}, {_phi_res.true_expr}, {_phi_res.false_expr})"
+                )
+            else:
+                expr = _phi_result
         elif op in _PASSTHROUGH:
             expr = resolve(inst.operands[0])
         elif op in _BINOPS:
@@ -2100,6 +2134,8 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
         if hoist_name not in cse.hoist_defs:
             cse.hoist_defs[hoist_name] = expr.text
             cse.hoist_order.append(hoist_name)
+            if _phi_res is not None:
+                cse.phi_resolutions[hoist_name] = _phi_res
         env[ssa] = Expr(hoist_name, prec=100)
         return env[ssa]
 
@@ -2187,7 +2223,7 @@ def _lower_phi(  # noqa: C901
     cfg: _FunctionCfg | None,
     cse: CseState | None,
     sccp: object | None = None,
-) -> Expr:
+) -> Expr | PhiResolution:
     """Lower a phi node.
 
     Two cases, tried in order:
@@ -2284,8 +2320,11 @@ def _lower_phi(  # noqa: C901
             true_expr = resolve_edge(true_edge_ssa)
             false_expr = resolve_edge(false_edge_ssa)
             if cond is not None and true_expr is not None and false_expr is not None:
-                return Expr(
-                    f"jnp.where({cond.text}, {true_expr.text}, {false_expr.text})"
+                return PhiResolution(
+                    cond_ssa=cond.text,
+                    cond_negated=False,
+                    true_expr=true_expr.text,
+                    false_expr=false_expr.text,
                 )
 
     # Case 1b: 3-edge nested diamond (e.g. PSP103's ``expll`` macro).

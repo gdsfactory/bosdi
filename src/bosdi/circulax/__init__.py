@@ -1,6 +1,6 @@
 """circulax integration layer for bosdi.
 
-Provides :func:`osdi_component` and :class:`OsdiComponentGroup` / :class:`OsdiModelDescriptor`
+Provides :func:`osdi_component`, :func:`va_component`, and supporting classes
 for use with :func:`circulax.compiler.compile_netlist`.
 
 Install via::
@@ -20,11 +20,17 @@ from bosdi.circulax.osdi_component import (
     _BOSDI_ERR,
     osdi_component,
 )
+from bosdi.circulax.va_component import (
+    JacobianReturn,
+    va_component,
+)
 
 __all__ = [
+    "JacobianReturn",
     "OsdiComponentGroup",
     "OsdiModelDescriptor",
     "osdi_component",
+    "va_component",
     "_BOSDI_AVAILABLE",
     "_BOSDI_ERR",
 ]
