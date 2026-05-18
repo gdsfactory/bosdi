@@ -1173,6 +1173,39 @@ def lower(
     # Record how many hoists came from init before switching to eval prefix.
     _init_hoist_end = len(cse.hoist_order)
 
+    # Concretely evaluate the init hoists to build a float-valued cache.
+    # This seeds eval SCCP with values that the symbolic lattice can't prove
+    # because it doesn't fold fdiv/exp/log/sqrt.  The namespace is seeded with
+    # jnp (for jnp.exp, jnp.divide, etc.) and the concrete static-param values
+    # keyed by their MIR SSA arg names.  Runtime-dependent hoists (those that
+    # reference signals or state) raise NameError → caught → skip.
+    _concrete_cache: dict[str, float] = {}
+    if effective_static and _init_hoist_end > 0:
+        import jax.numpy as _jnp_eval  # noqa: PLC0415
+
+        _eval_ns: dict[str, object] = {"jnp": _jnp_eval, "__builtins__": {}}
+        # Hoist expressions use the Python param name (e.g. "SWIGATE"), not the
+        # MIR SSA name.  Seed by name so "SWIGATE > 0.0" evaluates correctly.
+        for _kind in cm.init_interner.parameters.values():
+            if isinstance(_kind, ParamRef) and _kind.name in effective_static:
+                _eval_ns[_kind.name] = effective_static[_kind.name]
+        for _hoist_ssa in cse.hoist_order[:_init_hoist_end]:
+            _expr = cse.hoist_defs.get(_hoist_ssa)
+            if _expr is None:
+                continue
+            try:
+                _result = eval(_expr, _eval_ns)  # noqa: S307
+                _eval_ns[_hoist_ssa] = _result
+                if hasattr(_result, "item"):
+                    _fval = float(_result.item())
+                elif isinstance(_result, (int, float)):
+                    _fval = float(_result)
+                else:
+                    continue
+                if math.isfinite(_fval):
+                    _concrete_cache[_hoist_ssa] = _fval
+            except Exception:  # noqa: BLE001
+                pass
     # Switch CSE prefix so eval's hoists land under their plain SSA names,
     # distinguishable from init's ``i_``-prefixed ones.
     cse.ssa_prefix = ""
@@ -1215,6 +1248,13 @@ def lower(
         lat = init_sccp.lattice_value(init_val)
         if lat.is_constant:
             eval_sccp_init[eval_arg] = lat.value
+        elif init_val in init_env:
+            # Fall back to concretely evaluated value when the symbolic lattice
+            # stayed BOTTOM (e.g. init computed this through fdiv/exp/log that
+            # the lattice couldn't fold before the math-intrinsic extension).
+            _hoist_key = init_env[init_val].text
+            if _hoist_key in _concrete_cache:
+                eval_sccp_init[eval_arg] = _concrete_cache[_hoist_key]
     # Identify "voltage" args (Voltage, CurrentKind, HiddenStateInput, etc.)
     # by interner kind so SCCP can compute voltage-taint provenance for the
     # unopt two-phase init walk's ``skip_voltage_tainted`` filter.

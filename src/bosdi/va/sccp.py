@@ -43,6 +43,7 @@ Public surface:
 
 from __future__ import annotations
 
+import math as _math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
@@ -106,6 +107,38 @@ class LatticeValue:
 
 _TOP = LatticeValue.top()
 _BOTTOM = LatticeValue.bottom()
+
+# Math intrinsics the SCCP lattice can fold when all operands are CONSTANT.
+# Only returns CONSTANT for finite results — inf/nan stays BOTTOM so that
+# downstream comparisons against them don't incorrectly eliminate branches.
+_SCCP_MATH1: dict[str, Any] = {
+    "exp": _math.exp,
+    "ln": _math.log,
+    "log": _math.log10,
+    "sqrt": _math.sqrt,
+    "floor": _math.floor,
+    "ceil": _math.ceil,
+    "sin": _math.sin,
+    "cos": _math.cos,
+    "tan": _math.tan,
+    "asin": _math.asin,
+    "acos": _math.acos,
+    "atan": _math.atan,
+    "sinh": _math.sinh,
+    "cosh": _math.cosh,
+    "tanh": _math.tanh,
+    "asinh": _math.asinh,
+    "acosh": _math.acosh,
+    "atanh": _math.atanh,
+    "fabs": abs,
+    "abs": abs,
+}
+
+_SCCP_MATH2: dict[str, Any] = {
+    "pow": _math.pow,
+    "hypot": _math.hypot,
+    "atan2": _math.atan2,
+}
 
 
 def _meet(a: LatticeValue, b: LatticeValue) -> LatticeValue:
@@ -190,11 +223,22 @@ def _eval_opcode(opcode: str, operands: list[LatticeValue]) -> LatticeValue:
             if b == 0:
                 return _BOTTOM
             return LatticeValue(LatticeState.CONSTANT, a % b, "float")
-        # ``fdiv`` deliberately not folded — ``1.0 / 0.0`` semantics differ
-        # between Python (raises ZeroDivisionError) and JAX (yields ``inf``
-        # / ``nan``), and the existing ``jnp.divide(a, jnp.where(b == 0,
-        # 1e-300, b))`` safe-divide pattern depends on staying at runtime
-        # to preserve the guard.
+        # ``fdiv`` when b is non-zero: fold exactly.  When b == 0 stay BOTTOM
+        # so the downstream safe-divide guard (jnp.where) stays live at runtime.
+        if op == "fdiv" and b != 0:
+            try:
+                result = float(a / b)
+                if _math.isfinite(result):
+                    return LatticeValue(LatticeState.CONSTANT, result, "float")
+            except (ZeroDivisionError, OverflowError):
+                pass
+        if op in _SCCP_MATH2:
+            try:
+                result = float(_SCCP_MATH2[op](a, b))
+                if _math.isfinite(result):
+                    return LatticeValue(LatticeState.CONSTANT, result, "float")
+            except (ValueError, OverflowError, ZeroDivisionError):
+                pass
 
     if len(operands) == 1:
         a = operands[0].value
@@ -221,6 +265,13 @@ def _eval_opcode(opcode: str, operands: list[LatticeValue]) -> LatticeValue:
             return LatticeValue(LatticeState.CONSTANT, -a, "float")
         if op == "ineg":
             return LatticeValue(LatticeState.CONSTANT, -a, "int")
+        if op in _SCCP_MATH1:
+            try:
+                result = float(_SCCP_MATH1[op](a))
+                if _math.isfinite(result):
+                    return LatticeValue(LatticeState.CONSTANT, result, "float")
+            except (ValueError, OverflowError, ZeroDivisionError):
+                pass
 
     return _BOTTOM
 
