@@ -2319,6 +2319,24 @@ def _lower_phi(  # noqa: C901
                     f"jnp.where({outer_cond.text}, {outer_expr.text}, {inner_where})"
                 )
 
+    # Case 1.5: SCCP live-edge shortcut.
+    # When SCCP has eliminated all but one predecessor edge (e.g. a
+    # parameter-dependent condition folds to a constant), resolve only that
+    # live edge.  This fires after diamond detection so we never silently
+    # drop voltage-dependent branches that Case 1 would have preserved via
+    # ``jnp.where`` — by this point neither diamond detector matched, so
+    # there is no runtime condition to preserve.
+    from .sccp import SccpResult as _SccpResult  # noqa: PLC0415
+
+    if isinstance(sccp, _SccpResult):
+        phi_block = sccp.block_of(inst.result)
+        if phi_block is not None:
+            live_ssa = sccp.live_phi_value(inst.phi_edges, phi_block)
+            if live_ssa is not None:
+                live = resolve_edge(live_ssa)
+                if live is not None:
+                    return live
+
     # Case 2: fallback — pick the most-informative edge.
     #
     # The original heuristic was "first resolvable non-zero edge", which
