@@ -33,12 +33,19 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/OWNER/bosdi"
-Repository = "https://github.com/OWNER/bosdi"
+Homepage = "https://github.com/gdsfactory/bosdi"
+Repository = "https://github.com/gdsfactory/bosdi"
 
 [build-system]
 requires = ["nanobind>=2.0.0", "setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+# --- CODESPELL CONFIGURATION ---
+# OpenVAF MIR opcode names (``fle``, ``ine``, ``inot``, ``ige``, etc.) and a
+# few short variable names (``nd`` for "node") collide with codespell's
+# default dictionary; ignore those plus a couple of stylistic variants.
+[tool.codespell]
+ignore-words-list = "fle,ine,inot,inout,nd,unparseable,coo"
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -121,10 +128,3 @@ publish = "uv publish dist/*"
 pythonpath = ["src"]
 # Optional: explicitly tell it where your tests live
 testpaths = ["tests"]
-
-# --- CODESPELL CONFIGURATION ---
-# OpenVAF MIR opcode names (``fle``, ``ine``, ``inot``, ``ige``, etc.) and a
-# few short variable names (``nd`` for "node") collide with codespell's
-# default dictionary; ignore those plus a couple of stylistic variants.
-[tool.codespell]
-ignore-words-list = "fle,ine,inot,inout,nd,unparseable,coo"

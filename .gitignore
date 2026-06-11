@@ -2,6 +2,12 @@
 .pixi/*
 !.pixi/config.toml
 
+# Claude Code
+.claude/
+
+# Proprietary PDK models (local only)
+src/devices/ihp_sg13g2/
+
 # build artifacts
 build/
 target/

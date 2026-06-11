@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-06-11
+
+### Added
+
+- Verilog-A to JAX lowering compiler (`bosdi.va`) — **alpha**
+- Circulax integration subpackage (`bosdi.circulax`) with `@va_component` and `@osdi_component` decorators
+- Multi-platform build support (macOS, Windows, Linux)
+- Python 3.11–3.14 support
+- SCCP optimization pass for constant folding in lowered VA models
+- PHI node batching and dominator-based diamond detection
+
 ## [0.1.0] - 2025-04-08
 
 ### Added
@@ -20,4 +31,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Resistor and capacitor OSDI binaries included for testing
 - Full `jax.grad()` / `jax.jit()` composition support through OSDI models
 
-[0.1.0]: https://github.com/OWNER/bosdi/releases/tag/v0.1.0
+[0.1.0]: https://github.com/gdsfactory/bosdi/releases/tag/v0.1.0
+[0.2.0]: https://github.com/gdsfactory/bosdi/releases/tag/v0.2.0
