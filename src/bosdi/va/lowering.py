@@ -49,6 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .mir import (
+    AbstimeInput,
     CachedValues,
     CompiledModule,
     Constant,
@@ -113,7 +114,13 @@ _BINOPS: dict[str, tuple[str, int]] = {
 _UNARYOPS: dict[str, str] = {
     "fneg": "-",
     "ineg": "-",
-    "bnot": "not ",
+    # ``bnot`` is the MIR's boolean-NOT opcode. Emitting Python ``not``
+    # raises ``TracerBoolConversionError`` when the operand is a traced
+    # JAX array (the ``not`` operator forces a Python-bool conversion).
+    # ``~`` on a JAX bool array does bitwise-NOT, which equals logical-NOT
+    # for booleans — works under JIT/vmap. Same operator as ``inot`` since
+    # JAX treats them uniformly per-dtype.
+    "bnot": "~",
     "inot": "~",
 }
 
@@ -184,6 +191,23 @@ class Expr:
 
 
 @dataclass
+class PhiResolution:
+    """Structured metadata for a diamond-pattern phi node.
+
+    Emitted by ``_lower_phi`` for Case 1 diamonds where the condition is
+    dynamic (runtime-dependent).  Stored alongside the fallback
+    ``jnp.where(...)`` expression so the emitter can group consecutive
+    same-condition PHIs into a single ``jax.tree_util.tree_map`` call,
+    reducing emitted source size and JAX trace overhead.
+    """
+
+    cond_ssa: str  # hoisted SSA name (or expr text) of the branch condition
+    cond_negated: bool  # True when the condition was inverted in the original branch
+    true_expr: str  # expression text for the true branch
+    false_expr: str  # expression text for the false branch
+
+
+@dataclass
 class CseState:
     """Common-subexpression-elimination bookkeeping for one ``lower()`` run.
 
@@ -208,6 +232,14 @@ class CseState:
     hoist_defs: dict[str, str] = field(default_factory=dict)
     hoist_order: list[str] = field(default_factory=list)
     ssa_prefix: str = ""
+    # When non-empty, any MIR SSA whose name is in this set gets hoisted
+    # with the "i_" prefix regardless of ``ssa_prefix``. Used by the
+    # unopt-MIR init/eval partition path (see ``_partition_init_eval``).
+    init_eligible: frozenset[str] = frozenset()
+    # Structured metadata for batchable diamond-pattern PHIs.  Keys match
+    # entries in ``hoist_defs`` (same ``hoist_name``).  Populated by
+    # ``_resolve_ssa`` when ``_lower_phi`` returns a ``PhiResolution``.
+    phi_resolutions: dict[str, PhiResolution] = field(default_factory=dict)
 
 
 def _compute_refcount(fn: Function, roots: list[str]) -> dict[str, int]:
@@ -306,6 +338,10 @@ class LoweredDevice:
     # parameter-fitting use case where a small subset of model parameters
     # need gradients but the bulk should remain folded for speed.
     differentiable_params: tuple[str, ...] | None = ()
+    # PHI node batching: structured resolutions for diamond-pattern PHIs
+    # that can be grouped into ``jax.tree_util.tree_map`` batches.  Keys
+    # are the same ``hoist_name`` strings that appear in ``cse_hoists``.
+    phi_resolutions: dict[str, PhiResolution] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +594,11 @@ def _sccp_initial_constants(
 
 
 def _inject_sccp_constants(
-    env: dict[str, Expr], sccp_result: object, fn: Function | None = None
+    env: dict[str, Expr],
+    sccp_result: object,
+    fn: Function | None = None,
+    *,
+    skip_voltage_tainted: bool = False,
 ) -> int:
     """Pre-load *env* with literal Exprs for every SSA SCCP marked CONSTANT.
 
@@ -580,6 +620,12 @@ def _inject_sccp_constants(
     runtime ``jnp.where`` that evaluates both branches at JAX time.
     Skipping phi-result injection costs a few literals but avoids
     eliminating valid voltage chains.
+
+    When ``skip_voltage_tainted=True`` (used by the unopt two-phase init
+    walk), SSAs marked as voltage-tainted in the SCCP result are also
+    skipped.  These are constants whose value depends on runtime input
+    cancellation (e.g. ``V(D,D) * coeff = 0`` after node collapse) — they
+    must NOT be baked into a setup function.
     """
     from .sccp import (
         SccpResult,
@@ -602,6 +648,8 @@ def _inject_sccp_constants(
             continue
         if ssa in phi_results:
             continue
+        if skip_voltage_tainted and ssa in sccp_result.voltage_tainted:
+            continue
         # Skip non-numeric constants — strings don't take part in the
         # binop folder and the lowering's existing handling of ``sconst``
         # references is fine for them.  Booleans also need careful
@@ -612,6 +660,289 @@ def _inject_sccp_constants(
         env[ssa] = _literal_expr(lat.value)
         n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# Unopt-MIR init/eval partition.
+# ---------------------------------------------------------------------------
+
+
+def _match_opt_init_to_unopt(
+    opt_cm: "CompiledModule",
+    unopt_cm: "CompiledModule",
+    params: dict[str, float],
+    temperature: float = 300.15,
+    n_probes: int = 6,
+) -> frozenset[str]:
+    """Return the set of unopt-MIR SSA names that correspond to opt-MIR init outputs.
+
+    The opt-MIR (``--dump-mir``) has the correct init/eval split: its
+    ``init_fn`` computes exactly the SSAs that belong in the analog-initial
+    block.  Those SSAs appear under different names in the unopt-MIR combined
+    function because the optimiser renumbers them.  We bridge the gap by
+    **value equivalence at multiple parameter points**: run the MIR interpreter
+    on both at ``n_probes`` independently perturbed parameter sets and match on
+    the resulting value tuple.
+
+    Only unopt SSAs that are also init-eligible (purely parameter-derived) are
+    considered candidates, avoiding false matches with eval SSAs.
+
+    Args:
+        opt_cm:     Parsed opt-MIR module (from ``compile_va_opt_mir``).
+        unopt_cm:   Parsed unopt-MIR module (from ``compile_va_unopt``).
+        params:     Model-parameter dict (``{name: float}``); used as base.
+        temperature: Temperature in K.
+        n_probes:   Number of independent parameter-point evaluations.
+                    More probes → fewer false positives; 6 gives <1e-50
+                    collision probability for typical physics computations.
+
+    Returns:
+        Frozenset of **unopt-MIR** SSA names that match opt-MIR init outputs.
+        Pass as ``opt_init_eligible`` to ``lower()``.
+    """
+    import hashlib as _hashlib
+    import struct as _struct
+
+    from .interpret import interpret
+
+    def _run_opt(ps: dict[str, float]) -> dict[str, float]:
+        env = interpret(
+            opt_cm.init_fn,
+            opt_cm.init_interner,
+            params=ps,
+            signals={},
+            temperature=temperature,
+        )
+        return {
+            k: float(v)
+            for k, v in env.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
+    def _run_unopt(ps: dict[str, float]) -> dict[str, float]:
+        env = interpret(
+            unopt_cm.eval_fn,
+            unopt_cm.eval_interner,
+            params=ps,
+            signals={},
+            temperature=temperature,
+        )
+        return {
+            k: float(v)
+            for k, v in env.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
+    def _fp_bytes(v: float) -> bytes:
+        try:
+            return _struct.pack(">d", v)
+        except Exception:
+            return b"\x00" * 8
+
+    # Only consider unopt SSAs that are init-eligible.
+    init_eligible = _partition_init_eval(unopt_cm.eval_fn, unopt_cm.eval_interner)
+
+    # Generate n_probes parameter sets: base + (n_probes-1) random perturbations.
+    # Use a deterministic seed so results are reproducible.
+    import random as _random
+
+    rng = _random.Random(0xDEAD_BEEF)
+    probe_sets: list[dict[str, float]] = [params]
+    # Avoid zero-valued params by flooring to 1% of the base (or 1e-10).
+    _base_vals = {k: max(abs(v), 1e-10) for k, v in params.items()}
+    for _ in range(n_probes - 1):
+        ps = {
+            k: v * rng.uniform(0.3, 3.0) * (1 if v >= 0 else -1)
+            for k, v in _base_vals.items()
+        }
+        probe_sets.append(ps)
+
+    # Evaluate at all probe points.
+    opt_envs: list[dict[str, float]] = [_run_opt(ps) for ps in probe_sets]
+    unopt_envs: list[dict[str, float]] = [_run_unopt(ps) for ps in probe_sets]
+
+    # Build a signature (tuple of floats) for each SSA across all probes.
+    # Two SSAs compute the same function iff their signatures are identical.
+    def _sig_opt(ssa: str) -> tuple[float, ...]:
+        return tuple(env.get(ssa, float("nan")) for env in opt_envs)
+
+    def _sig_unopt(ssa: str) -> tuple[float, ...]:
+        return tuple(env.get(ssa, float("nan")) for env in unopt_envs)
+
+    # Build a hash of the signature for fast lookup.
+    def _hash_sig(sig: tuple[float, ...]) -> bytes:
+        raw = b"".join(_fp_bytes(v) for v in sig)
+        return _hashlib.md5(raw, usedforsecurity=False).digest()  # noqa: S324
+
+    # Group unopt SSAs by their signature hash (only init-eligible).
+    unopt_by_hash: dict[bytes, list[str]] = {}
+    for ssa in init_eligible:
+        sig = _sig_unopt(ssa)
+        if any(v != v for v in sig):  # NaN → skip (SSA not reached)
+            continue
+        h = _hash_sig(sig)
+        unopt_by_hash.setdefault(h, []).append(ssa)
+
+    # Match each opt-MIR init output.
+    opt_output_ssas = set(opt_cm.cached.mapping.keys())
+    matched: set[str] = set()
+    for opt_ssa in opt_output_ssas:
+        sig = _sig_opt(opt_ssa)
+        if any(v != v for v in sig):
+            continue
+        h = _hash_sig(sig)
+        cands = unopt_by_hash.get(h, [])
+        if len(cands) == 1:
+            matched.add(cands[0])
+        # len > 1 → still ambiguous even after n_probes; skip (conservative)
+
+    return frozenset(matched)
+
+
+def _partition_init_eval(
+    fn: "Function",
+    interner: "HirInterner",
+) -> frozenset[str]:
+    """Identify MIR SSA names that are *init-eligible* in a combined function.
+
+    An SSA is init-eligible iff every value it transitively depends on is
+    either a model parameter, temperature, or a numeric/boolean constant —
+    i.e. it has **no dependence on port voltages or branch currents**.  These
+    are exactly the quantities that Verilog-A's ``analog initial`` block
+    computes: device-physics constants that depend only on geometry and doping,
+    not on bias.
+
+    Used by the ``--dump-unopt-mir`` path where ``analog initial`` and
+    ``analog`` are merged into one function: we recover the split by
+    dependency analysis rather than relying on the structured init/eval
+    boundary that ``--dump-json`` / ``--dump-mir`` expose.
+
+    Args:
+        fn:       The combined MIR function (``eval_fn`` from unopt ingestion).
+        interner: Describes what each function argument represents.
+
+    Returns:
+        Frozenset of MIR SSA names whose computation is purely parameter /
+        temperature dependent.  All other SSAs are implicitly eval-only.
+    """
+    # Seed: tag each function argument as param-safe or voltage-polluted.
+    init_safe: set[str] = set()
+    for arg in fn.args:
+        kind = interner.parameters.get(arg)
+        if isinstance(
+            kind, (ParamRef, TemperatureInput, ParamGivenRef, ParamSysFunInput)
+        ):
+            init_safe.add(arg)
+        # Voltage, CurrentKind, AbstimeInput, HiddenStateInput, etc. → eval-only.
+
+    # Constants (literals) are always init-safe.
+    for c in fn.constants:
+        init_safe.add(c.name)
+
+    # Forward propagation: an SSA is init-safe iff ALL its operands are.
+    # Iterate until stable (handles back-edges from loops, though PSP103
+    # has none at this MIR level).
+    changed = True
+    while changed:
+        changed = False
+        for block in fn.blocks:
+            for inst in block.insts:
+                if inst.result is None or inst.result in init_safe:
+                    continue
+                if inst.opcode == "phi":
+                    operands = [edge.value for edge in (inst.phi_edges or [])]
+                else:
+                    operands = list(inst.operands or [])
+                # call operands: target is not an SSA, skip it
+                if inst.opcode == "call":
+                    operands = list(inst.operands or [])
+                if all(op in init_safe for op in operands):
+                    init_safe.add(inst.result)
+                    changed = True
+
+    return frozenset(init_safe)
+
+
+def _compute_unopt_init_cache_refs(
+    cse_hoist_order: list[str],
+    hoist_defs: dict[str, str],
+) -> tuple[int, list[str]]:
+    """From the post-walk hoist list, derive a clean init/eval boundary.
+
+    After a unified eval walk with ``cse.init_eligible`` set, the hoist list
+    contains a mix of ``i_vN`` (init-prefixed) and plain ``vN`` (eval) names
+    in DFS post-order.  Because the shared CSE table can pull plain eval SSAs
+    into the expression of an init hoist (when two SSAs share a sub-expression
+    that was first hoisted as eval), some ``i_vN`` hoists may reference plain
+    ``vN`` names.  Those cannot move to the setup function — demote them to
+    eval by stripping the ``i_`` prefix.
+
+    Algorithm (iterative until stable):
+    1. Any ``i_vN`` whose expression references a plain ``vN`` is demoted to
+       eval (renamed to ``vN`` in hoist_defs and hoist_order).
+    2. Any ``i_vN`` that now references a just-demoted (was ``i_vM``, now
+       ``vM``) name is demoted in the next pass.
+    3. Repeat until no demotions occur.
+
+    After demotion, perform a stable partition: remaining ``i_vN`` hoists
+    first (they only reference each other), then plain ``vN`` hoists.
+    Identify boundary refs (``i_vN`` names referenced in eval expressions).
+
+    Returns:
+        ``(init_hoist_count, init_cache_refs)``.
+    """
+    import re as _re
+
+    _I_NAME = _re.compile(r"\bi_v\d+\b")
+    _V_NAME = _re.compile(r"\bv\d+\b")
+
+    # Work with the caller's lists/dicts directly (mutations propagate back).
+    hoist_order = list(cse_hoist_order)  # local copy of order; written back at end
+
+    # Build a name→expression index for fast lookup.
+    # Iteratively demote i_vN hoists that reference plain vN names.
+    plain_names: set[str] = {h for h in hoist_order if not h.startswith("i_")}
+    changed = True
+    while changed:
+        changed = False
+        new_order: list[str] = []
+        for name in hoist_order:
+            if not name.startswith("i_"):
+                new_order.append(name)
+                continue
+            expr = hoist_defs.get(name, "")
+            # Check if this i_vN expression references any plain vN name.
+            if any(v in plain_names for v in _V_NAME.findall(expr)):
+                # Demote: rename i_vN → vN throughout.
+                plain = name[2:]  # strip "i_"
+                hoist_defs[plain] = hoist_defs.pop(name)
+                # Rewrite any other expression that referenced the old name.
+                for k in list(hoist_defs):
+                    if name in hoist_defs[k]:
+                        hoist_defs[k] = hoist_defs[k].replace(name, plain)
+                plain_names.add(plain)
+                new_order.append(plain)
+                changed = True
+            else:
+                new_order.append(name)
+        hoist_order = new_order
+
+    # Stable partition: all surviving i_vN hoists first, then plain vN.
+    i_order = [h for h in hoist_order if h.startswith("i_")]
+    v_order = [h for h in hoist_order if not h.startswith("i_")]
+    hoist_order = i_order + v_order
+    init_hoist_count = len(i_order)
+
+    # Boundary: i_vN names referenced in eval expressions.
+    eval_exprs = " ".join(hoist_defs.get(h, "") for h in v_order)
+    boundary_set = set(_I_NAME.findall(eval_exprs))
+    cache_refs = [h for h in hoist_order if h in boundary_set]
+
+    # Write corrected order back to the caller's list (hoist_defs was mutated
+    # in-place above so cse.hoist_defs is already up to date).
+    cse_hoist_order[:] = hoist_order
+
+    return init_hoist_count, cache_refs
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +958,7 @@ def lower(
     static_params: dict[str, int | float] | None = None,
     class_name: str | None = None,
     differentiable_params: tuple[str, ...] | None = (),
+    opt_init_eligible: frozenset[str] | None = None,
 ) -> LoweredDevice:
     """Lower a parsed :class:`CompiledModule` into a :class:`LoweredDevice`.
 
@@ -741,7 +1073,32 @@ def lower(
     # same ``i_v42`` name in scope. Init hoists use the ``i_`` prefix so
     # ``i_v42`` and eval's own ``v42`` never collide.
     all_roots = _residual_ssa_names(cm) + _jacobian_ssa_names(cm)
-    cse = CseState(refcount=_compute_refcount(cm.eval_fn, all_roots), ssa_prefix="i_")
+
+    # Unopt-MIR path: ``--dump-unopt-mir`` merges the analog-initial and
+    # analog blocks into one function, so ``cached.mapping`` is empty and
+    # there is no separate init_fn walk.  Recover the split by dependency
+    # analysis: any SSA whose value depends only on model parameters /
+    # temperature (not port voltages or branch currents) is init-eligible
+    # and will be hoisted with the ``i_`` prefix during the unified walk,
+    # exactly as if it had been resolved in a separate init pass.
+    _is_unopt_combined = not cm.cached.mapping
+    _unopt_init_eligible: frozenset[str] = frozenset()
+    if _is_unopt_combined:
+        if opt_init_eligible is not None:
+            # Caller supplied a pre-computed set from ``_match_opt_init_to_unopt``:
+            # exact opt-MIR init outputs matched to unopt SSA names by value
+            # equivalence.  This gives the same 447 clean cache slots as the
+            # JSON/opt-MIR path, avoiding CSE cross-contamination entirely.
+            _unopt_init_eligible = opt_init_eligible
+        else:
+            # Fall back to dependency analysis (conservative, ~608 slots).
+            _unopt_init_eligible = _partition_init_eval(cm.eval_fn, cm.eval_interner)
+
+    cse = CseState(
+        refcount=_compute_refcount(cm.eval_fn, all_roots),
+        ssa_prefix="i_",
+        init_eligible=_unopt_init_eligible,
+    )
 
     # Run SCCP on the init function, then rewrite it: dead blocks dropped,
     # phi nodes whose dead predecessors are pruned simplify to single-edge
@@ -816,6 +1173,39 @@ def lower(
     # Record how many hoists came from init before switching to eval prefix.
     _init_hoist_end = len(cse.hoist_order)
 
+    # Concretely evaluate the init hoists to build a float-valued cache.
+    # This seeds eval SCCP with values that the symbolic lattice can't prove
+    # because it doesn't fold fdiv/exp/log/sqrt.  The namespace is seeded with
+    # jnp (for jnp.exp, jnp.divide, etc.) and the concrete static-param values
+    # keyed by their MIR SSA arg names.  Runtime-dependent hoists (those that
+    # reference signals or state) raise NameError → caught → skip.
+    _concrete_cache: dict[str, float] = {}
+    if effective_static and _init_hoist_end > 0:
+        import jax.numpy as _jnp_eval  # noqa: PLC0415
+
+        _eval_ns: dict[str, object] = {"jnp": _jnp_eval, "__builtins__": {}}
+        # Hoist expressions use the Python param name (e.g. "SWIGATE"), not the
+        # MIR SSA name.  Seed by name so "SWIGATE > 0.0" evaluates correctly.
+        for _kind in cm.init_interner.parameters.values():
+            if isinstance(_kind, ParamRef) and _kind.name in effective_static:
+                _eval_ns[_kind.name] = effective_static[_kind.name]
+        for _hoist_ssa in cse.hoist_order[:_init_hoist_end]:
+            _expr = cse.hoist_defs.get(_hoist_ssa)
+            if _expr is None:
+                continue
+            try:
+                _result = eval(_expr, _eval_ns)  # noqa: S307
+                _eval_ns[_hoist_ssa] = _result
+                if hasattr(_result, "item"):
+                    _fval = float(_result.item())
+                elif isinstance(_result, (int, float)):
+                    _fval = float(_result)
+                else:
+                    continue
+                if math.isfinite(_fval):
+                    _concrete_cache[_hoist_ssa] = _fval
+            except Exception:  # noqa: BLE001
+                pass
     # Switch CSE prefix so eval's hoists land under their plain SSA names,
     # distinguishable from init's ``i_``-prefixed ones.
     cse.ssa_prefix = ""
@@ -858,7 +1248,37 @@ def lower(
         lat = init_sccp.lattice_value(init_val)
         if lat.is_constant:
             eval_sccp_init[eval_arg] = lat.value
-    eval_sccp = run_sccp(cm.eval_fn, eval_sccp_init)
+        elif init_val in init_env:
+            # Fall back to concretely evaluated value when the symbolic lattice
+            # stayed BOTTOM (e.g. init computed this through fdiv/exp/log that
+            # the lattice couldn't fold before the math-intrinsic extension).
+            _hoist_key = init_env[init_val].text
+            if _hoist_key in _concrete_cache:
+                eval_sccp_init[eval_arg] = _concrete_cache[_hoist_key]
+    # Identify "voltage" args (Voltage, CurrentKind, HiddenStateInput, etc.)
+    # by interner kind so SCCP can compute voltage-taint provenance for the
+    # unopt two-phase init walk's ``skip_voltage_tainted`` filter.
+    _voltage_arg_names: set[str] = set()
+    for _arg in cm.eval_fn.args:
+        _kind = cm.eval_interner.parameters.get(_arg)
+        if isinstance(
+            _kind,
+            (
+                Voltage,
+                CurrentKind,
+                HiddenStateInput,
+                AbstimeInput,
+                PrevStateInput,
+                NewStateInput,
+                EnableLimInput,
+                PortConnectedInput,
+            ),
+        ):
+            _voltage_arg_names.add(_arg)
+
+    eval_sccp = run_sccp(
+        cm.eval_fn, eval_sccp_init, voltage_arg_names=_voltage_arg_names
+    )
     eval_fn = rewrite_function(cm.eval_fn, eval_sccp)
     _inject_sccp_constants(eval_env, eval_sccp, eval_fn)
 
@@ -942,7 +1362,43 @@ def lower(
     else:
         jac_resist, jac_react = {}, {}
 
+    # --- Unopt-MIR post-walk: recover init/eval split from unified walk -----
+    # The unified walk (no separate init_fn pass) interleaves ``i_``-prefixed
+    # init hoists with plain eval hoists in DFS traversal order.  The emitter
+    # expects all init hoists to come first (as ``cse_hoists[:init_hoist_count]``)
+    # followed by eval hoists.  Since init hoists only reference other init
+    # hoists and eval hoists may reference init hoists, a stable partition
+    # (init first, eval second, relative order preserved within each group)
+    # is always a valid topological ordering.
+    if _is_unopt_combined and _unopt_init_eligible:
+        # Single-phase walk + post-walk demotion. (Two-phase walk attempts
+        # are documented in commit history but consistently produce wrong
+        # physics due to SCCP rewriter / resolve-walk interactions; needs
+        # more targeted work.)
+        _init_hoist_end, _init_cache_refs = _compute_unopt_init_cache_refs(
+            cse.hoist_order, cse.hoist_defs
+        )
+    # -------------------------------------------------------------------------
+
     cse_hoists = [(ssa, cse.hoist_defs[ssa]) for ssa in cse.hoist_order]
+
+    # For the unopt path: the boundary-ref scan in _compute_unopt_init_cache_refs
+    # only searched eval hoist expressions, but residual expressions (f/q) can also
+    # reference i_v... names directly. Add any such names that are missing.
+    if _is_unopt_combined and _init_cache_refs is not None:
+        _i_name_re = re.compile(r"\bi_v\d+\b")
+        _all_residual = " ".join(
+            list(f_exprs.values())
+            + list(q_exprs.values())
+            + [e for _, e in (jac_resist or {}).items()]
+            + [e for _, e in (jac_react or {}).items()]
+        )
+        _init_ref_set = set(_init_cache_refs)
+        _i_order_set = {h for h in cse.hoist_order if h.startswith("i_")}
+        for name in _i_name_re.findall(_all_residual):
+            if name not in _init_ref_set and name in _i_order_set:
+                _init_cache_refs.append(name)
+                _init_ref_set.add(name)
 
     return LoweredDevice(
         class_name=class_name or _camel_case(cm.name),
@@ -958,6 +1414,7 @@ def lower(
         init_hoist_count=_init_hoist_end,
         init_cache_refs=_init_cache_refs,
         differentiable_params=differentiable_params,
+        phi_resolutions=dict(cse.phi_resolutions),
     )
 
 
@@ -1331,6 +1788,8 @@ class _FunctionCfg:
 
     terminators: dict[str, Inst]  # block label -> its terminator instruction
     preds: dict[str, list[str]]  # block label -> predecessor block labels
+    entry: str | None  # entry block label (first block of the function)
+    idom: dict[str, str]  # immediate dominator of each reachable block
 
 
 def _build_cfg(fn: Function) -> _FunctionCfg:
@@ -1346,7 +1805,79 @@ def _build_cfg(fn: Function) -> _FunctionCfg:
         terminators[b.label] = term
         for tgt in term.targets:
             preds.setdefault(tgt, []).append(b.label)
-    return _FunctionCfg(terminators=terminators, preds=preds)
+    entry = fn.blocks[0].label if fn.blocks else None
+    idom = _compute_idom(entry, preds, terminators) if entry is not None else {}
+    return _FunctionCfg(terminators=terminators, preds=preds, entry=entry, idom=idom)
+
+
+def _compute_idom(
+    entry: str,
+    preds: dict[str, list[str]],
+    terminators: dict[str, Inst],
+) -> dict[str, str]:
+    """Cooper-Harvey-Kennedy iterative immediate-dominator analysis.
+
+    Returns ``{block: idom(block)}`` for every reachable block.  The entry
+    block has no idom and is omitted from the result.  ``idom[b]`` is the
+    closest strict dominator of ``b`` — the unique block that every path
+    from entry to ``b`` must pass through, that itself doesn't dominate
+    any other strict dominator of ``b``.
+
+    For a diamond merge block, ``idom[merge]`` is the decision block —
+    even when the branches between contain arbitrary internal control
+    flow.  Climb-based detection in ``_find_simple_diamond`` fails when
+    both branches have nested if/elses (juncap200's express vs full-
+    junction physics path is the canonical case); idom handles it
+    natively because every path from entry to merge still goes through
+    the outer decision.
+    """
+    # Reverse-postorder traversal of reachable blocks.
+    rpo: list[str] = []
+    visited: set[str] = set()
+
+    def dfs(blk: str) -> None:
+        if blk in visited:
+            return
+        visited.add(blk)
+        term = terminators.get(blk)
+        if term is not None:
+            for tgt in term.targets:
+                dfs(tgt)
+        rpo.append(blk)
+
+    dfs(entry)
+    rpo.reverse()
+    rpo_idx = {b: i for i, b in enumerate(rpo)}
+
+    # Standard CHK iterative algorithm.
+    idom: dict[str, str] = {entry: entry}
+
+    def _intersect(b1: str, b2: str) -> str:
+        finger1, finger2 = b1, b2
+        while finger1 != finger2:
+            while rpo_idx[finger1] > rpo_idx[finger2]:
+                finger1 = idom[finger1]
+            while rpo_idx[finger2] > rpo_idx[finger1]:
+                finger2 = idom[finger2]
+        return finger1
+
+    changed = True
+    while changed:
+        changed = False
+        for blk in rpo[1:]:  # skip entry
+            block_preds = [p for p in preds.get(blk, []) if p in idom]
+            if not block_preds:
+                continue
+            new_idom = block_preds[0]
+            for other in block_preds[1:]:
+                new_idom = _intersect(other, new_idom)
+            if idom.get(blk) != new_idom:
+                idom[blk] = new_idom
+                changed = True
+
+    # Drop the self-mapping for the entry block — it has no strict idom.
+    idom.pop(entry, None)
+    return idom
 
 
 def _defining_insts(fn: Function) -> dict[str, Inst]:
@@ -1407,6 +1938,7 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
     # on set allocations (observed OOM at > 50 GB RSS before this fix).
     # The ``try/finally`` ensures we always clean up on both normal return
     # and exception paths.
+    _phi_res: PhiResolution | None = None
     visiting.add(ssa)
     try:
 
@@ -1426,7 +1958,7 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
             )
 
         if op == "phi":
-            expr = _lower_phi(
+            _phi_result = _lower_phi(
                 inst,
                 defs,
                 const_table,
@@ -1439,6 +1971,13 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                 cse,
                 sccp,
             )
+            if isinstance(_phi_result, PhiResolution):
+                _phi_res = _phi_result
+                expr = Expr(
+                    f"jnp.where({_phi_res.cond_ssa}, {_phi_res.true_expr}, {_phi_res.false_expr})"
+                )
+            else:
+                expr = _phi_result
         elif op in _PASSTHROUGH:
             expr = resolve(inst.operands[0])
         elif op in _BINOPS:
@@ -1507,25 +2046,29 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                 fn = "jnp.log" if op == "ln" else "jnp.log10"
                 expr = Expr(f"{fn}(jnp.maximum({inner.text}, 1e-300))")
             elif op == "sqrt":
-                # Floor sqrt argument to 1e-30 rather than 0. Using 0 causes
-                # `0.5 / sqrt(0) = inf` in JAX's derivative path (the JVP of
-                # sqrt is 0.5/sqrt(x), which diverges at x=0), and `inf * 0`
-                # propagates as NaN through subsequent ops. A 1e-30 floor keeps
-                # the derivative finite (0.5/sqrt(1e-30) ≈ 5e14) while the
-                # gradient of jnp.maximum(x, 1e-30) w.r.t. x is 0 for x<1e-30,
-                # so the chain rule gives 5e14 * 0 = 0 — no NaN. The primal
-                # change (sqrt(1e-30) ≈ 3e-16 instead of 0) is negligible for
-                # dead-branch values that would have been masked by jnp.where.
-                # Verilog-A physics guards sqrt() calls with conditional branches
-                # (e.g. JUNCAP200's `if (V < VMAX) ... else { zinv = sqrt(idmult) }`
-                # — the else branch is only valid when V >= VMAX). The diamond-phi
-                # lifter emits jnp.where for simple diamonds but falls back to
-                # picking one edge when nested if/else defeats the single-
-                # predecessor walk. JAX
-                # evaluates all paths eagerly, so sqrt of a large negative from
-                # the dead else-branch produces NaN that poisons downstream ops.
-                # Flooring to 1e-30 (rather than 0) prevents inf gradients.
-                expr = Expr(f"jnp.sqrt(jnp.maximum({inner.text}, 1e-30))")
+                # Floor sqrt argument to 1e-300 (the float64 normal-min floor)
+                # rather than 0. Using 0 causes `0.5 / sqrt(0) = inf` in
+                # JAX's derivative path (the JVP of sqrt is 0.5/sqrt(x),
+                # which diverges at x=0), and `inf * 0` propagates as NaN
+                # through subsequent ops.
+                #
+                # Originally floored to 1e-30, but that's way too high for
+                # IHP juncap200's tunneling-physics prefactors:
+                #     btatpartbot = sqrt(32 * meff * m_e * q * vbi^3) / hbar
+                # has a sqrt argument around 1e-49 at default IHP params
+                # (MEFFTATBOT=0.25, vbi≈0.55V). Clamping that to 1e-30
+                # gives sqrt = 1e-15 instead of the true ~4.4e-25 — a 10
+                # orders of magnitude error that propagates downstream and
+                # blows the residual current up by ~1e10. The 1e-300 floor
+                # is small enough that no realistic physics value gets
+                # clamped, while keeping the gradient finite (5e149 — large
+                # but representable in float64).
+                #
+                # The dead-branch concern (sqrt of a large-negative-from-
+                # discarded-else producing NaN) is addressed by jnp.maximum
+                # itself, which clamps any negative input back to the
+                # floor regardless of magnitude.
+                expr = Expr(f"jnp.sqrt(jnp.maximum({inner.text}, 1e-300))")
             else:
                 expr = Expr(f"{_MATH1[op]}({inner.text})")
         elif op in _MATH2:
@@ -1622,10 +2165,17 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
         op in _PASSTHROUGH or op in _CAST_OPS or bool(_TRIVIAL_EXPR_RE.match(expr.text))
     )
     if cse is not None and not skip_hoist:
-        hoist_name = f"{cse.ssa_prefix}{ssa}" if cse.ssa_prefix else ssa
+        # Per-SSA prefix: init-eligible SSAs always use "i_" even during a
+        # unified eval walk (unopt-MIR path where init and eval share one fn).
+        if cse.init_eligible and ssa in cse.init_eligible:
+            hoist_name = f"i_{ssa}"
+        else:
+            hoist_name = f"{cse.ssa_prefix}{ssa}" if cse.ssa_prefix else ssa
         if hoist_name not in cse.hoist_defs:
             cse.hoist_defs[hoist_name] = expr.text
             cse.hoist_order.append(hoist_name)
+            if _phi_res is not None:
+                cse.phi_resolutions[hoist_name] = _phi_res
         env[ssa] = Expr(hoist_name, prec=100)
         return env[ssa]
 
@@ -1713,7 +2263,7 @@ def _lower_phi(  # noqa: C901
     cfg: _FunctionCfg | None,
     cse: CseState | None,
     sccp: object | None = None,
-) -> Expr:
+) -> Expr | PhiResolution:
     """Lower a phi node.
 
     Two cases, tried in order:
@@ -1764,9 +2314,17 @@ def _lower_phi(  # noqa: C901
     # static-condition phis still fold; runtime-condition phis still
     # emit ``jnp.where``.
 
-    # Case 1: try diamond.
+    # Case 1: try diamond detection.  Try the cheap climb-based detector
+    # first (handles trivial pure-diamond and one-sided cases), then fall
+    # back to the dominator-based detector for diamonds where both
+    # branches contain internal control flow (e.g. juncap200's express
+    # vs full-junction-physics if/else, where each branch has nested
+    # if-blocks for SRH / BBT / avalanche corrections — the climb can't
+    # walk through the internal phi-merges).
     if cfg is not None and len(inst.phi_edges) == 2:
         diamond = _find_simple_diamond(inst.phi_edges, cfg)
+        if diamond is None:
+            diamond = _find_dominator_diamond(inst.phi_edges, cfg)
         if diamond is not None:
             cond_ssa, true_edge_ssa, false_edge_ssa = diamond
 
@@ -1802,8 +2360,11 @@ def _lower_phi(  # noqa: C901
             true_expr = resolve_edge(true_edge_ssa)
             false_expr = resolve_edge(false_edge_ssa)
             if cond is not None and true_expr is not None and false_expr is not None:
-                return Expr(
-                    f"jnp.where({cond.text}, {true_expr.text}, {false_expr.text})"
+                return PhiResolution(
+                    cond_ssa=cond.text,
+                    cond_negated=False,
+                    true_expr=true_expr.text,
+                    false_expr=false_expr.text,
                 )
 
     # Case 1b: 3-edge nested diamond (e.g. PSP103's ``expll`` macro).
@@ -1836,6 +2397,24 @@ def _lower_phi(  # noqa: C901
                 return Expr(
                     f"jnp.where({outer_cond.text}, {outer_expr.text}, {inner_where})"
                 )
+
+    # Case 1.5: SCCP live-edge shortcut.
+    # When SCCP has eliminated all but one predecessor edge (e.g. a
+    # parameter-dependent condition folds to a constant), resolve only that
+    # live edge.  This fires after diamond detection so we never silently
+    # drop voltage-dependent branches that Case 1 would have preserved via
+    # ``jnp.where`` — by this point neither diamond detector matched, so
+    # there is no runtime condition to preserve.
+    from .sccp import SccpResult as _SccpResult  # noqa: PLC0415
+
+    if isinstance(sccp, _SccpResult):
+        phi_block = sccp.block_of(inst.result)
+        if phi_block is not None:
+            live_ssa = sccp.live_phi_value(inst.phi_edges, phi_block)
+            if live_ssa is not None:
+                live = resolve_edge(live_ssa)
+                if live is not None:
+                    return live
 
     # Case 2: fallback — pick the most-informative edge.
     #
@@ -1891,6 +2470,97 @@ def _lower_phi(  # noqa: C901
             return e
     # Priority 4: last-resort.
     return resolved[0]
+
+
+def _find_dominator_diamond(
+    phi_edges: list, cfg: _FunctionCfg
+) -> tuple[str, str, str] | None:
+    """Detect a 2-edge diamond using the immediate-dominator tree.
+
+    Used as a fallback when ``_find_simple_diamond``'s climb-based
+    detection fails because both branches contain internal control flow
+    (nested if/else, internal phi-merges).
+
+    Strategy: locate the merge block (the unique block whose predecessor
+    set is a superset of both phi-edge predecessor blocks). The
+    immediate dominator of the merge block is the outer decision —
+    every path from entry to the merge passes through it, regardless of
+    internal control flow within each branch. If that dominator is
+    ``br``-terminated, we have a clean diamond. Map the phi edges to
+    true / false sides via forward reachability from each br target,
+    bounded by the decision block (so we don't cycle back).
+
+    Returns ``(cond_ssa, true_edge_ssa, false_edge_ssa)`` or ``None``.
+    """
+    if len(phi_edges) != 2:
+        return None
+
+    # Find the merge block: the unique block whose predecessor set
+    # contains both edge-predecessor blocks. (For a pure diamond the
+    # merge block's preds == {edge0.block, edge1.block} but for
+    # asymmetric diamonds where one edge-block is itself the merge's
+    # parent there can be additional preds.)
+    edge_blocks = {e.block for e in phi_edges}
+    merge: str | None = None
+    for blk, blk_preds in cfg.preds.items():
+        if edge_blocks.issubset(set(blk_preds)):
+            merge = blk
+            break
+    if merge is None:
+        return None
+
+    decision = cfg.idom.get(merge)
+    if decision is None:
+        return None
+    term = cfg.terminators.get(decision)
+    if term is None or term.opcode != "br" or len(term.targets) != 2:
+        return None
+
+    cond_ssa = term.operands[0]
+    t_true, t_false = term.targets
+
+    # Forward-reachability from each br target, stopping at ``decision``
+    # (don't cycle back through it) and at ``merge`` (don't cross over).
+    def _reach(start: str) -> set[str]:
+        seen: set[str] = set()
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            if cur in seen or cur == decision or cur == merge:
+                continue
+            seen.add(cur)
+            term_cur = cfg.terminators.get(cur)
+            if term_cur is None:
+                continue
+            for tgt in term_cur.targets:
+                if tgt not in seen and tgt != decision:
+                    stack.append(tgt)
+        return seen
+
+    reach_true = _reach(t_true) | {t_true}
+    reach_false = _reach(t_false) | {t_false}
+
+    true_ssa: str | None = None
+    false_ssa: str | None = None
+    for edge in phi_edges:
+        in_t = edge.block in reach_true
+        in_f = edge.block in reach_false
+        if in_t and not in_f:
+            if true_ssa is not None:
+                return None
+            true_ssa = edge.value
+        elif in_f and not in_t:
+            if false_ssa is not None:
+                return None
+            false_ssa = edge.value
+        else:
+            # Edge predecessor is reachable from both sides, or neither
+            # — can't unambiguously assign.
+            return None
+
+    if true_ssa is None or false_ssa is None:
+        return None
+    return cond_ssa, true_ssa, false_ssa
 
 
 def _find_simple_diamond(
@@ -2413,7 +3083,11 @@ def _plan_component_surface(  # noqa: C901, PLR0912
         and "_temperature" not in seen
     ):
         seen.add("_temperature")
-        specs.append(("_temperature", "float", "300.0"))
+        # SPICE / OSDI / VACASK convention: tnom = 27 °C = 300.15 K.
+        # Our prior default of 300.0 K (26.85 °C) introduces a 0.05 %
+        # phitd offset that propagates as ~30x error in sub-threshold
+        # MOSFET currents (exp(Vgs/(n*phitd)) amplification).
+        specs.append(("_temperature", "float", "300.15"))
     if (
         any(isinstance(k, ParamSysFunInput) and k.name == "mfactor" for k in eval_kinds)
         and "_mfactor" not in seen
@@ -2599,6 +3273,7 @@ def _camel_case(name: str) -> str:
 __all__ = [
     "Expr",
     "LoweredDevice",
+    "_match_opt_init_to_unopt",
     "LoweringError",
     "lower",
 ]

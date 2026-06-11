@@ -43,6 +43,7 @@ Public surface:
 
 from __future__ import annotations
 
+import math as _math
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
@@ -106,6 +107,38 @@ class LatticeValue:
 
 _TOP = LatticeValue.top()
 _BOTTOM = LatticeValue.bottom()
+
+# Math intrinsics the SCCP lattice can fold when all operands are CONSTANT.
+# Only returns CONSTANT for finite results — inf/nan stays BOTTOM so that
+# downstream comparisons against them don't incorrectly eliminate branches.
+_SCCP_MATH1: dict[str, Any] = {
+    "exp": _math.exp,
+    "ln": _math.log,
+    "log": _math.log10,
+    "sqrt": _math.sqrt,
+    "floor": _math.floor,
+    "ceil": _math.ceil,
+    "sin": _math.sin,
+    "cos": _math.cos,
+    "tan": _math.tan,
+    "asin": _math.asin,
+    "acos": _math.acos,
+    "atan": _math.atan,
+    "sinh": _math.sinh,
+    "cosh": _math.cosh,
+    "tanh": _math.tanh,
+    "asinh": _math.asinh,
+    "acosh": _math.acosh,
+    "atanh": _math.atanh,
+    "fabs": abs,
+    "abs": abs,
+}
+
+_SCCP_MATH2: dict[str, Any] = {
+    "pow": _math.pow,
+    "hypot": _math.hypot,
+    "atan2": _math.atan2,
+}
 
 
 def _meet(a: LatticeValue, b: LatticeValue) -> LatticeValue:
@@ -190,11 +223,22 @@ def _eval_opcode(opcode: str, operands: list[LatticeValue]) -> LatticeValue:
             if b == 0:
                 return _BOTTOM
             return LatticeValue(LatticeState.CONSTANT, a % b, "float")
-        # ``fdiv`` deliberately not folded — ``1.0 / 0.0`` semantics differ
-        # between Python (raises ZeroDivisionError) and JAX (yields ``inf``
-        # / ``nan``), and the existing ``jnp.divide(a, jnp.where(b == 0,
-        # 1e-300, b))`` safe-divide pattern depends on staying at runtime
-        # to preserve the guard.
+        # ``fdiv`` when b is non-zero: fold exactly.  When b == 0 stay BOTTOM
+        # so the downstream safe-divide guard (jnp.where) stays live at runtime.
+        if op == "fdiv" and b != 0:
+            try:
+                result = float(a / b)
+                if _math.isfinite(result):
+                    return LatticeValue(LatticeState.CONSTANT, result, "float")
+            except (ZeroDivisionError, OverflowError):
+                pass
+        if op in _SCCP_MATH2:
+            try:
+                result = float(_SCCP_MATH2[op](a, b))
+                if _math.isfinite(result):
+                    return LatticeValue(LatticeState.CONSTANT, result, "float")
+            except (ValueError, OverflowError, ZeroDivisionError):
+                pass
 
     if len(operands) == 1:
         a = operands[0].value
@@ -221,6 +265,13 @@ def _eval_opcode(opcode: str, operands: list[LatticeValue]) -> LatticeValue:
             return LatticeValue(LatticeState.CONSTANT, -a, "float")
         if op == "ineg":
             return LatticeValue(LatticeState.CONSTANT, -a, "int")
+        if op in _SCCP_MATH1:
+            try:
+                result = float(_SCCP_MATH1[op](a))
+                if _math.isfinite(result):
+                    return LatticeValue(LatticeState.CONSTANT, result, "float")
+            except (ValueError, OverflowError, ZeroDivisionError):
+                pass
 
     return _BOTTOM
 
@@ -242,9 +293,24 @@ class SccpResult:
     # callers (the lowering walk's PHI handler in particular) can ask
     # ``live_phi_value`` without rebuilding the index themselves.
     ssa_block: dict[str, str] = field(default_factory=dict)
+    # ``voltage_tainted`` contains every SSA whose computation chain
+    # involved at least one runtime input (Voltage / CurrentKind /
+    # HiddenStateInput / etc. — any function arg seeded as BOTTOM).
+    # An SSA can be both ``is_constant`` and voltage-tainted: this means
+    # the value happens to be constant at SCCP analysis time (e.g. a
+    # multiplication with a structural-zero) but only because of how
+    # the runtime inputs cancel.  Such "structural-zero" constants are
+    # NOT safe to bake into a setup function: at runtime the underlying
+    # voltage chain still needs to produce intermediate non-zero values
+    # for downstream computations to be correct.
+    voltage_tainted: set[str] = field(default_factory=set)
 
     def lattice_value(self, ssa: str) -> LatticeValue:
         return self.lattice.get(ssa, _TOP)
+
+    def is_voltage_tainted(self, ssa: str) -> bool:
+        """True if SSA's computation involved any runtime (BOTTOM-seeded) input."""
+        return ssa in self.voltage_tainted
 
     def is_block_dead(self, label: str) -> bool:
         return label not in self.visited_blocks
@@ -294,6 +360,7 @@ class _Sccp:
 
     fn: Function
     initial_constants: dict[str, Any]
+    voltage_arg_names: set[str] = field(default_factory=set)
 
     lattice: dict[str, LatticeValue] = field(default_factory=dict)
     executable_edges: set[tuple[str, str]] = field(default_factory=set)
@@ -319,7 +386,53 @@ class _Sccp:
             executable_edges=self.executable_edges,
             visited_blocks=self.visited_blocks,
             ssa_block=self.inst_block,
+            voltage_tainted=self._compute_voltage_taint(),
         )
+
+    def _compute_voltage_taint(self) -> set[str]:
+        """Forward-propagate voltage-input taint through the def-use graph.
+
+        An SSA is voltage-tainted iff at least one of its dependencies is a
+        Voltage / CurrentKind / HiddenStateInput (or other runtime-only
+        input).  Param args that happen to be BOTTOM at SCCP analysis time
+        (because they're runtime-supplied) are NOT taint sources — they're
+        legitimate setup-function inputs.
+
+        The caller distinguishes these via ``voltage_arg_names`` (passed
+        through ``run_sccp``); only those args seed the taint set.
+
+        Use case: lowering must NOT bake a voltage-tainted constant into a
+        setup function — even if SCCP proves it constant via cancellation
+        like ``V(D,D) * coeff = 0``, the runtime computation chain still
+        needs to flow through the voltage operands for downstream
+        intermediates to be correct.
+        """
+        # Seed: only explicitly-tagged voltage args.
+        tainted: set[str] = set(self.voltage_arg_names)
+
+        # Iterate to fixpoint: any inst whose result depends on a tainted
+        # operand becomes tainted.
+        changed = True
+        while changed:
+            changed = False
+            for block in self.fn.blocks:
+                if block.label not in self.visited_blocks:
+                    continue
+                for inst in block.insts:
+                    if inst.result is None or inst.result in tainted:
+                        continue
+                    if inst.opcode == "phi":
+                        operands = [
+                            edge.value
+                            for edge in (inst.phi_edges or [])
+                            if (edge.block, block.label) in self.executable_edges
+                        ]
+                    else:
+                        operands = list(inst.operands or [])
+                    if any(op in tainted for op in operands):
+                        tainted.add(inst.result)
+                        changed = True
+        return tainted
 
     # ------------------------------------------------------------------
     # Setup
@@ -503,6 +616,8 @@ def _const_to_lattice(c: Constant) -> LatticeValue:
 def run_sccp(
     fn: Function,
     initial_constants: dict[str, Any] | None = None,
+    *,
+    voltage_arg_names: set[str] | None = None,
 ) -> SccpResult:
     """Run SCCP on a single MIR :class:`Function`.
 
@@ -523,7 +638,11 @@ def run_sccp(
         constants, prune dead blocks, and short-circuit PHIs without
         having to reproduce the analysis itself.
     """
-    driver = _Sccp(fn=fn, initial_constants=dict(initial_constants or {}))
+    driver = _Sccp(
+        fn=fn,
+        initial_constants=dict(initial_constants or {}),
+        voltage_arg_names=set(voltage_arg_names or ()),
+    )
     return driver.run()
 
 
