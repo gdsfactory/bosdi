@@ -57,7 +57,15 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      - name: Publish to TestPyPI
+        if: contains(github.ref_name, 'rc') || contains(github.ref_name, 'dev') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+
       - name: Publish to PyPI
+        if: "!(contains(github.ref_name, 'rc') || contains(github.ref_name, 'dev') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta'))"
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
