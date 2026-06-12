@@ -98,8 +98,8 @@ jax = ">=0.7.0,<0.8"  # needs to be installed from pypi for windows support
 jaxlib = ">=0.7.0,<0.8"
 
 [tool.pixi.target.linux-64.dependencies]
-auditwheel = ">=6.0"
-patchelf = ">=0.18"
+auditwheel = ">=6.0,<7"
+patchelf = ">=0.17,<1"
 
 [tool.pixi.feature.py311.dependencies]
 python = "3.11.*"
