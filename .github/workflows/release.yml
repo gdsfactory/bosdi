@@ -40,6 +40,16 @@ jobs:
       - name: Build wheel
         run: pixi run -e ${{ matrix.python-env }} wheel
 
+      - name: Repair Linux wheel (manylinux tag)
+        if: runner.os == 'Linux'
+        run: |
+          pip install auditwheel
+          for whl in dist/*.whl; do
+            auditwheel repair "$whl" -w dist-repaired/
+          done
+          rm dist/*.whl
+          mv dist-repaired/*.whl dist/
+
       - name: Build sdist
         if: runner.os == 'Linux' && matrix.python-env == 'py313'
         run: pixi run -e py313 sdist
