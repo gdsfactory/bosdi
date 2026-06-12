@@ -3,7 +3,7 @@
 ![CI](https://github.com/gdsfactory/bosdi/actions/workflows/test.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
-![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)
+![Platform: Linux | macOS](https://img.shields.io/badge/platform-linux%20%7C%20macOS-lightgrey)
 ![Status: Experimental](https://img.shields.io/badge/status-experimental-orange)
 
 > **Experimental** — bosdi is under active development. The OSDI binary evaluation path is stable and well-tested, but
@@ -134,8 +134,8 @@ Pass `jnp.nan` for any parameter to use its Verilog-A default. Parameters can be
 
 ## Limitations
 
-- **Platform:** Linux, macOS, Windows; Python 3.11+; OSDI 0.4 ABI only. `.osdi` binaries are platform-specific — compile
-  from `.va` sources via [openvaf-r](https://github.com/cdaunt/OpenVAF) on each target
+- **Platform:** Linux and macOS; Python 3.11+; OSDI 0.4 ABI only. `.osdi` binaries are platform-specific — compile from
+  `.va` sources via [openvaf-r](https://github.com/cdaunt/OpenVAF) on each target
 - **OSDI differentiability:** `jax.grad()` works through node voltages only, not model parameters — use the VA path for
   parameter gradients
 - **Stateful models** (`num_states > 0`): evaluation is skipped and outputs are zeroed

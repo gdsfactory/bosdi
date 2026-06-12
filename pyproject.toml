@@ -15,7 +15,6 @@ keywords = [
 ]
 classifiers = [
   "Operating System :: MacOS",
-  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -50,7 +49,7 @@ skip = "tests/devices/*"
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64", "win-64", "osx-arm64"]
+platforms = ["linux-64", "osx-arm64"]
 preview = ["pixi-build"]
 
 [tool.pixi.package]
