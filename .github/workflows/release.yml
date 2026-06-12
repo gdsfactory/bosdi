@@ -43,9 +43,9 @@ jobs:
       - name: Repair Linux wheel (manylinux tag)
         if: runner.os == 'Linux'
         run: |
-          pip install auditwheel
+          sudo apt-get install -y patchelf
           for whl in dist/*.whl; do
-            auditwheel repair "$whl" -w dist-repaired/
+            uvx auditwheel repair "$whl" -w dist-repaired/
           done
           rm dist/*.whl
           mv dist-repaired/*.whl dist/

@@ -36,7 +36,12 @@ Homepage = "https://github.com/gdsfactory/bosdi"
 Repository = "https://github.com/gdsfactory/bosdi"
 
 [build-system]
-requires = ["nanobind>=2.0.0", "setuptools>=61.0.0", "wheel"]
+requires = [
+  "jaxlib>=0.7.0,<0.8",
+  "nanobind>=2.0.0",
+  "setuptools>=61.0.0",
+  "wheel"
+]
 build-backend = "setuptools.build_meta"
 
 # --- CODESPELL CONFIGURATION ---
