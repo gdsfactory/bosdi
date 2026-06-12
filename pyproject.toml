@@ -1,6 +1,6 @@
 [project]
 name = "bosdi"
-version = "0.1.1rc2"
+version = "0.1.1rc3"
 description = "Make OSDI device models (Verilog-A compiled to .osdi) differentiable via JAX"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -54,7 +54,7 @@ preview = ["pixi-build"]
 
 [tool.pixi.package]
 name = "bosdi"
-version = "0.1.1rc2"
+version = "0.1.1rc3"
 
 [tool.pixi.package.build]
 backend = { name = "pixi-build-python", version = "*" }
