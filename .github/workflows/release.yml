@@ -43,9 +43,8 @@ jobs:
       - name: Repair Linux wheel (manylinux tag)
         if: runner.os == 'Linux'
         run: |
-          pipx install auditwheel
           for whl in dist/*.whl; do
-            auditwheel repair "$whl" -w dist-repaired/
+            pixi run -e ${{ matrix.python-env }} auditwheel repair "$whl" -w dist-repaired/
           done
           rm dist/*.whl
           mv dist-repaired/*.whl dist/
