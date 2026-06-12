@@ -1,6 +1,6 @@
 [project]
 name = "bosdi"
-version = "0.1.1rc1"
+version = "0.1.1rc2"
 description = "Make OSDI device models (Verilog-A compiled to .osdi) differentiable via JAX"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -54,7 +54,7 @@ preview = ["pixi-build"]
 
 [tool.pixi.package]
 name = "bosdi"
-version = "0.1.1rc1"
+version = "0.1.1rc2"
 
 [tool.pixi.package.build]
 backend = { name = "pixi-build-python", version = "*" }
@@ -116,11 +116,10 @@ test = "pytest -v"
 build = "python setup.py build_ext --inplace"
 build-clean = "rm -rf build/ && find . -name 'osdi_shim_nb*.so' -delete && python setup.py build_ext --inplace"
 # Wheel must use --no-isolation so the pixi env provides jaxlib's XLA FFI headers.
-# sdist can use uv build directly (no native compilation needed).
 wheel = "python -m build --no-isolation --wheel"
-sdist = "uv build --sdist"
-dist = "uv build --sdist && python -m build --no-isolation --wheel"
-publish = "uv publish dist/*"
+sdist = "python -m build --no-isolation --sdist"
+dist = "python -m build --no-isolation"
+publish = "python -m twine upload dist/*"
 install-openvaf = "cargo install --git https://github.com/cdaunt/OpenVAF openvaf-driver --features llvm18"
 
 # --- PYTEST CONFIGURATION ---
