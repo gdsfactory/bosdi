@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write # for OIDC PyPI trusted publisher
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
