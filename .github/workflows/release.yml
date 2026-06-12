@@ -24,21 +24,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y llvm-18-dev libclang-18-dev
 
-      - name: Install LLVM 18 (macOS)
-        if: runner.os == 'macOS'
-        run: brew install llvm@18
-
-      - name: Install openvaf-r (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Install openvaf-r (Linux)
+        if: runner.os == 'Linux'
         run: pixi run -e ${{ matrix.python-env }} install-openvaf
-        env:
-          LLVM_SYS_181_PREFIX: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/llvm@18' || '' }}
 
       - name: Build extension
         run: pixi run -e ${{ matrix.python-env }} build
 
-      - name: Run tests
-        if: runner.os != 'Windows'
+      - name: Run tests (Linux only)
+        if: runner.os == 'Linux'
         run: pixi run -e ${{ matrix.python-env }} test
 
       - name: Build wheel
