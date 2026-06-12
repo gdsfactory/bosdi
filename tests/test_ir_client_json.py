@@ -35,7 +35,7 @@ RESISTOR_VA = (
     / "verilog_a"
     / "resistor.va"
 )
-CAPACITOR_VA = pathlib.Path(__file__).parent / "capacitor_va.va"
+CAPACITOR_VA = pathlib.Path(__file__).parent / "devices" / "capacitor_va.va"
 
 OPENVAF_MISSING = pytest.mark.skipif(
     subprocess.run(["which", "openvaf-r"], capture_output=True).returncode != 0,

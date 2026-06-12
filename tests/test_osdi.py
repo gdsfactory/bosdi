@@ -25,7 +25,7 @@ def resistor_model():
     Ensure 'resistor_va.osdi' is compiled and present in the test directory.
     """
     # Load the binary dynamically via your Rust host
-    model = folder / "resistor_va.osdi"
+    model = folder / "compiled_osdi" / "resistor_va.osdi"
     model = load_osdi_model(str(model))
 
     # Quick sanity checks on the OSDI Descriptor extraction
@@ -172,7 +172,7 @@ def test_resistor_jax_jvp(resistor_model):
 @pytest.fixture(scope="module")
 def capacitor_model():
     """Load the compiled capacitor OSDI binary once for the test module."""
-    model = folder / "capacitor_va.osdi"
+    model = folder / "compiled_osdi" / "capacitor_va.osdi"
     model = load_osdi_model(str(model))
 
     assert model.num_pins == 2, f"Expected 2 pins, got {model.num_pins}"
@@ -849,7 +849,9 @@ def test_handle_type():
     # decoupled from any particular fixture scope.
     import pathlib
 
-    m = load_osdi_model(str(pathlib.Path(__file__).parent / "resistor_va.osdi"))
+    m = load_osdi_model(
+        str(pathlib.Path(__file__).parent / "compiled_osdi" / "resistor_va.osdi")
+    )
     h = osdi_setup_batch(m.id, np.array([[1.0, 50.0]], dtype=np.float64))
     try:
         assert isinstance(h, OsdiBatchHandle)

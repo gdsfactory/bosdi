@@ -20,6 +20,9 @@ jobs:
         with:
           environments: ${{ matrix.python-env }}
 
+      - name: Install openvaf-r
+        run: pixi run -e ${{ matrix.python-env }} install-openvaf
+
       - name: Build extension
         run: pixi run -e ${{ matrix.python-env }} build
 

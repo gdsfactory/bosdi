@@ -8,6 +8,9 @@
 # Proprietary PDK models (local only)
 src/devices/ihp_sg13g2/
 
+# Compiled OSDI binaries (built at test time from .va sources)
+*.osdi
+
 # build artifacts
 build/
 target/
