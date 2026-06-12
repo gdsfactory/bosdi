@@ -22,7 +22,9 @@ jobs:
 
       - name: Install LLVM 18 (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y llvm-18-dev libclang-18-dev
+        run: |
+          sudo apt-get install -y llvm-18-dev llvm-18 clang-18 libclang-18-dev
+          sudo ln -sf /usr/bin/llvm-lib-18 /usr/bin/llvm-lib
 
       - name: Install openvaf-r (Linux)
         if: runner.os == 'Linux'
