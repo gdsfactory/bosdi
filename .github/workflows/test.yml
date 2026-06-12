@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.8.1
+      - name: Install LLVM 18
+        run: sudo apt-get install -y llvm-18-dev libclang-18-dev
       - run: pixi run install-openvaf
       - run: pixi run build
       - run: pixi run test

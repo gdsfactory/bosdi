@@ -20,13 +20,19 @@ jobs:
         with:
           environments: ${{ matrix.python-env }}
 
-      - name: Install openvaf-r
+      - name: Install LLVM 18 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y llvm-18-dev libclang-18-dev
+
+      - name: Install openvaf-r (Linux)
+        if: runner.os == 'Linux'
         run: pixi run -e ${{ matrix.python-env }} install-openvaf
 
       - name: Build extension
         run: pixi run -e ${{ matrix.python-env }} build
 
       - name: Run tests
+        if: runner.os == 'Linux'
         run: pixi run -e ${{ matrix.python-env }} test
 
       - name: Build wheel

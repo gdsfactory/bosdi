@@ -122,7 +122,7 @@ wheel = "python -m build --no-isolation --wheel"
 sdist = "uv build --sdist"
 dist = "uv build --sdist && python -m build --no-isolation --wheel"
 publish = "uv publish dist/*"
-install-openvaf = "cargo install --git https://github.com/cdaunt/OpenVAF openvaf"
+install-openvaf = "cargo install --git https://github.com/cdaunt/OpenVAF openvaf-driver --features llvm18"
 
 # --- PYTEST CONFIGURATION ---
 [tool.pytest.ini_options]
