@@ -5,13 +5,26 @@ on:
     tags: ["v*.*.*"]
 
 jobs:
-  build:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: wheelhouse/
+
+  test-linux:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
         python-env: [py312, py313]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -20,46 +33,57 @@ jobs:
         with:
           environments: ${{ matrix.python-env }}
 
-      - name: Install LLVM 18 (Linux)
-        if: runner.os == 'Linux'
+      - name: Install LLVM 18
         run: |
           sudo apt-get install -y llvm-18-dev llvm-18 clang-18 libclang-18-dev
           sudo ln -sf /usr/bin/llvm-lib-18 /usr/bin/llvm-lib
 
-      - name: Install openvaf-r (Linux)
-        if: runner.os == 'Linux'
+      - name: Install openvaf-r
         run: pixi run -e ${{ matrix.python-env }} install-openvaf
 
       - name: Build extension
         run: pixi run -e ${{ matrix.python-env }} build
 
-      - name: Run tests (Linux only)
-        if: runner.os == 'Linux'
+      - name: Run tests
         run: pixi run -e ${{ matrix.python-env }} test
+
+      - name: Build sdist
+        if: matrix.python-env == 'py313'
+        run: pixi run -e py313 sdist
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-env == 'py313'
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-env: [py312, py313]
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          environments: ${{ matrix.python-env }}
+
+      - name: Build extension
+        run: pixi run -e ${{ matrix.python-env }} build
 
       - name: Build wheel
         run: pixi run -e ${{ matrix.python-env }} wheel
 
-      - name: Repair Linux wheel (manylinux tag)
-        if: runner.os == 'Linux'
-        run: |
-          for whl in dist/*.whl; do
-            pixi run -e ${{ matrix.python-env }} auditwheel repair "$whl" -w dist-repaired/
-          done
-          rm dist/*.whl
-          mv dist-repaired/*.whl dist/
-
-      - name: Build sdist
-        if: runner.os == 'Linux' && matrix.python-env == 'py313'
-        run: pixi run -e py313 sdist
-
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.os }}-${{ matrix.python-env }}
+          name: dist-macos-${{ matrix.python-env }}
           path: dist/
 
   publish:
-    needs: build
+    needs: [build-linux, test-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
