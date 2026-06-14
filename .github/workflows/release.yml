@@ -104,12 +104,14 @@ jobs:
         with:
           packages-dir: dist/
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
 
       - name: Publish to PyPI
         if: "!(contains(github.ref_name, 'rc') || contains(github.ref_name, 'dev') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta'))"
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          skip-existing: true
 
       - name: Create GitHub Release
         run: gh release create ${{ github.ref_name }} dist/* --generate-notes
