@@ -44,6 +44,16 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+# --- CIBUILDWHEEL CONFIGURATION ---
+[tool.cibuildwheel]
+build = "cp312-* cp313-*"
+skip = "*-musllinux*"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+environment = { PATH = "/root/.cargo/bin:$PATH" }
+
 # --- CODESPELL CONFIGURATION ---
 # OpenVAF MIR opcode names (``fle``, ``ine``, ``inot``, ``ige``, etc.) and a
 # few short variable names (``nd`` for "node") collide with codespell's
