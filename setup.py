@@ -123,7 +123,7 @@ setup(
     # at runtime — needs the ``openvaf_py`` PyO3 binding to compile ``.va``
     # sources directly; the legacy text-MIR path (``parse_dump``) stays
     # available for environments without it.
-    packages=["bosdi", "bosdi.va"],
+    packages=["bosdi", "bosdi.va", "bosdi.circulax"],
     ext_modules=[osdi_extension],
     cmdclass={"build_ext": BuildExt},
     zip_safe=False,
