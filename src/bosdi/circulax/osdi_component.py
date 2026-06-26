@@ -92,6 +92,36 @@ class OsdiComponentGroup(eqx.Module):
     # (~20–40 % faster for PSP103).  None falls back to the model_id + params path.
     handle: object | None = eqx.field(static=True, default=None)
 
+    def without_handle(self) -> "OsdiComponentGroup":
+        """Return a copy without the Tier-3 handle.
+
+        The returned group uses the ``model_id + params`` evaluation path
+        instead of the pre-baked handle path.  This is necessary when
+        ``params`` will be swapped via ``eqx.tree_at`` inside JIT/vmap/scan,
+        since the handle is a static field that cannot be re-created during
+        tracing.
+        """
+        return OsdiComponentGroup(
+            name=self.name,
+            model_id=self.model_id,
+            num_pins=self.num_pins,
+            num_nodes=self.num_nodes,
+            num_params=self.num_params,
+            num_states=self.num_states,
+            params=self.params,
+            states=self.states,
+            var_indices=self.var_indices,
+            eq_indices=self.eq_indices,
+            jac_rows=self.jac_rows,
+            jac_cols=self.jac_cols,
+            reg_diag=self.reg_diag,
+            index_map=self.index_map,
+            is_fdomain=self.is_fdomain,
+            amplitude_param=self.amplitude_param,
+            use_schur_reduction=self.use_schur_reduction,
+            handle=None,
+        )
+
     def with_params(self, new_params: jnp.ndarray) -> "OsdiComponentGroup":
         """Return a copy of this group with updated params and a fresh handle.
 
