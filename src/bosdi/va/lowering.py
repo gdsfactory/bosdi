@@ -45,7 +45,7 @@ import ast
 import math
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 
 from .mir import (
@@ -954,7 +954,7 @@ def lower(
     cm: CompiledModule,
     *,
     va_defaults: dict[str, ParamSpec] | None = None,
-    collapse_nodes: bool = False,
+    collapse_nodes: bool | Collection[tuple[str, str]] = False,
     static_params: dict[str, int | float] | None = None,
     class_name: str | None = None,
     differentiable_params: tuple[str, ...] | None = (),
@@ -973,9 +973,20 @@ def lower(
     rest of lowering — apply OpenVAF's ``CollapseHint`` decisions to
     shrink the DAE to the same shape OSDI emits. Off by default because
     collapse decisions are conditional on user-facing parameters (e.g.
-    the diode's ``Rs=0`` triggers ``CI→C`` but ``Rs>0`` doesn't); only
-    enable it for devices where the user intends the OSDI-matching
-    reduced system (PSP103, BSIM4, etc).
+    the diode's ``Rs=0`` triggers ``CI→C`` but ``Rs>0`` doesn't — and
+    ``True`` applies **every** hint unconditionally, which shorts any
+    resistance network the card keeps live, like BSIM4's substrate mesh
+    with ``rbodymod=1``).  Pass a collection of ``(node, node)`` pairs
+    instead to apply only the hints the model's mode flags actually
+    enable — the same decision OSDI/ngspice make at setup, e.g. for a
+    BSIM4 card with ``rdsmod=0`` but ``rbodymod=1``::
+
+        collapse_nodes=[("d", "di"), ("s", "si"),          # rdsmod=0
+                        ("g", "gm"), ("gm", "gi")]         # rgatemod=0
+
+    Pair order is irrelevant; hints not in the collection are skipped.
+    ``True`` keeps the old apply-everything behaviour and is only safe
+    when every hint's condition is known to hold for the baked card.
 
     ``static_params`` is an optional ``{param_name: value}`` dict of
     integer or float parameters whose values are *known at lowering time*
@@ -1044,7 +1055,12 @@ def lower(
     )
 
     if collapse_nodes:
-        _collapse_trivial_nodes(cm)
+        _collapse_trivial_nodes(
+            cm,
+            allowed_pairs=None
+            if collapse_nodes is True
+            else frozenset(frozenset(p) for p in collapse_nodes),
+        )
 
     # Build a constants table that spans all three functions — the DaeSystem
     # block references SSA names that may have been declared in any of them
@@ -1480,7 +1496,10 @@ _COLLAPSE_DECL_RE = re.compile(
 )
 
 
-def _collapse_trivial_nodes(cm: CompiledModule) -> dict[str, str]:
+def _collapse_trivial_nodes(
+    cm: CompiledModule,
+    allowed_pairs: frozenset[frozenset[str]] | None = None,
+) -> dict[str, str]:
     """Apply OpenVAF's ``CollapseHint`` decisions to the parsed DAE.
 
     OpenVAF's ``hir_lower`` pass emits a callback of the form
@@ -1500,6 +1519,13 @@ def _collapse_trivial_nodes(cm: CompiledModule) -> dict[str, str]:
     matches the collapsed id is rewritten to reference the survivor
     instead.
 
+    A ``CollapseHint`` is emitted for every *conditional* ``V(a,b) <+ 0``
+    in the source — whether it actually fires depends on parameter values
+    resolved at setup (BSIM4's ``rdsmod``/``rgatemod``/``rbodymod``,
+    the diode's ``Rs``).  ``allowed_pairs`` (a set of unordered node-name
+    pairs) restricts the pass to the hints the caller has decided are
+    live; ``None`` applies every hint unconditionally.
+
     Mutates ``cm.dae``, ``cm.internal_nodes``, and each interner's
     ``Voltage`` inputs in place. Returns ``{collapsed_node_id →
     survivor_node_id}`` for tests / logging.
@@ -1512,6 +1538,8 @@ def _collapse_trivial_nodes(cm: CompiledModule) -> dict[str, str]:
             m = _COLLAPSE_DECL_RE.search(cd.raw)
             if m:
                 pairs.add((m.group(1), m.group(2)))
+    if allowed_pairs is not None:
+        pairs = {p for p in pairs if frozenset(p) in allowed_pairs}
     if not pairs:
         return {}
 
