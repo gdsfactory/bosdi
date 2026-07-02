@@ -441,8 +441,18 @@ def _rewrite_branch_unknown(
     m = _FLOW_RE.match(node_name)
     if m is None:
         return node_name
-    branch_name = m.group(1).strip()
-    key = (branch_name, None)
+    inner = m.group(1)
+    # ``flow(hi,lo)`` labels an implicit two-node branch; its registry key
+    # must be the same ``(hi, lo)`` pair ``_input_kind_from_param`` used for
+    # the matching ``I(hi, lo)`` probe input.  Keying on the raw ``"hi,lo"``
+    # string minted a *fresh* branch_id here, so the DAE unknown and the
+    # eval body's probe reads disagreed on the branch's identity and the
+    # emitted Python referenced states that don't exist (BSIM4 rbodymod=1).
+    if "," in inner:
+        hi, _, lo = inner.partition(",")
+        key: tuple[str, str | None] = (hi.strip(), lo.strip())
+    else:
+        key = (inner.strip(), None)
     bid = branch_registry.setdefault(key, len(branch_registry))
     return f"br[Branch(BranchId({bid}))]"
 

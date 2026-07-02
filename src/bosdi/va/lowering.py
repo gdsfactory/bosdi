@@ -1668,6 +1668,14 @@ def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
     probes (``Unnamed``) that carry a ``branch_id`` from the JSON IR client.
     Prefers the user's ``.va`` branch name for named branches, falls back to
     ``i_br<id>``.
+
+    The preferred ``i_<branch>`` name is only usable when it's unique: for
+    implicit branches the compiler derives ``branch`` from the **hi node**,
+    and several branches can share a hi node (BSIM4's rbodymod=1 substrate
+    network hangs three resistors off ``sbulk``).  Any name claimed by more
+    than one ``branch_id`` is demoted to the collision-free ``i_br<id>``
+    form for *all* its claimants — a state name must identify exactly one
+    unknown.
     """
     mapping: dict[int, str] = {}
     for interner in (cm.eval_interner, cm.init_interner, cm.setup_interner):
@@ -1686,7 +1694,13 @@ def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
                 hi = kind.hi or ""
                 lo = kind.lo or ""
                 mapping[kind.branch_id] = f"i_un_{hi}_{lo}_{kind.branch_id}"
-    return mapping
+    claimants: dict[str, int] = {}
+    for name in mapping.values():
+        claimants[name] = claimants.get(name, 0) + 1
+    return {
+        bid: name if claimants[name] == 1 else f"i_br{bid}"
+        for bid, name in mapping.items()
+    }
 
 
 # ---------------------------------------------------------------------------
