@@ -240,6 +240,10 @@ class CseState:
     # entries in ``hoist_defs`` (same ``hoist_name``).  Populated by
     # ``_resolve_ssa`` when ``_lower_phi`` returns a ``PhiResolution``.
     phi_resolutions: dict[str, PhiResolution] = field(default_factory=dict)
+    # How ``fdiv`` guards a possibly-zero denominator: ``"overflow"``
+    # (``n / where(bad, 1e-300, d)``, the default) or ``"mask"`` (finite
+    # ``where(bad, 0.0, n / where(bad, 1.0, d))``).  See ``lower()``.
+    safe_divide_mode: str = "overflow"
 
 
 def _compute_refcount(fn: Function, roots: list[str]) -> dict[str, int]:
@@ -959,6 +963,7 @@ def lower(
     class_name: str | None = None,
     differentiable_params: tuple[str, ...] | None = (),
     opt_init_eligible: frozenset[str] | None = None,
+    safe_divide_mode: str = "overflow",
 ) -> LoweredDevice:
     """Lower a parsed :class:`CompiledModule` into a :class:`LoweredDevice`.
 
@@ -992,7 +997,27 @@ def lower(
     ``class_name`` overrides the default CamelCase class name derived
     from the VA module name.  Use it to emit multiple specialisations of
     the same model under distinct Python identifiers.
+
+    ``safe_divide_mode`` picks how ``fdiv`` guards a denominator that may
+    be zero in a dead ``jnp.where`` branch:
+
+    * ``"overflow"`` (default): ``n / jnp.where(bad, 1e-300, d)``.  When
+      the guard fires the quotient is huge (``n * 1e300``) and overflows
+      to ``inf`` for ``|n| > ~1.8e8``.  PSP103's ring-oscillator DC
+      homotopy *relies* on that magnitude to push Newton away from
+      numerically-degenerate fixed points — but the ``inf`` turns into
+      NaN at the first multiplication by zero downstream (JAX evaluates
+      both sides of every ``jnp.where``), which BSIM4 hits through the
+      ``(a - a)`` self-differences node collapse leaves behind.
+    * ``"mask"``: ``jnp.where(bad, 0.0, n / jnp.where(bad, 1.0, d))``.
+      Identical when ``d`` is healthy; an exact, finite ``0.0`` when the
+      guard fires, so no ``inf`` ever escapes into downstream arithmetic
+      or ``jvp``/``vjp``.  Prefer this for models whose dead branches
+      overflow (BSIM4).
     """
+    if safe_divide_mode not in ("overflow", "mask"):
+        msg = f"safe_divide_mode must be 'overflow' or 'mask', got {safe_divide_mode!r}"
+        raise ValueError(msg)
     # Bump Python's recursion ceiling so deeply-chained dataflows (BSIM4's
     # ~ 9 k eval ops, PSP103's ~ 20 k) don't trip the default 1 000-frame
     # limit. Aggressive CSE hoisting in ``_resolve_ssa`` caps the *textual*
@@ -1098,6 +1123,7 @@ def lower(
         refcount=_compute_refcount(cm.eval_fn, all_roots),
         ssa_prefix="i_",
         init_eligible=_unopt_init_eligible,
+        safe_divide_mode=safe_divide_mode,
     )
 
     # Run SCCP on the init function, then rewrite it: dead blocks dropped,
@@ -2116,6 +2142,17 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                     # in the all-static emit, plus another ~300 ``a*b``
                     # squares whose operands trace back to these.
                     expr = Expr(f"jnp.divide({_a}, {_b})")
+                elif cse is not None and cse.safe_divide_mode == "mask":
+                    # Finite guard (see ``lower()``): the dead-branch value
+                    # is an exact 0.0 instead of ~1e300/inf, so it can't NaN
+                    # anything downstream via inf * 0.  The condition text is
+                    # repeated, but for hoisted denominators it's a short
+                    # ``vNNN`` reference.
+                    _bad = f"({_b} == 0.0) | ~jnp.isfinite({_b})"
+                    expr = Expr(
+                        f"jnp.where({_bad}, 0.0, "
+                        f"jnp.divide({_a}, jnp.where({_bad}, 1.0, {_b})))"
+                    )
                 else:
                     expr = Expr(
                         f"jnp.divide({_a}, jnp.where(({_b} == 0.0) | ~jnp.isfinite({_b}), 1e-300, {_b}))"
