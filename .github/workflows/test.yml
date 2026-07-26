@@ -25,5 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.8.1
+
+      - name: Install openvaf-r (pre-built)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://fides.fe.uni-lj.si/openvaf/download/openvaf-reloaded-20260616-2-gc592eed6-win_x64.zip" -OutFile openvaf.zip
+          Expand-Archive openvaf.zip -DestinationPath "$env:USERPROFILE\.local\bin"
+          echo "$env:USERPROFILE\.local\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
       - run: pixi run build
       - run: pixi run test
