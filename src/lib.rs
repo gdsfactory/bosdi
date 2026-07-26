@@ -453,6 +453,28 @@ lazy_static::lazy_static! {
     static ref NEXT_MODEL_ID: RwLock<u32> = RwLock::new(1);
 }
 
+thread_local! {
+    static LAST_OSDI_ERROR: RefCell<String> = RefCell::new(String::new());
+}
+
+fn set_last_error(msg: String) {
+    eprintln!("{msg}");
+    LAST_OSDI_ERROR.with(|e| *e.borrow_mut() = msg);
+}
+
+#[no_mangle]
+pub extern "C" fn get_last_osdi_error(buf: *mut u8, buf_len: usize) -> usize {
+    LAST_OSDI_ERROR.with(|e| {
+        let msg = e.borrow();
+        let bytes = msg.as_bytes();
+        let copy_len = bytes.len().min(buf_len);
+        if copy_len > 0 && !buf.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, copy_len); }
+        }
+        bytes.len()
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. PHASE 1: LOADING
 // ─────────────────────────────────────────────────────────────────────────────
@@ -468,26 +490,25 @@ fn fail() -> ModelMetadata {
 pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> ModelMetadata {
     let ver = match OsdiVersion::from_u32(version) {
         Some(v) => v,
-        None    => { eprintln!("OSDI: unknown version {version}"); return fail(); }
+        None    => { set_last_error(format!("OSDI: unknown version {version}")); return fail(); }
     };
     let layout = match AbiLayout::for_version(ver) {
         Some(l) => l,
-        None    => { eprintln!("OSDI: version {:?} not yet implemented", ver); return fail(); }
+        None    => { set_last_error(format!("OSDI: version {:?} not yet implemented", ver)); return fail(); }
     };
 
     let path = unsafe {
         assert!(!path_ptr.is_null());
         match CStr::from_ptr(path_ptr).to_str() {
             Ok(s) => s,
-            Err(_) => return fail(),
+            Err(_) => { set_last_error("OSDI: path is not valid UTF-8".into()); return fail(); }
         }
     };
 
     let lib = match unsafe { Library::new(path) } {
         Ok(l)  => l,
         Err(e) => {
-            eprintln!("OSDI load error for '{path}': {e}");
-            println!("OSDI load error for '{path}': {e}");
+            set_last_error(format!("OSDI load error for '{path}': {e}"));
             return fail();
         }
     };
@@ -497,8 +518,8 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
             let s: Symbol<$ty> = match unsafe { $lib.get($name) } {
                 Ok(s)  => s,
                 Err(e) => {
-                    eprintln!("OSDI missing '{}': {e}",
-                              std::str::from_utf8($name).unwrap_or("?"));
+                    set_last_error(format!("OSDI missing '{}': {e}",
+                              std::str::from_utf8($name).unwrap_or("?")));
                     return fail();
                 }
             };
@@ -511,7 +532,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         let desc_sym: Symbol<*const u8> =
             match unsafe { lib.get(layout.descriptor_symbol) } {
                 Ok(s)  => s,
-                Err(e) => { eprintln!("OSDI missing descriptor symbol: {e}"); return fail(); }
+                Err(e) => { set_last_error(format!("OSDI missing descriptor symbol: {e}")); return fail(); }
             };
         unsafe { *desc_sym }
     };

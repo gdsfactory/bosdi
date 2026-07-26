@@ -28,6 +28,7 @@ extern "C" {
 
     // Diagnostic
     void dump_model_info(uint32_t model_id);
+    size_t get_last_osdi_error(uint8_t* buf, size_t buf_len);
 
     // Resistive mask (Vec<bool> not repr(C), so separate two-call pattern)
     size_t get_resistive_mask_len(uint32_t model_id);
@@ -388,6 +389,14 @@ NB_MODULE(osdi_shim_nb, m) {
     m.def("dump_model_info", [](uint32_t model_id) {
         dump_model_info(model_id);
     }, nb::arg("model_id"));
+
+    m.def("get_last_error", []() {
+        size_t len = get_last_osdi_error(nullptr, 0);
+        if (len == 0) return std::string();
+        std::vector<uint8_t> buf(len, 0);
+        get_last_osdi_error(buf.data(), len);
+        return std::string(reinterpret_cast<const char*>(buf.data()), len);
+    });
 
     m.def("get_resistive_mask", [](uint32_t model_id) {
         size_t n = get_resistive_mask_len(model_id);

@@ -95,9 +95,10 @@ def load_osdi_model(osdi_filepath: str, version: str = "0.4") -> OsdiModel:
     meta = osdi_shim_nb.load_osdi_library(osdi_filepath, version_int)
 
     if not meta.success:
+        detail = osdi_shim_nb.get_last_error()
         raise RuntimeError(
             f"Failed to load OSDI binary '{osdi_filepath}' as OSDI {version}. "
-            "Ensure it is a valid OpenVAF compiled .osdi file."
+            f"{detail or 'Ensure it is a valid OpenVAF compiled .osdi file.'}"
         )
 
     mid = meta.model_id

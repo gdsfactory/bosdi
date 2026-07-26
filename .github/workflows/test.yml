@@ -42,4 +42,29 @@ jobs:
           openvaf-r --allow variant_const_simparam tests/devices/resistor_va.va -o test_resistor.osdi
           Get-ChildItem test_resistor.osdi
 
+      - name: Diagnose .osdi loading
+        shell: pwsh
+        run: |
+          # Check DLL dependencies
+          dumpbin /dependents test_resistor.osdi 2>$null
+          dumpbin /exports test_resistor.osdi 2>$null | Select-String "OSDI|setup_model|eval_0|osdi_log"
+          # Try loading with ctypes to get the actual Windows error
+          pixi run python -c "
+          import ctypes, os
+          path = os.path.abspath('test_resistor.osdi')
+          print(f'Loading: {path}')
+          print(f'Exists: {os.path.exists(path)}')
+          print(f'Size: {os.path.getsize(path)}')
+          try:
+              dll = ctypes.CDLL(path)
+              print(f'SUCCESS: loaded {dll}')
+          except OSError as e:
+              print(f'FAILED: {e}')
+          try:
+              dll = ctypes.WinDLL(path)
+              print(f'WinDLL SUCCESS: loaded {dll}')
+          except OSError as e:
+              print(f'WinDLL FAILED: {e}')
+          "
+
       - run: pixi run test
