@@ -34,4 +34,12 @@ jobs:
           echo "$env:USERPROFILE\.local\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       - run: pixi run build
+
+      - name: Verify openvaf-r and compile a test model
+        shell: pwsh
+        run: |
+          openvaf-r --version
+          openvaf-r --allow variant_const_simparam tests/devices/resistor_va.va -o test_resistor.osdi
+          Get-ChildItem test_resistor.osdi
+
       - run: pixi run test

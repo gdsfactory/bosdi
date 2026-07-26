@@ -485,7 +485,11 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
 
     let lib = match unsafe { Library::new(path) } {
         Ok(l)  => l,
-        Err(e) => { eprintln!("OSDI load error: {e}"); return fail(); }
+        Err(e) => {
+            eprintln!("OSDI load error for '{path}': {e}");
+            println!("OSDI load error for '{path}': {e}");
+            return fail();
+        }
     };
 
     macro_rules! sym {
