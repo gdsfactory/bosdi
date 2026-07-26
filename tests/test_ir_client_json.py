@@ -9,6 +9,7 @@ those flags are absent.
 from __future__ import annotations
 
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -37,13 +38,17 @@ RESISTOR_VA = (
 )
 CAPACITOR_VA = pathlib.Path(__file__).parent / "devices" / "capacitor_va.va"
 
+_openvaf_available = shutil.which("openvaf-r") is not None
+
 OPENVAF_MISSING = pytest.mark.skipif(
-    subprocess.run(["which", "openvaf-r"], capture_output=True).returncode != 0,
+    not _openvaf_available,
     reason="openvaf-r not in PATH",
 )
 
 
 def _has_flag(flag: str) -> bool:
+    if not _openvaf_available:
+        return False
     result = subprocess.run(["openvaf-r", "--help"], capture_output=True, text=True)
     return flag in result.stdout or flag in result.stderr
 
