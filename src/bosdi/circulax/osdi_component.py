@@ -8,7 +8,6 @@ via a single optional install (``pip install circulax[verilog-a]``) without
 requiring ``bosdi`` as a mandatory circulax dependency.
 
 Requires the ``bosdi`` package to be installed (``osdi_loader`` must be importable).
-OSDI support is not available on all platforms (e.g. Windows).
 """
 
 import difflib
@@ -289,8 +288,7 @@ def osdi_component(
     if not _BOSDI_AVAILABLE:
         raise ImportError(
             "OSDI support requires bosdi's native extension (osdi_loader), which could "
-            "not be imported. Install circulax[verilog-a] to get OSDI support. "
-            "Note: OSDI is not available on all platforms (e.g. Windows)."
+            "not be imported. Install circulax[verilog-a] to get OSDI support."
         ) from _BOSDI_ERR
 
     model = load_osdi_model(osdi_path)

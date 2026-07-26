@@ -82,8 +82,33 @@ jobs:
           name: dist-macos-${{ matrix.python-env }}
           path: dist/
 
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-env: [py312, py313]
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          environments: ${{ matrix.python-env }}
+
+      - name: Build extension
+        run: pixi run -e ${{ matrix.python-env }} build
+
+      - name: Build wheel
+        run: pixi run -e ${{ matrix.python-env }} wheel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-${{ matrix.python-env }}
+          path: dist/
+
   publish:
-    needs: [build-linux, test-linux, build-macos]
+    needs: [build-linux, test-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

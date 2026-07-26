@@ -15,6 +15,7 @@ keywords = [
 ]
 classifiers = [
   "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -54,6 +55,9 @@ manylinux-x86_64-image = "manylinux_2_28"
 before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
 environment = { PATH = "/root/.cargo/bin:$PATH" }
 
+[tool.cibuildwheel.windows]
+before-all = "rustup default stable"
+
 # --- CODESPELL CONFIGURATION ---
 # OpenVAF MIR opcode names (``fle``, ``ine``, ``inot``, ``ige``, etc.) and a
 # few short variable names (``nd`` for "node") collide with codespell's
@@ -64,7 +68,7 @@ skip = "tests/devices/*"
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64", "osx-arm64"]
+platforms = ["linux-64", "osx-arm64", "win-64"]
 preview = ["pixi-build"]
 
 [tool.pixi.package]
