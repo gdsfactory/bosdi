@@ -45,26 +45,41 @@ jobs:
       - name: Diagnose .osdi loading
         shell: pwsh
         run: |
-          # Check DLL dependencies
-          dumpbin /dependents test_resistor.osdi 2>$null
-          dumpbin /exports test_resistor.osdi 2>$null | Select-String "OSDI|setup_model|eval_0|osdi_log"
-          # Try loading with ctypes to get the actual Windows error
           pixi run python -c "
-          import ctypes, os
+          import ctypes, ctypes.wintypes, os, struct
           path = os.path.abspath('test_resistor.osdi')
           print(f'Loading: {path}')
           print(f'Exists: {os.path.exists(path)}')
           print(f'Size: {os.path.getsize(path)}')
+          # Check PE architecture
+          with open(path, 'rb') as f:
+              f.seek(0x3C)
+              pe_off = struct.unpack('<I', f.read(4))[0]
+              f.seek(pe_off + 4)
+              machine = struct.unpack('<H', f.read(2))[0]
+              print(f'PE machine: 0x{machine:04X} (0x8664=AMD64, 0x14C=i386)')
+          import platform
+          print(f'Python arch: {platform.machine()}')
+          # Try loading
           try:
               dll = ctypes.CDLL(path)
-              print(f'SUCCESS: loaded {dll}')
+              print(f'CDLL SUCCESS: {dll}')
           except OSError as e:
-              print(f'FAILED: {e}')
+              print(f'CDLL FAILED: {e}')
           try:
               dll = ctypes.WinDLL(path)
-              print(f'WinDLL SUCCESS: loaded {dll}')
+              print(f'WinDLL SUCCESS: {dll}')
           except OSError as e:
               print(f'WinDLL FAILED: {e}')
+          # Also try loading via bosdi
+          try:
+              import osdi_shim_nb
+              meta = osdi_shim_nb.load_osdi_library(path, 4)
+              print(f'bosdi load success={meta.success}')
+              if not meta.success:
+                  print(f'bosdi error: {osdi_shim_nb.get_last_error()}')
+          except Exception as e:
+              print(f'bosdi import/load error: {e}')
           "
 
       - run: pixi run test
