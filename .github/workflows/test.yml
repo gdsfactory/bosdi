@@ -18,3 +18,12 @@ jobs:
       - run: pixi run install-openvaf
       - run: pixi run build
       - run: pixi run test
+
+  # TODO: remove once Windows support is validated
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+      - run: pixi run build
+      - run: pixi run test
