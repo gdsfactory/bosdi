@@ -49,37 +49,61 @@ jobs:
           import ctypes, ctypes.wintypes, os, struct
           path = os.path.abspath('test_resistor.osdi')
           print(f'Loading: {path}')
-          print(f'Exists: {os.path.exists(path)}')
           print(f'Size: {os.path.getsize(path)}')
-          # Check PE architecture
+          # Parse PE export table to see actual symbol names
           with open(path, 'rb') as f:
               f.seek(0x3C)
               pe_off = struct.unpack('<I', f.read(4))[0]
               f.seek(pe_off + 4)
               machine = struct.unpack('<H', f.read(2))[0]
-              print(f'PE machine: 0x{machine:04X} (0x8664=AMD64, 0x14C=i386)')
-          import platform
-          print(f'Python arch: {platform.machine()}')
-          # Try loading
-          try:
-              dll = ctypes.CDLL(path)
-              print(f'CDLL SUCCESS: {dll}')
-          except OSError as e:
-              print(f'CDLL FAILED: {e}')
-          try:
-              dll = ctypes.WinDLL(path)
-              print(f'WinDLL SUCCESS: {dll}')
-          except OSError as e:
-              print(f'WinDLL FAILED: {e}')
-          # Also try loading via bosdi
-          try:
-              import osdi_shim_nb
-              meta = osdi_shim_nb.load_osdi_library(path, 4)
-              print(f'bosdi load success={meta.success}')
-              if not meta.success:
-                  print(f'bosdi error: {osdi_shim_nb.get_last_error()}')
-          except Exception as e:
-              print(f'bosdi import/load error: {e}')
+              print(f'PE machine: 0x{machine:04X}')
+              f.seek(pe_off + 6)
+              num_sections = struct.unpack('<H', f.read(2))[0]
+              f.seek(pe_off + 0x18)
+              opt_magic = struct.unpack('<H', f.read(2))[0]
+              opt_hdr_size = 0x70 if opt_magic == 0x10b else 0x88  # PE32 vs PE32+
+              export_rva = struct.unpack('<I', f.read(4))[0] if False else 0
+              # Read export directory RVA from data directory[0]
+              dd_off = pe_off + 0x18 + opt_hdr_size
+              f.seek(dd_off)
+              export_rva, export_size = struct.unpack('<II', f.read(8))
+              print(f'Export dir RVA: 0x{export_rva:X}, size: {export_size}')
+              if export_rva == 0:
+                  print('NO EXPORT TABLE')
+              else:
+                  # Find section containing export RVA
+                  sec_off = pe_off + 0x18 + (0x60 if opt_magic == 0x10b else 0x70) + 0x10 * 16
+                  # Actually, section headers start after optional header
+                  f.seek(pe_off + 0x14)
+                  opt_size = struct.unpack('<H', f.read(2))[0]
+                  sec_start = pe_off + 0x18 + opt_size
+                  file_off = None
+                  for i in range(num_sections):
+                      f.seek(sec_start + i * 40 + 12)
+                      vaddr, vsize_raw, raw_off = struct.unpack('<III', f.read(12))
+                      if vaddr <= export_rva < vaddr + max(vsize_raw, 1):
+                          file_off = export_rva - vaddr + raw_off
+                          break
+                  if file_off is None:
+                      print('Could not map export RVA to file offset')
+                  else:
+                      f.seek(file_off + 24)
+                      num_names = struct.unpack('<I', f.read(4))[0]
+                      f.seek(file_off + 32)
+                      names_rva = struct.unpack('<I', f.read(4))[0]
+                      names_file = names_rva - export_rva + file_off
+                      print(f'Exported symbols ({num_names}):')
+                      for j in range(num_names):
+                          f.seek(names_file + j * 4)
+                          name_rva = struct.unpack('<I', f.read(4))[0]
+                          name_file = name_rva - export_rva + file_off
+                          f.seek(name_file)
+                          name = b''
+                          while True:
+                              c = f.read(1)
+                              if c == b'\x00' or not c: break
+                              name += c
+                          print(f'  [{j}] {name.decode(\"ascii\", errors=\"replace\")}')
           "
 
       - run: pixi run test
