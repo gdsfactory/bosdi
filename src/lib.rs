@@ -139,7 +139,7 @@ impl AbiLayout {
             flag_calc_react_residual:   2,
             flag_calc_resist_jacobian:  4,
             flag_calc_react_jacobian:   8,
-            descriptor_symbol:         b"OSDI_DESCRIPTORS\0",
+            descriptor_symbol:         b"OSDI_DESCRIPTORS",
         }
     }
 }
@@ -683,9 +683,9 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
 
     // ── function pointers with NULL descriptor slots — look up by name ────────
     // OpenVAF exports these as `fname_0` (index 0 = first model in the binary).
-    let setup_model:    SetupModelFn    = sym!(lib, b"setup_model_0\0",    SetupModelFn);
-    let setup_instance: SetupInstanceFn = sym!(lib, b"setup_instance_0\0", SetupInstanceFn);
-    let eval:           EvalFn          = sym!(lib, b"eval_0\0",           EvalFn);
+    let setup_model:    SetupModelFn    = sym!(lib, b"setup_model_0",    SetupModelFn);
+    let setup_instance: SetupInstanceFn = sym!(lib, b"setup_instance_0", SetupInstanceFn);
+    let eval:           EvalFn          = sym!(lib, b"eval_0",           EvalFn);
 
     // ── install simulator callbacks if the model exports them ─────────────────
     // `osdi_log` is a BSS function-pointer slot (null by default) that some
@@ -693,7 +693,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     // Without a callback they crash; a no-op is sufficient since we fall back to
     // 0.0 for missing params anyway.
     unsafe {
-        if let Ok(sym) = lib.get::<*mut c_void>(b"osdi_log\0") {
+        if let Ok(sym) = lib.get::<*mut c_void>(b"osdi_log") {
             // *sym is the BSS address cast as *mut c_void; reinterpret as *mut fn ptr.
             let slot = *sym as *mut unsafe extern "C" fn(*mut c_void, *const c_char, u32);
             if !slot.is_null() {
