@@ -53,6 +53,10 @@ def _has_flag(flag: str) -> bool:
     return flag in result.stdout or flag in result.stderr
 
 
+DUMP_JSON_MISSING = pytest.mark.skipif(
+    not _has_flag("--dump-json"),
+    reason="openvaf-r does not support --dump-json (custom fork needed)",
+)
 UNOPT_JSON_MISSING = pytest.mark.skipif(
     not _has_flag("--dump-unopt-json"),
     reason="openvaf-r does not support --dump-unopt-json (rebuild needed)",
@@ -81,18 +85,21 @@ def _assert_valid_dumpfile(df: DumpFile, va_path: pathlib.Path) -> None:
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 def test_compile_va_resistor_returns_dumpfile():
     df = compile_va(RESISTOR_VA)
     _assert_valid_dumpfile(df, RESISTOR_VA)
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 def test_compile_va_resistor_module_name():
     df = compile_va(RESISTOR_VA)
     assert df.modules[0].name == "resistor_va"
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 def test_compile_va_resistor_ports():
     df = compile_va(RESISTOR_VA)
     mod = df.modules[0]
@@ -100,6 +107,7 @@ def test_compile_va_resistor_ports():
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 def test_compile_va_capacitor_returns_dumpfile():
     df = compile_va(CAPACITOR_VA)
     _assert_valid_dumpfile(df, CAPACITOR_VA)
@@ -131,6 +139,7 @@ def test_compile_va_unopt_json_resistor_ports():
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 @UNOPT_JSON_MISSING
 def test_compile_va_unopt_json_has_more_cslots_than_opt():
     """Unoptimised path should produce ≥ as many cache slots as optimised."""
@@ -183,6 +192,7 @@ def test_compile_va_unopt_json_with_split_has_cache_slots():
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 @UNOPT_JSON_MISSING
 @UNOPT_JSON_SPLIT_MISSING
 def test_three_json_paths_agree_on_ports():
@@ -198,6 +208,7 @@ def test_three_json_paths_agree_on_ports():
 
 
 @OPENVAF_MISSING
+@DUMP_JSON_MISSING
 @UNOPT_JSON_MISSING
 @UNOPT_JSON_SPLIT_MISSING
 def test_three_json_paths_agree_on_dae_unknowns():
