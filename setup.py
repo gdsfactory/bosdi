@@ -74,7 +74,15 @@ class BuildExt(build_ext):
 
             # 3. Link the Rust library
             ext.extra_objects = [static_lib_path]
-            if sys.platform != "win32":
+            if sys.platform == "win32":
+                ext.extra_link_args = list(ext.extra_link_args or []) + [
+                    "ws2_32.lib",
+                    "advapi32.lib",
+                    "userenv.lib",
+                    "bcrypt.lib",
+                    "ntdll.lib",
+                ]
+            else:
                 ext.extra_link_args = list(ext.extra_link_args or []) + [
                     "-lm",
                     "-ldl",

@@ -86,6 +86,9 @@ struct AbiLayout {
     // param_opvar and access/given_flag function pointers
     desc_param_opvar:          usize,
     desc_fn_access:            usize,
+    desc_fn_setup_model:       usize,
+    desc_fn_setup_instance:    usize,
+    desc_fn_eval:              usize,
     desc_fn_given_flag_model:  usize,
     desc_fn_given_flag_inst:   usize,
     // OsdiSimInfo shape (for layout-driven construction in future versions)
@@ -130,6 +133,9 @@ impl AbiLayout {
             desc_jac_entries:          32,
             desc_param_opvar:          88,
             desc_fn_access:            128,
+            desc_fn_setup_model:       136,
+            desc_fn_setup_instance:    144,
+            desc_fn_eval:              152,
             desc_fn_given_flag_model:  240,
             desc_fn_given_flag_inst:   248,
             sim_info_prev_solve_off:   40,
@@ -139,7 +145,7 @@ impl AbiLayout {
             flag_calc_react_residual:   2,
             flag_calc_resist_jacobian:  4,
             flag_calc_react_jacobian:   8,
-            descriptor_symbol:         b"OSDI_DESCRIPTORS\0",
+            descriptor_symbol:         b"OSDI_DESCRIPTORS",
         }
     }
 }
@@ -453,6 +459,28 @@ lazy_static::lazy_static! {
     static ref NEXT_MODEL_ID: RwLock<u32> = RwLock::new(1);
 }
 
+thread_local! {
+    static LAST_OSDI_ERROR: RefCell<String> = RefCell::new(String::new());
+}
+
+fn set_last_error(msg: String) {
+    eprintln!("{msg}");
+    LAST_OSDI_ERROR.with(|e| *e.borrow_mut() = msg);
+}
+
+#[no_mangle]
+pub extern "C" fn get_last_osdi_error(buf: *mut u8, buf_len: usize) -> usize {
+    LAST_OSDI_ERROR.with(|e| {
+        let msg = e.borrow();
+        let bytes = msg.as_bytes();
+        let copy_len = bytes.len().min(buf_len);
+        if copy_len > 0 && !buf.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, copy_len); }
+        }
+        bytes.len()
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. PHASE 1: LOADING
 // ─────────────────────────────────────────────────────────────────────────────
@@ -468,24 +496,27 @@ fn fail() -> ModelMetadata {
 pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> ModelMetadata {
     let ver = match OsdiVersion::from_u32(version) {
         Some(v) => v,
-        None    => { eprintln!("OSDI: unknown version {version}"); return fail(); }
+        None    => { set_last_error(format!("OSDI: unknown version {version}")); return fail(); }
     };
     let layout = match AbiLayout::for_version(ver) {
         Some(l) => l,
-        None    => { eprintln!("OSDI: version {:?} not yet implemented", ver); return fail(); }
+        None    => { set_last_error(format!("OSDI: version {:?} not yet implemented", ver)); return fail(); }
     };
 
     let path = unsafe {
         assert!(!path_ptr.is_null());
         match CStr::from_ptr(path_ptr).to_str() {
             Ok(s) => s,
-            Err(_) => return fail(),
+            Err(_) => { set_last_error("OSDI: path is not valid UTF-8".into()); return fail(); }
         }
     };
 
     let lib = match unsafe { Library::new(path) } {
         Ok(l)  => l,
-        Err(e) => { eprintln!("OSDI load error: {e}"); return fail(); }
+        Err(e) => {
+            set_last_error(format!("OSDI load error for '{path}': {e}"));
+            return fail();
+        }
     };
 
     macro_rules! sym {
@@ -493,8 +524,8 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
             let s: Symbol<$ty> = match unsafe { $lib.get($name) } {
                 Ok(s)  => s,
                 Err(e) => {
-                    eprintln!("OSDI missing '{}': {e}",
-                              std::str::from_utf8($name).unwrap_or("?"));
+                    set_last_error(format!("OSDI missing '{}': {e}",
+                              std::str::from_utf8($name).unwrap_or("?")));
                     return fail();
                 }
             };
@@ -507,7 +538,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         let desc_sym: Symbol<*const u8> =
             match unsafe { lib.get(layout.descriptor_symbol) } {
                 Ok(s)  => s,
-                Err(e) => { eprintln!("OSDI missing descriptor symbol: {e}"); return fail(); }
+                Err(e) => { set_last_error(format!("OSDI missing descriptor symbol: {e}")); return fail(); }
             };
         unsafe { *desc_sym }
     };
@@ -656,11 +687,22 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         unsafe { read_fn(desc, layout.desc_fn_given_flag_inst) }
             .unwrap_or(noop_given_inst);
 
-    // ── function pointers with NULL descriptor slots — look up by name ────────
-    // OpenVAF exports these as `fname_0` (index 0 = first model in the binary).
-    let setup_model:    SetupModelFn    = sym!(lib, b"setup_model_0\0",    SetupModelFn);
-    let setup_instance: SetupInstanceFn = sym!(lib, b"setup_instance_0\0", SetupInstanceFn);
-    let eval:           EvalFn          = sym!(lib, b"eval_0\0",           EvalFn);
+    // ── setup_model / setup_instance / eval ─────────────────────────────────
+    // Try the descriptor function-pointer slots first (filled by the PE/ELF
+    // loader via relocation). Fall back to named symbol lookup — the gdsfactory
+    // OpenVAF fork exports these as `fname_0`.
+    let setup_model: SetupModelFn = match unsafe { read_fn(desc, layout.desc_fn_setup_model) } {
+        Some(f) => f,
+        None    => sym!(lib, b"setup_model_0", SetupModelFn),
+    };
+    let setup_instance: SetupInstanceFn = match unsafe { read_fn(desc, layout.desc_fn_setup_instance) } {
+        Some(f) => f,
+        None    => sym!(lib, b"setup_instance_0", SetupInstanceFn),
+    };
+    let eval: EvalFn = match unsafe { read_fn(desc, layout.desc_fn_eval) } {
+        Some(f) => f,
+        None    => sym!(lib, b"eval_0", EvalFn),
+    };
 
     // ── install simulator callbacks if the model exports them ─────────────────
     // `osdi_log` is a BSS function-pointer slot (null by default) that some
@@ -668,7 +710,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     // Without a callback they crash; a no-op is sufficient since we fall back to
     // 0.0 for missing params anyway.
     unsafe {
-        if let Ok(sym) = lib.get::<*mut c_void>(b"osdi_log\0") {
+        if let Ok(sym) = lib.get::<*mut c_void>(b"osdi_log") {
             // *sym is the BSS address cast as *mut c_void; reinterpret as *mut fn ptr.
             let slot = *sym as *mut unsafe extern "C" fn(*mut c_void, *const c_char, u32);
             if !slot.is_null() {

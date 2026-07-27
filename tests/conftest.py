@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 logger = logging.getLogger(__name__)
 
 DEVICES_DIR = Path(__file__).parent / "devices"
@@ -105,12 +107,26 @@ def _compile_one(openvaf: str, va_rel: str, osdi_name: str, extra_flags: tuple) 
     return True
 
 
+_OSDI_TEST_MODULES = {
+    "test_osdi",
+    "test_diode_behaviour",
+    "test_diode_structure",
+    "test_osdi_debug",
+    "test_compiled_models",
+    "test_bsim4_model_card",
+}
+
+_openvaf_found = False
+
+
 def pytest_configure(config):
+    global _openvaf_found  # noqa: PLW0603
     openvaf = shutil.which("openvaf-r")
     if openvaf is None:
         logger.warning("openvaf-r not found — .osdi files will not be compiled")
         return
 
+    _openvaf_found = True
     COMPILED_DIR.mkdir(exist_ok=True)
 
     failed = []
@@ -120,3 +136,15 @@ def pytest_configure(config):
 
     if failed:
         logger.warning("Failed to compile %d models: %s", len(failed), failed)
+
+
+def pytest_collection_modifyitems(config, items):
+    if _openvaf_found:
+        return
+    skip = pytest.mark.skip(reason="openvaf-r not available — no .osdi binaries")
+    for item in items:
+        if (
+            item.module
+            and item.module.__name__.rpartition(".")[-1] in _OSDI_TEST_MODULES
+        ):
+            item.add_marker(skip)
