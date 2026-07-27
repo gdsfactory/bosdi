@@ -1667,7 +1667,8 @@ def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
     Covers both named branches (``Branch``) and unnamed substrate-network
     probes (``Unnamed``) that carry a ``branch_id`` from the JSON IR client.
     Prefers the user's ``.va`` branch name for named branches, falls back to
-    ``i_br<id>``.
+    ``i_br<id>``.  Names shared by multiple branch_ids (e.g. several implicit
+    branches off the same hi node) are demoted to ``i_br<id>`` for all claimants.
     """
     mapping: dict[int, str] = {}
     for interner in (cm.eval_interner, cm.init_interner, cm.setup_interner):
@@ -1686,7 +1687,13 @@ def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
                 hi = kind.hi or ""
                 lo = kind.lo or ""
                 mapping[kind.branch_id] = f"i_un_{hi}_{lo}_{kind.branch_id}"
-    return mapping
+    claimants: dict[str, int] = {}
+    for name in mapping.values():
+        claimants[name] = claimants.get(name, 0) + 1
+    return {
+        bid: name if claimants[name] == 1 else f"i_br{bid}"
+        for bid, name in mapping.items()
+    }
 
 
 # ---------------------------------------------------------------------------

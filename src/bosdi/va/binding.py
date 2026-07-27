@@ -441,8 +441,13 @@ def _rewrite_branch_unknown(
     m = _FLOW_RE.match(node_name)
     if m is None:
         return node_name
-    branch_name = m.group(1).strip()
-    key = (branch_name, None)
+    inner = m.group(1)
+    # Parse into the same (hi, lo) key that _input_kind_from_param uses.
+    if "," in inner:
+        hi, _, lo = inner.partition(",")
+        key: tuple[str, str | None] = (hi.strip(), lo.strip())
+    else:
+        key = (inner.strip(), None)
     bid = branch_registry.setdefault(key, len(branch_registry))
     return f"br[Branch(BranchId({bid}))]"
 
