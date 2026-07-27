@@ -973,20 +973,10 @@ def lower(
     rest of lowering — apply OpenVAF's ``CollapseHint`` decisions to
     shrink the DAE to the same shape OSDI emits. Off by default because
     collapse decisions are conditional on user-facing parameters (e.g.
-    the diode's ``Rs=0`` triggers ``CI→C`` but ``Rs>0`` doesn't — and
-    ``True`` applies **every** hint unconditionally, which shorts any
-    resistance network the card keeps live, like BSIM4's substrate mesh
-    with ``rbodymod=1``).  Pass a collection of ``(node, node)`` pairs
-    instead to apply only the hints the model's mode flags actually
-    enable — the same decision OSDI/ngspice make at setup, e.g. for a
-    BSIM4 card with ``rdsmod=0`` but ``rbodymod=1``::
-
-        collapse_nodes=[("d", "di"), ("s", "si"),          # rdsmod=0
-                        ("g", "gm"), ("gm", "gi")]         # rgatemod=0
-
-    Pair order is irrelevant; hints not in the collection are skipped.
-    ``True`` keeps the old apply-everything behaviour and is only safe
-    when every hint's condition is known to hold for the baked card.
+    the diode's ``Rs=0`` triggers ``CI→C`` but ``Rs>0`` doesn't).
+    ``True`` applies every hint unconditionally; pass a collection of
+    ``(node, node)`` pairs to apply only specific hints (pair order
+    is irrelevant).
 
     ``static_params`` is an optional ``{param_name: value}`` dict of
     integer or float parameters whose values are *known at lowering time*
@@ -1519,12 +1509,8 @@ def _collapse_trivial_nodes(
     matches the collapsed id is rewritten to reference the survivor
     instead.
 
-    A ``CollapseHint`` is emitted for every *conditional* ``V(a,b) <+ 0``
-    in the source — whether it actually fires depends on parameter values
-    resolved at setup (BSIM4's ``rdsmod``/``rgatemod``/``rbodymod``,
-    the diode's ``Rs``).  ``allowed_pairs`` (a set of unordered node-name
-    pairs) restricts the pass to the hints the caller has decided are
-    live; ``None`` applies every hint unconditionally.
+    ``allowed_pairs`` restricts the pass to the given unordered node-name
+    pairs; ``None`` applies every hint unconditionally.
 
     Mutates ``cm.dae``, ``cm.internal_nodes``, and each interner's
     ``Voltage`` inputs in place. Returns ``{collapsed_node_id →

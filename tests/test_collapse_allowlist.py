@@ -1,13 +1,4 @@
-"""``collapse_nodes`` must be restrictable to the hints that are actually live.
-
-OpenVAF emits a ``CollapseHint`` for every conditional ``V(a,b) <+ 0`` in the
-source; whether each hint fires depends on parameter values resolved at setup
-(BSIM4's ``rdsmod``/``rgatemod``/``rbodymod``).  ``collapse_nodes=True``
-applies every hint unconditionally, which shorts any resistance network the
-card keeps live — BSIM4 with ``rbodymod=1`` loses its whole substrate mesh.
-Passing an allow-list of node pairs applies only the collapses the mode flags
-enable, matching what OSDI/ngspice do at setup.
-"""
+"""collapse_nodes allow-list: apply only the CollapseHints that are live."""
 
 import pathlib
 
@@ -15,12 +6,11 @@ import pytest
 
 openvaf_py = pytest.importorskip("openvaf_py")
 
-from bosdi.va import compile_va, lower
+from bosdi.va import compile_va, lower  # noqa: E402
 
 BSIM4_VA = pathlib.Path(__file__).parent / "devices" / "bsim4v8.va"
 
-# rbodymod=1: substrate resistor network live; rdsmod=0 / rgatemod=0: those
-# node merges match ngspice.  "as"/"lambda" are Python keywords -> baked.
+# "as"/"lambda" are Python keywords — must be baked static.
 STATIC = {"rbodymod": 1, "rdsmod": 0, "rgatemod": 0, "as": 0.0, "lambda": 0.0}
 SUBSTRATE_NODES = {"v_bi", "v_dbulk", "v_sbulk"}
 
