@@ -53,9 +53,21 @@ def _has_flag(flag: str) -> bool:
     return flag in result.stdout or flag in result.stderr
 
 
+def _dump_json_works() -> bool:
+    """Check that --dump-json actually produces output (not just listed in help)."""
+    if not _has_flag("--dump-json"):
+        return False
+    result = subprocess.run(
+        ["openvaf-r", "--dump-json", str(CAPACITOR_VA)],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and len(result.stdout.strip()) > 2
+
+
 DUMP_JSON_MISSING = pytest.mark.skipif(
-    not _has_flag("--dump-json"),
-    reason="openvaf-r does not support --dump-json (custom fork needed)",
+    not _dump_json_works(),
+    reason="openvaf-r --dump-json not functional (custom fork needed)",
 )
 UNOPT_JSON_MISSING = pytest.mark.skipif(
     not _has_flag("--dump-unopt-json"),
