@@ -218,14 +218,8 @@ class OsdiModelDescriptor:
     def _canonicalise(self, d: dict, *, source: str) -> dict:
         """Case-insensitive: rewrite ``d``'s keys to match ``self.param_names``.
 
-        Parameters absent from ``d`` are filled with NaN — the OSDI
-        runtime's "not given" marker (see ``osdi_setup_batch``): the
-        loader skips writing them, so ``setup_model``/``setup_instance``
-        run the model's own ``$param_given`` default resolution, exactly
-        like a SPICE ``.model`` card.  Filling with 0.0 instead would
-        mark every unnamed parameter as *explicitly given as zero* —
-        including ``$mfactor``, which scales every current and charge
-        the device contributes to 0.
+        Absent parameters are filled with NaN (the OSDI "not given" marker)
+        so the model's own Verilog-A defaults apply.
         """
         out = dict.fromkeys(self.param_names, float("nan"))
         for k, v in d.items():
@@ -274,11 +268,9 @@ def osdi_component(
                         If ``None`` (recommended), canonical names are read from
                         the OSDI binary and resolved case-insensitively.
         default_params: Default values for selected parameters.  Keys may be
-                        any subset of canonical parameter names.  Parameters
-                        not named here (or in per-instance settings) are
-                        passed to the OSDI runtime as NaN — its "not given"
-                        marker — so the model's own Verilog-A defaults apply,
-                        exactly like an ngspice ``.model`` card.
+                        any subset of canonical parameter names.  Unspecified
+                        parameters are filled with NaN (OSDI "not given") so
+                        the model's own Verilog-A defaults apply.
         use_schur_reduction: Eliminate OSDI internal nodes via Schur complement
                         before global Newton (experimental).
 
