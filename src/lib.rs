@@ -86,6 +86,9 @@ struct AbiLayout {
     // param_opvar and access/given_flag function pointers
     desc_param_opvar:          usize,
     desc_fn_access:            usize,
+    desc_fn_setup_model:       usize,
+    desc_fn_setup_instance:    usize,
+    desc_fn_eval:              usize,
     desc_fn_given_flag_model:  usize,
     desc_fn_given_flag_inst:   usize,
     // OsdiSimInfo shape (for layout-driven construction in future versions)
@@ -130,6 +133,9 @@ impl AbiLayout {
             desc_jac_entries:          32,
             desc_param_opvar:          88,
             desc_fn_access:            128,
+            desc_fn_setup_model:       136,
+            desc_fn_setup_instance:    144,
+            desc_fn_eval:              152,
             desc_fn_given_flag_model:  240,
             desc_fn_given_flag_inst:   248,
             sim_info_prev_solve_off:   40,
@@ -681,11 +687,22 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         unsafe { read_fn(desc, layout.desc_fn_given_flag_inst) }
             .unwrap_or(noop_given_inst);
 
-    // ── function pointers with NULL descriptor slots — look up by name ────────
-    // OpenVAF exports these as `fname_0` (index 0 = first model in the binary).
-    let setup_model:    SetupModelFn    = sym!(lib, b"setup_model_0",    SetupModelFn);
-    let setup_instance: SetupInstanceFn = sym!(lib, b"setup_instance_0", SetupInstanceFn);
-    let eval:           EvalFn          = sym!(lib, b"eval_0",           EvalFn);
+    // ── setup_model / setup_instance / eval ─────────────────────────────────
+    // Try the descriptor function-pointer slots first (filled by the PE/ELF
+    // loader via relocation). Fall back to named symbol lookup — the gdsfactory
+    // OpenVAF fork exports these as `fname_0`.
+    let setup_model: SetupModelFn = match unsafe { read_fn(desc, layout.desc_fn_setup_model) } {
+        Some(f) => f,
+        None    => sym!(lib, b"setup_model_0", SetupModelFn),
+    };
+    let setup_instance: SetupInstanceFn = match unsafe { read_fn(desc, layout.desc_fn_setup_instance) } {
+        Some(f) => f,
+        None    => sym!(lib, b"setup_instance_0", SetupInstanceFn),
+    };
+    let eval: EvalFn = match unsafe { read_fn(desc, layout.desc_fn_eval) } {
+        Some(f) => f,
+        None    => sym!(lib, b"eval_0", EvalFn),
+    };
 
     // ── install simulator callbacks if the model exports them ─────────────────
     // `osdi_log` is a BSS function-pointer slot (null by default) that some
