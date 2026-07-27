@@ -1,17 +1,4 @@
-"""Branch-current state names must be consistent between the DAE states
-tuple and the probe reads inside the emitted eval body.
-
-Regression test for the BSIM4 rbodymod=1 substrate network: its five
-branch-current unknowns surface as ``flow(hi,lo)`` DAE nodes, and three of
-them share the hi node ``sbulk``.  Two historical bugs made the emitted
-Python reference states that don't exist:
-
-1. ``_rewrite_branch_unknown`` keyed the branch registry on the raw
-   ``"hi,lo"`` string instead of the ``(hi, lo)`` tuple the probe inputs
-   registered, minting fresh BranchIds for every DAE branch unknown.
-2. ``_build_branch_state_name_map`` derived ``i_<branch>`` names from the
-   hi node, which is not unique across branches.
-"""
+"""Branch-current state names: DAE states tuple vs eval body references."""
 
 import ast
 import pathlib
@@ -20,7 +7,7 @@ import pytest
 
 openvaf_py = pytest.importorskip("openvaf_py")
 
-from bosdi.va import compile_va, emit_source, lower
+from bosdi.va import compile_va, emit_source, lower  # noqa: E402
 
 BSIM4_VA = pathlib.Path(__file__).parent / "devices" / "bsim4v8.va"
 
@@ -31,9 +18,7 @@ def bsim4_rbody_source():
     dev = lower(
         dump.modules[0],
         class_name="Bsim4Rbody",
-        # rbodymod=1 keeps the substrate resistor network live.  "as" and
-        # "lambda" are Python keywords, so they must be baked static or the
-        # emitted def signature would not parse.
+        # "as" and "lambda" are Python keywords — must be baked static.
         static_params={"rbodymod": 1, "as": 0.0, "lambda": 0.0},
     )
     return emit_source([dev])
