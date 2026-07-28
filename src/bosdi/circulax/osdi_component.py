@@ -216,8 +216,12 @@ class OsdiModelDescriptor:
         )
 
     def _canonicalise(self, d: dict, *, source: str) -> dict:
-        """Case-insensitive: rewrite ``d``'s keys to match ``self.param_names``."""
-        out = dict.fromkeys(self.param_names, 0.0)
+        """Case-insensitive: rewrite ``d``'s keys to match ``self.param_names``.
+
+        Absent parameters are filled with NaN (the OSDI "not given" marker)
+        so the model's own Verilog-A defaults apply.
+        """
+        out = dict.fromkeys(self.param_names, float("nan"))
         for k, v in d.items():
             idx = self._name_to_idx.get(k.lower())
             if idx is None:
@@ -264,7 +268,9 @@ def osdi_component(
                         If ``None`` (recommended), canonical names are read from
                         the OSDI binary and resolved case-insensitively.
         default_params: Default values for selected parameters.  Keys may be
-                        any subset of canonical parameter names.
+                        any subset of canonical parameter names.  Unspecified
+                        parameters are filled with NaN (OSDI "not given") so
+                        the model's own Verilog-A defaults apply.
         use_schur_reduction: Eliminate OSDI internal nodes via Schur complement
                         before global Newton (experimental).
 

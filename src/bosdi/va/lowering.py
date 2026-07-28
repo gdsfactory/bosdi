@@ -42,10 +42,11 @@ Known shortfalls (deliberate):
 from __future__ import annotations
 
 import ast
+import keyword
 import math
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 
 from .mir import (
@@ -240,6 +241,7 @@ class CseState:
     # entries in ``hoist_defs`` (same ``hoist_name``).  Populated by
     # ``_resolve_ssa`` when ``_lower_phi`` returns a ``PhiResolution``.
     phi_resolutions: dict[str, PhiResolution] = field(default_factory=dict)
+    safe_divide_mode: str = "overflow"
 
 
 def _compute_refcount(fn: Function, roots: list[str]) -> dict[str, int]:
@@ -954,11 +956,12 @@ def lower(
     cm: CompiledModule,
     *,
     va_defaults: dict[str, ParamSpec] | None = None,
-    collapse_nodes: bool = False,
+    collapse_nodes: bool | Collection[tuple[str, str]] = False,
     static_params: dict[str, int | float] | None = None,
     class_name: str | None = None,
     differentiable_params: tuple[str, ...] | None = (),
     opt_init_eligible: frozenset[str] | None = None,
+    safe_divide_mode: str = "overflow",
 ) -> LoweredDevice:
     """Lower a parsed :class:`CompiledModule` into a :class:`LoweredDevice`.
 
@@ -973,9 +976,10 @@ def lower(
     rest of lowering — apply OpenVAF's ``CollapseHint`` decisions to
     shrink the DAE to the same shape OSDI emits. Off by default because
     collapse decisions are conditional on user-facing parameters (e.g.
-    the diode's ``Rs=0`` triggers ``CI→C`` but ``Rs>0`` doesn't); only
-    enable it for devices where the user intends the OSDI-matching
-    reduced system (PSP103, BSIM4, etc).
+    the diode's ``Rs=0`` triggers ``CI→C`` but ``Rs>0`` doesn't).
+    ``True`` applies every hint unconditionally; pass a collection of
+    ``(node, node)`` pairs to apply only specific hints (pair order
+    is irrelevant).
 
     ``static_params`` is an optional ``{param_name: value}`` dict of
     integer or float parameters whose values are *known at lowering time*
@@ -992,7 +996,12 @@ def lower(
     ``class_name`` overrides the default CamelCase class name derived
     from the VA module name.  Use it to emit multiple specialisations of
     the same model under distinct Python identifiers.
+
+    ``safe_divide_mode``: ``"overflow"`` (default) or ``"mask"`` — see PR #12.
     """
+    if safe_divide_mode not in ("overflow", "mask"):
+        msg = f"safe_divide_mode must be 'overflow' or 'mask', got {safe_divide_mode!r}"
+        raise ValueError(msg)
     # Bump Python's recursion ceiling so deeply-chained dataflows (BSIM4's
     # ~ 9 k eval ops, PSP103's ~ 20 k) don't trip the default 1 000-frame
     # limit. Aggressive CSE hoisting in ``_resolve_ssa`` caps the *textual*
@@ -1044,7 +1053,12 @@ def lower(
     )
 
     if collapse_nodes:
-        _collapse_trivial_nodes(cm)
+        _collapse_trivial_nodes(
+            cm,
+            allowed_pairs=None
+            if collapse_nodes is True
+            else frozenset(frozenset(p) for p in collapse_nodes),
+        )
 
     # Build a constants table that spans all three functions — the DaeSystem
     # block references SSA names that may have been declared in any of them
@@ -1098,6 +1112,7 @@ def lower(
         refcount=_compute_refcount(cm.eval_fn, all_roots),
         ssa_prefix="i_",
         init_eligible=_unopt_init_eligible,
+        safe_divide_mode=safe_divide_mode,
     )
 
     # Run SCCP on the init function, then rewrite it: dead blocks dropped,
@@ -1413,7 +1428,11 @@ def lower(
         static_params=effective_static or {},
         init_hoist_count=_init_hoist_end,
         init_cache_refs=_init_cache_refs,
-        differentiable_params=differentiable_params,
+        differentiable_params=(
+            tuple(py_param_name(n) for n in differentiable_params)
+            if differentiable_params is not None
+            else None
+        ),
         phi_resolutions=dict(cse.phi_resolutions),
     )
 
@@ -1480,7 +1499,10 @@ _COLLAPSE_DECL_RE = re.compile(
 )
 
 
-def _collapse_trivial_nodes(cm: CompiledModule) -> dict[str, str]:
+def _collapse_trivial_nodes(
+    cm: CompiledModule,
+    allowed_pairs: frozenset[frozenset[str]] | None = None,
+) -> dict[str, str]:
     """Apply OpenVAF's ``CollapseHint`` decisions to the parsed DAE.
 
     OpenVAF's ``hir_lower`` pass emits a callback of the form
@@ -1500,6 +1522,9 @@ def _collapse_trivial_nodes(cm: CompiledModule) -> dict[str, str]:
     matches the collapsed id is rewritten to reference the survivor
     instead.
 
+    ``allowed_pairs`` restricts the pass to the given unordered node-name
+    pairs; ``None`` applies every hint unconditionally.
+
     Mutates ``cm.dae``, ``cm.internal_nodes``, and each interner's
     ``Voltage`` inputs in place. Returns ``{collapsed_node_id →
     survivor_node_id}`` for tests / logging.
@@ -1512,6 +1537,8 @@ def _collapse_trivial_nodes(cm: CompiledModule) -> dict[str, str]:
             m = _COLLAPSE_DECL_RE.search(cd.raw)
             if m:
                 pairs.add((m.group(1), m.group(2)))
+    if allowed_pairs is not None:
+        pairs = {p for p in pairs if frozenset(p) in allowed_pairs}
     if not pairs:
         return {}
 
@@ -1667,7 +1694,8 @@ def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
     Covers both named branches (``Branch``) and unnamed substrate-network
     probes (``Unnamed``) that carry a ``branch_id`` from the JSON IR client.
     Prefers the user's ``.va`` branch name for named branches, falls back to
-    ``i_br<id>``.
+    ``i_br<id>``.  Names shared by multiple branch_ids (e.g. several implicit
+    branches off the same hi node) are demoted to ``i_br<id>`` for all claimants.
     """
     mapping: dict[int, str] = {}
     for interner in (cm.eval_interner, cm.init_interner, cm.setup_interner):
@@ -1686,7 +1714,13 @@ def _build_branch_state_name_map(cm: CompiledModule) -> dict[int, str]:
                 hi = kind.hi or ""
                 lo = kind.lo or ""
                 mapping[kind.branch_id] = f"i_un_{hi}_{lo}_{kind.branch_id}"
-    return mapping
+    claimants: dict[str, int] = {}
+    for name in mapping.values():
+        claimants[name] = claimants.get(name, 0) + 1
+    return {
+        bid: name if claimants[name] == 1 else f"i_br{bid}"
+        for bid, name in mapping.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2116,6 +2150,12 @@ def _resolve_ssa(  # noqa: C901, PLR0912, PLR0915
                     # in the all-static emit, plus another ~300 ``a*b``
                     # squares whose operands trace back to these.
                     expr = Expr(f"jnp.divide({_a}, {_b})")
+                elif cse is not None and cse.safe_divide_mode == "mask":
+                    _bad = f"({_b} == 0.0) | ~jnp.isfinite({_b})"
+                    expr = Expr(
+                        f"jnp.where({_bad}, 0.0, "
+                        f"jnp.divide({_a}, jnp.where({_bad}, 1.0, {_b})))"
+                    )
                 else:
                     expr = Expr(
                         f"jnp.divide({_a}, jnp.where(({_b} == 0.0) | ~jnp.isfinite({_b}), 1e-300, {_b}))"
@@ -2935,6 +2975,11 @@ def _node_voltage_expr(name: str, node_id: str, internal_name: dict[str, str]) -
     return f"signals.{name}"
 
 
+def py_param_name(name: str) -> str:
+    """Append trailing underscore to Python-keyword VA param names (PEP 8)."""
+    return f"{name}_" if keyword.iskeyword(name) else name
+
+
 def _input_kind_expr(  # noqa: C901, PLR0911
     kind: InputKind,
     branch_state_name: dict[int, str],
@@ -2953,7 +2998,7 @@ def _input_kind_expr(  # noqa: C901, PLR0911
         lo_ref = _node_voltage_expr(kind.lo, kind.lo_node or "", internal_name)
         return Expr(f"{hi_ref} - {lo_ref}", prec=6)
     if isinstance(kind, ParamRef):
-        return Expr(kind.name)
+        return Expr(py_param_name(kind.name))
     if isinstance(kind, ParamGivenRef):
         # $param_given(X) — was the param explicitly provided by the user?
         #   * In static_params (baked at compile time): True
@@ -3072,9 +3117,9 @@ def _plan_component_surface(  # noqa: C901, PLR0912
                     continue  # baked in as literal; must not appear in the emitted signature
                 spec = va_defaults.get(kind.name)
                 if spec is None:
-                    specs.append((kind.name, "float", "0.0"))
+                    specs.append((py_param_name(kind.name), "float", "0.0"))
                 else:
-                    specs.append((kind.name, spec.type_, spec.default))
+                    specs.append((py_param_name(kind.name), spec.type_, spec.default))
 
     # Append the simulator-supplied kwargs the eval references.
     eval_kinds = list(cm.eval_interner.parameters.values())
@@ -3276,6 +3321,7 @@ __all__ = [
     "_match_opt_init_to_unopt",
     "LoweringError",
     "lower",
+    "py_param_name",
 ]
 
 
