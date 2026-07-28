@@ -17,7 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .lowering import LoweredDevice, PhiResolution
+from .lowering import LoweredDevice, PhiResolution, py_param_name
 
 # Matches the SSA names the lowering emits — bare ``v123`` / ``i_v123``,
 # the ``_init_cache[N]`` indices, and any local prefixed with ``v``.
@@ -362,12 +362,20 @@ def _substitute_static_params(
     """
     if not static_params:
         return cse_hoists
-    pattern = re.compile(
-        r"\b(" + "|".join(re.escape(k) for k in static_params) + r")\b"
-    )
+    # Match both the VA name and its keyword-safe alias (``as`` is also
+    # ``as_`` in emitted text — see ``py_param_name``): body references
+    # produced by the lowering already carry the alias, so a sweep keyed
+    # only on the VA name would miss them (``\bas\b`` doesn't match
+    # ``as_`` — the underscore is a word character).
+    lookup = {
+        alias: v
+        for k, v in static_params.items()
+        for alias in {k, py_param_name(k)}
+    }
+    pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in lookup) + r")\b")
 
     def _sub(text: str) -> str:
-        return pattern.sub(lambda m: repr(static_params[m.group(0)]), text)
+        return pattern.sub(lambda m: repr(lookup[m.group(0)]), text)
 
     return [(ssa, _sub(expr)) for ssa, expr in cse_hoists]
 

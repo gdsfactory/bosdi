@@ -42,6 +42,7 @@ Known shortfalls (deliberate):
 from __future__ import annotations
 
 import ast
+import keyword
 import math
 import re
 import sys
@@ -1427,7 +1428,14 @@ def lower(
         static_params=effective_static or {},
         init_hoist_count=_init_hoist_end,
         init_cache_refs=_init_cache_refs,
-        differentiable_params=differentiable_params,
+        # Callers name differentiable params by their VA name; the strings
+        # land in the emitted decorator where circulax matches them against
+        # the signature kwargs, so apply the same keyword-safe aliasing.
+        differentiable_params=(
+            tuple(py_param_name(n) for n in differentiable_params)
+            if differentiable_params is not None
+            else None
+        ),
         phi_resolutions=dict(cse.phi_resolutions),
     )
 
@@ -2970,6 +2978,29 @@ def _node_voltage_expr(name: str, node_id: str, internal_name: dict[str, str]) -
     return f"signals.{name}"
 
 
+def py_param_name(name: str) -> str:
+    """Map a Verilog-A parameter name to the Python identifier we emit for it.
+
+    Verilog-A identifiers are almost always valid Python identifiers, so
+    parameters normally keep their ``.va`` name in the emitted signature
+    and body. The exception is Python *keywords*: BSIM4 declares
+    ``parameter real as`` (source area) and ``parameter real lambda``
+    (velocity overshoot), and ``def f(..., as: float = 0.0, ...)`` is a
+    SyntaxError. Those get a trailing underscore (``as_`` / ``lambda_``
+    — the PEP 8 convention for keyword collisions). A trailing rather
+    than leading underscore keeps renamed user params visually distinct
+    from the framework-injected kwargs (``_temperature``, ``_mfactor``,
+    ``_simparam_*``), which reserve the leading-underscore namespace.
+
+    Everything keyed by the *VA* name — ``static_params``,
+    ``va_defaults``, sentinel detection, ``$param_given`` — is looked up
+    before this mapping is applied; only the emitted Python surface
+    (signature kwarg, body references, ``differentiable_params`` strings
+    forwarded to the decorator) uses the renamed form.
+    """
+    return f"{name}_" if keyword.iskeyword(name) else name
+
+
 def _input_kind_expr(  # noqa: C901, PLR0911
     kind: InputKind,
     branch_state_name: dict[int, str],
@@ -2988,7 +3019,9 @@ def _input_kind_expr(  # noqa: C901, PLR0911
         lo_ref = _node_voltage_expr(kind.lo, kind.lo_node or "", internal_name)
         return Expr(f"{hi_ref} - {lo_ref}", prec=6)
     if isinstance(kind, ParamRef):
-        return Expr(kind.name)
+        # Emitted body reference — must match the (possibly keyword-renamed)
+        # signature kwarg from ``_plan_component_surface``.
+        return Expr(py_param_name(kind.name))
     if isinstance(kind, ParamGivenRef):
         # $param_given(X) — was the param explicitly provided by the user?
         #   * In static_params (baked at compile time): True
@@ -3105,11 +3138,15 @@ def _plan_component_surface(  # noqa: C901, PLR0912
                 seen.add(kind.name)
                 if kind.name in _static:
                     continue  # baked in as literal; must not appear in the emitted signature
+                # ``static_params`` / ``va_defaults`` are keyed by the VA
+                # name; only the emitted kwarg gets the keyword-safe alias
+                # (BSIM4's ``as`` / ``lambda`` → ``as_`` / ``lambda_``),
+                # mirroring the body references from ``_input_kind_expr``.
                 spec = va_defaults.get(kind.name)
                 if spec is None:
-                    specs.append((kind.name, "float", "0.0"))
+                    specs.append((py_param_name(kind.name), "float", "0.0"))
                 else:
-                    specs.append((kind.name, spec.type_, spec.default))
+                    specs.append((py_param_name(kind.name), spec.type_, spec.default))
 
     # Append the simulator-supplied kwargs the eval references.
     eval_kinds = list(cm.eval_interner.parameters.values())
@@ -3311,6 +3348,7 @@ __all__ = [
     "_match_opt_init_to_unopt",
     "LoweringError",
     "lower",
+    "py_param_name",
 ]
 
 
