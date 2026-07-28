@@ -1,13 +1,4 @@
-"""``safe_divide_mode`` controls how ``fdiv`` guards possibly-zero denominators.
-
-``"overflow"`` (default) keeps the historical ``n / where(bad, 1e-300, d)``
-form: when the guard fires the quotient is ~1e300 and overflows to ``inf``
-for large numerators, which turns into NaN at the first multiplication by
-zero downstream (JAX evaluates both sides of every ``jnp.where``).
-
-``"mask"`` emits ``where(bad, 0.0, n / where(bad, 1.0, d))`` — identical for
-healthy denominators, an exact finite 0.0 when the guard fires.
-"""
+"""Tests for safe_divide_mode='overflow' vs 'mask' fdiv guard forms."""
 
 import ast
 import pathlib
@@ -15,15 +6,12 @@ import re
 
 import pytest
 
-openvaf_py = pytest.importorskip("openvaf_py")
-
 from bosdi.va import compile_va, emit_source, lower
+
+openvaf_py = pytest.importorskip("openvaf_py")
 
 DIODE_VA = pathlib.Path(__file__).parent / "devices" / "diode.va"
 
-# The overflow-style guard is the only place a bare ``1e-300`` appears as a
-# jnp.where *argument* (the log/sqrt floors use ``jnp.maximum(x, 1e-300)``,
-# i.e. ``1e-300)``), so ``1e-300,`` identifies it unambiguously.
 OVERFLOW_GUARD = re.compile(r"1e-300,")
 MASK_GUARD = re.compile(r"jnp\.where\(\(.*?, 0\.0, jnp\.divide")
 
