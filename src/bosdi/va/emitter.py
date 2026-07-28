@@ -362,15 +362,8 @@ def _substitute_static_params(
     """
     if not static_params:
         return cse_hoists
-    # Match both the VA name and its keyword-safe alias (``as`` is also
-    # ``as_`` in emitted text — see ``py_param_name``): body references
-    # produced by the lowering already carry the alias, so a sweep keyed
-    # only on the VA name would miss them (``\bas\b`` doesn't match
-    # ``as_`` — the underscore is a word character).
     lookup = {
-        alias: v
-        for k, v in static_params.items()
-        for alias in {k, py_param_name(k)}
+        alias: v for k, v in static_params.items() for alias in {k, py_param_name(k)}
     }
     pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in lookup) + r")\b")
 
