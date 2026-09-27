@@ -5,9 +5,8 @@ import pathlib
 
 import pytest
 
-openvaf_py = pytest.importorskip("openvaf_py")
 
-from bosdi.va import compile_va, emit_source, lower  # noqa: E402
+from bosdi.va import compile_va, emit_source, lower
 
 BSIM4_VA = pathlib.Path(__file__).parent / "devices" / "bsim4v8.va"
 

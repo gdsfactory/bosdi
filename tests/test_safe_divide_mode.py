@@ -8,7 +8,6 @@ import pytest
 
 from bosdi.va import compile_va, emit_source, lower
 
-openvaf_py = pytest.importorskip("openvaf_py")
 
 DIODE_VA = pathlib.Path(__file__).parent / "devices" / "diode.va"
 

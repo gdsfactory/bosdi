@@ -11,15 +11,12 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "src"))
 
+from bosdi.va import compile_va
 from bosdi.va.emitter import emit_source
 from bosdi.va.lowering import lower, py_param_name
 from bosdi.va.va_defaults import parse_va_defaults_expanded
 
 BSIM4_VA = pathlib.Path(__file__).parent / "devices" / "bsim4v8.va"
-
-openvaf_py = pytest.importorskip("openvaf_py")
-
-from bosdi.va.binding import compile_va  # noqa: E402 — after importorskip
 
 
 def test_py_param_name_keywords_get_trailing_underscore():
