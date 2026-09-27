@@ -15,6 +15,8 @@ from bosdi.va import compile_va
 from bosdi.va.emitter import emit_source
 from bosdi.va.lowering import lower, py_param_name
 from bosdi.va.va_defaults import parse_va_defaults_expanded
+from _openvaf import DUMP_JSON_MISSING
+
 
 BSIM4_VA = pathlib.Path(__file__).parent / "devices" / "bsim4v8.va"
 
@@ -41,6 +43,7 @@ def bsim4_device():
     return lower(df.modules[0], va_defaults=defaults)
 
 
+@DUMP_JSON_MISSING
 def test_bsim4_keyword_params_are_renamed_in_surface(bsim4_device):
     names = {name for name, _ty, _default in bsim4_device.params}
     assert "as_" in names
@@ -49,11 +52,13 @@ def test_bsim4_keyword_params_are_renamed_in_surface(bsim4_device):
     assert "lambda" not in names
 
 
+@DUMP_JSON_MISSING
 def test_bsim4_emitted_source_parses(bsim4_device):
     src = emit_source([bsim4_device])
     ast.parse(src)
 
 
+@DUMP_JSON_MISSING
 def test_bsim4_body_references_use_the_alias(bsim4_device):
     src = emit_source([bsim4_device])
     names = {node.id for node in ast.walk(ast.parse(src)) if isinstance(node, ast.Name)}

@@ -4,6 +4,10 @@ import pathlib
 
 
 from bosdi.va import compile_va, lower
+from _openvaf import DUMP_JSON_MISSING
+
+pytestmark = DUMP_JSON_MISSING
+
 
 BSIM4_VA = pathlib.Path(__file__).parent / "devices" / "bsim4v8.va"
 
