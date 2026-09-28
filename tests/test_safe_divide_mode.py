@@ -7,8 +7,10 @@ import re
 import pytest
 
 from bosdi.va import compile_va, emit_source, lower
+from _openvaf import DUMP_JSON_MISSING
 
-openvaf_py = pytest.importorskip("openvaf_py")
+pytestmark = DUMP_JSON_MISSING
+
 
 DIODE_VA = pathlib.Path(__file__).parent / "devices" / "diode.va"
 

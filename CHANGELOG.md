@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- `bosdi/va/binding.py` and the optional `openvaf_py` PyO3 dependency. `bosdi.va.compile_va` now resolves to
+  `ir_client.compile_va` (`openvaf-r --dump-json`), which was already written as a signature-identical drop-in; every
+  other `compile_va_*` entry point already used `ir_client`. The `python -m bosdi.va` CLI default moves with it.
+  Consumers that installed `openvaf-py` solely to call `compile_va` no longer need it.
+
+### Fixed
+
+- Four test files (`test_collapse_allowlist`, `test_branch_state_names`, `test_safe_divide_mode`,
+  `test_emitter_keyword_params`) were gated behind `pytest.importorskip("openvaf_py")` and so never ran in CI — which
+  meant the v0.1.6 Verilog-A fixes shipped without executing coverage. They now run: 163 passed (was 149).
+
 ## [0.1.6] - 2026-09-27
 
 Consolidates the Verilog-A lowering fixes that downstream consumers (notably

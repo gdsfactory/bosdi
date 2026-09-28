@@ -4,8 +4,8 @@ Stage 1 scope: parse ``openvaf-r --dump-mir`` textual output into structured
 MIR dataclasses. Lowering and code emission are follow-on stages.
 """
 
-from .binding import compile_va
 from .ir_client import (
+    compile_va,
     compile_va_opt_mir,
     compile_va_unopt,
     compile_va_unopt_json,

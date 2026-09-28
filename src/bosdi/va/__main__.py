@@ -1,7 +1,7 @@
 """CLI entry point: ``python -m bosdi.va <path/to/device.va>``.
 
-Compiles the Verilog-A source through ``openvaf_py`` (or text MIR via
-``openvaf-r --dump-mir``), lowers each module into a circulax-compatible
+Compiles the Verilog-A source through ``openvaf-r --dump-json`` (or text MIR
+via ``openvaf-r --dump-mir``), lowers each module into a circulax-compatible
 component, and writes a ``.py`` file next to the input (or to
 ``--out PATH`` if given).
 """
@@ -13,8 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .binding import compile_va as _binding_compile_va
 from .dump_parser import parse_dump
+from .ir_client import compile_va
 from .emitter import write_source
 from .lowering import lower
 from .va_defaults import ParamSpec, parse_va_defaults, parse_va_defaults_expanded
@@ -65,9 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         "--use-text-parser",
         action="store_true",
         help="Force the legacy ``--dump-mir`` text parser even for ``.va`` "
-        "inputs.  By default we go through the ``openvaf_py`` PyO3 binding, "
-        "which skips the subprocess and handles models (e.g. BSIM4) that "
-        "the text parser can't lower.",
+        "inputs.  By default we go through ``openvaf-r --dump-json``, which "
+        "handles models (e.g. BSIM4) that the text parser can't lower.",
     )
     args = parser.parse_args(argv)
 
@@ -82,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.use_text_parser:
             dump = parse_dump(_run_dump_mir(source))
         else:
-            dump = _binding_compile_va(str(source))
+            dump = compile_va(str(source))
     else:
         # Allow feeding a pre-captured dump (useful for tests). If there's a
         # sibling ``.va`` next to the dump, harvest defaults from it.
