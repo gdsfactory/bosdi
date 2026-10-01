@@ -27,6 +27,8 @@ import jax.numpy as jnp
 from circulax.components.base_component import (
     CircuitComponent,
     PhysicsReturn,
+    Signals,
+    States,
     _build_component,
     _extract_param,
 )
@@ -186,12 +188,9 @@ def _install_custom_jvp(
     )
     _jvp_is_specialized: bool = bool(getattr(cls, "_static_param_names", ()))
 
-    _PortsType = cls._VarsType_P
-    _StatesType = cls._VarsType_S
-
     def _unpack(vars_vec: jax.Array, params: Any) -> tuple[Any, Any, dict]:
-        signals = _PortsType(*vars_vec[:n_p]) if _PortsType else ()
-        s = _StatesType(*vars_vec[n_p:]) if _StatesType else ()
+        signals = Signals(vars_vec[:n_p], ports)
+        s = States(vars_vec[n_p:], states)
         kw = {name: _extract_param(params, name) for name in _param_names_for_kw}
         if _has_init_arg:
             if hasattr(params, "_init_cache_v2"):

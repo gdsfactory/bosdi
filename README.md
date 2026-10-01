@@ -106,11 +106,19 @@ pip install bosdi
 
 ```bash
 pixi run build   # compile Rust static lib + C++ extension
-pixi run test    # run pytest suite
+pixi run test    # standalone pytest suite; Circulax is not required
+pixi run --locked -e integration test-integration  # build and test with Circulax
 
 # single test
 pixi run pytest tests/test_osdi.py::test_resistor_dc_evaluation -v
 ```
+
+The `integration` environment has its own solve group and includes Circulax only for testing. It builds this checkout's
+native extension before running public DC/AC/transient, simulator-settings and generated-component checks. Both Linux
+and Windows CI run it alongside the standalone suite. Circulax is temporarily pinned to the immutable integration commit
+for PR #64; replace that pin with an upstream release once the required public native APIs are released. No Circulax
+extra is requested, so tests use this checkout's bosdi rather than installing a second copy. OpenVAF must be on PATH;
+JSON lowering tests additionally need the custom compiler's dump support.
 
 ## OSDI outputs
 
