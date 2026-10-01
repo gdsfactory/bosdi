@@ -1025,9 +1025,13 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
         write_param(i, val, kind, flags & PARA_TY_MASK);
     }
 
+    // Setup functions may call $simparam just like eval(). Supply a valid
+    // empty, null-terminated parameter table rather than a null struct pointer.
+    let mut names_sentinel: *mut i8 = std::ptr::null_mut();
+    let mut sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
     let mut init1 = OsdiInitInfo::default();
     unsafe {
-        (m.setup_model)(std::ptr::null_mut(), model_ptr, std::ptr::null_mut(), &mut init1);
+        (m.setup_model)(std::ptr::null_mut(), model_ptr, &mut sim_paras, &mut init1);
     }
 
     // Pass 2: instance params (after setup_model, before setup_instance)
@@ -1042,7 +1046,7 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     unsafe {
         (m.setup_instance)(
             std::ptr::null_mut(), inst_ptr, model_ptr,
-            300.0, m.num_terminals, std::ptr::null_mut(), &mut init2,
+            300.0, m.num_terminals, &mut sim_paras, &mut init2,
         );
     }
 }

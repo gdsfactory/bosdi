@@ -54,3 +54,33 @@ def test_nan_defaults_evaluate_like_explicit_defaults(resistor_descriptor):
         resistor_descriptor.model.id, voltages, params, old_state
     )
     np.testing.assert_allclose(cur, np.array([[0.02, -0.02]]), rtol=1e-6)
+
+
+def test_setup_accepts_simulator_parameter_queries(tmp_path):
+    """SPICE capacitor reads $simparam in setup; a null struct used to crash."""
+    import shutil
+    import subprocess
+    from osdi_jax import osdi_eval_with_handle, osdi_setup_batch
+
+    compiler = shutil.which("openvaf-r")
+    if compiler is None:
+        pytest.skip("openvaf-r is not installed")
+    source = folder / "devices/spice/capacitor.va"
+    target = tmp_path / "capacitor.osdi"
+    subprocess.run(
+        [compiler, str(source), "-o", str(target)], check=True, capture_output=True
+    )
+    descriptor = osdi_component(str(target), ports=("p", "n"))
+    instance = descriptor.make_instance({"capacitance": 1e-12})
+    params = np.array([[instance[key] for key in descriptor.param_names]])
+    handle = osdi_setup_batch(descriptor.model.id, params)
+    _, _, charge, capacitance, _ = osdi_eval_with_handle(
+        handle, jnp.array([[1.0, 0.0]]), jnp.empty((1, 0))
+    )
+    np.testing.assert_allclose(charge, [[1e-12, -1e-12]], rtol=1e-12, atol=1e-24)
+    np.testing.assert_allclose(
+        capacitance.reshape(1, 2, 2),
+        [[[1e-12, -1e-12], [-1e-12, 1e-12]]],
+        rtol=1e-12,
+        atol=1e-24,
+    )
