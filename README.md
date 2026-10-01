@@ -138,7 +138,8 @@ Pass `jnp.nan` for any parameter to use its Verilog-A default. Parameters can be
   compile from `.va` sources via [openvaf-r](https://github.com/cdaunt/OpenVAF) on each target
 - **OSDI differentiability:** `jax.grad()` works through node voltages only, not model parameters — use the VA path for
   parameter gradients
-- **Stateful models** (`num_states > 0`): evaluation is skipped and outputs are zeroed
+- **ABI states** (`num_states > 0`): the descriptor rejects these by default. Audited OpenVAF voltage-limiting slots may
+  use the explicit policy described below; generic history-dependent state is unsupported.
 - **VA lowering (alpha):** user-defined `analog function` calls and noise contributions are not yet supported
 
 ### Native OSDI node collapse
@@ -162,6 +163,21 @@ To reproduce VACASK AC, first solve DC and retain its conductance matrix. Then e
 at that operating point and solve `(G_dc + j*omega*C_ac) x = rhs`. A new registration/handle is required to change mode.
 Transient callers must provide a DC-consistent initial point. This does not add general state-history or `$abstime`
 support.
+
+### OpenVAF voltage-limiting slots
+
+OpenVAF derives OSDI `num_states` from its `$limit` slots. These Newton limiting buffers are distinct from physical
+`ddt` charges and `idt` unknowns, which are represented by the circuit DAE. For an audited binary whose slots serve only
+voltage limiting, use `osdi_component(..., state_policy="limiting_only")`. Bosdi leaves `ENABLE_LIM` disabled, evaluates
+the unmodified device equations, and does not propagate ABI state outputs. This can reduce convergence robustness
+compared with a simulator that enables limiting. It does not add fictitious delayed unknowns.
+
+The default `state_policy="reject"` remains appropriate for an unaudited binary. The ABI does not describe what its
+state slots mean; `limiting_only` is an explicit assertion by the caller, not automatic compiler detection. Generic
+history-dependent models, `$abstime`, and enabled voltage limiting still need a simulator lifecycle implementation.
+
+`descriptor.with_analysis("dc" | "ac" | "tran")` returns cached immutable registrations preserving the binary path,
+ports, defaults, temperature, and state policy. Circulax uses these registrations to orchestrate native analyses.
 
 ## Releases
 

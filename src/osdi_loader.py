@@ -51,6 +51,7 @@ class OsdiModel:
     param_names: list = field(default_factory=list)
     temperature: float = 300.0
     analysis: str = "ac"
+    path: str = ""
 
     @property
     def num_resist_jac(self) -> int:
@@ -127,6 +128,7 @@ def load_osdi_model(
         id=mid,
         temperature=temperature,
         analysis=analysis,
+        path=os.path.abspath(osdi_filepath),
         num_pins=meta.num_pins,
         num_nodes=meta.num_nodes,
         num_params=meta.num_params,

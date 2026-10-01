@@ -436,8 +436,7 @@ struct LoadedOsdi {
     pub num_slots:             usize,
     /// Terminals plus every raw internal and auxiliary node.
     pub num_all_nodes:         usize,
-    /// Number of NQS charge-partition state variables (e.g. 5 for BSIM3v3/4).
-    /// Zero for purely resistive models like the diode.
+    /// Number of ABI state slots. OpenVAF uses these for voltage limiting.
     pub num_states:            usize,
 }
 unsafe impl Send for LoadedOsdi {}
@@ -1165,11 +1164,11 @@ fn eval_device_from_setup(
     let mut names_sentinel: *mut i8 = std::ptr::null_mut();
     let sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
 
-    // Stateful models (BSIM3v3/4, etc.) write NQS charge-partition states to
-    // next_state and may read prev_state.  Pass zero-initialised scratch buffers
-    // so the model has valid pointers.  For DC analysis the states start at zero
-    // and the written values are discarded; for transient the caller propagates
-    // them explicitly (future work).
+    // Provide valid ABI state pointers. ENABLE_LIM is disabled, so OpenVAF
+    // voltage-limiting slots do not participate in F/Q evaluation. Physical
+    // charges and integration unknowns are carried by the DAE, not these slots.
+    // Generic binaries with history-dependent state still require a separate
+    // state lifecycle; the high-level API rejects them unless explicitly opted in.
     let (prev_state_ptr, next_state_ptr) = if m.num_states > 0 {
         scratch.state_buf.clear();
         scratch.state_buf.resize(2 * m.num_states as usize, 0.0);
@@ -1378,13 +1377,8 @@ pub extern "C" fn batched_osdi_eval_ffi(
                 });
         }
     } else {
-        // Stateful models: initialise state to zero and evaluate.
-        // States (NQS charge-partition variables in BSIM3v3/4, etc.) are not yet
-        // carried across Newton steps — they start at zero each call.  This gives
-        // correct resistive (DC / low-frequency) behaviour and is sufficient for
-        // operating-point finding and ring-oscillator frequency benchmarking.
-        // Reactive (capacitive) accuracy requires state propagation; that is a
-        // future enhancement.
+        // ABI state outputs are intentionally not propagated: voltage limiting
+        // is disabled. Do not interpret these zero outputs as physical history.
         let new_state = unsafe {
             std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
         };

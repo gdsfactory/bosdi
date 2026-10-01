@@ -197,11 +197,15 @@ class OsdiModelDescriptor:
         param_names: tuple | None,
         default_params: dict,
         use_schur_reduction: bool = False,
+        *,
+        state_policy: str = "reject",
     ) -> None:
         self.model = model
         self.ports = ports
         self.states: tuple = ()
         self.use_schur_reduction = use_schur_reduction
+        self.state_policy = state_policy
+        self._analysis_variants = {}
 
         if param_names is None:
             self.param_names = tuple(model.param_names)
@@ -217,6 +221,27 @@ class OsdiModelDescriptor:
         self.default_params = self._canonicalise(
             default_params, source="default_params"
         )
+
+    def with_analysis(self, analysis: str) -> "OsdiModelDescriptor":
+        """Return a cached immutable registration, preserving all model defaults."""
+        if analysis == self.model.analysis:
+            return self
+        if analysis not in self._analysis_variants:
+            if not self.model.path:
+                raise ValueError(
+                    "Changing OSDI analysis requires the binary source path"
+                )
+            self._analysis_variants[analysis] = osdi_component(
+                self.model.path,
+                self.ports,
+                param_names=None if self.is_canonical else self.param_names,
+                default_params=self.default_params.copy(),
+                use_schur_reduction=self.use_schur_reduction,
+                temperature=self.model.temperature,
+                analysis=analysis,
+                state_policy=self.state_policy,
+            )
+        return self._analysis_variants[analysis]
 
     def _canonicalise(self, d: dict, *, source: str) -> dict:
         """Case-insensitive: rewrite ``d``'s keys to match ``self.param_names``.
@@ -264,6 +289,7 @@ def osdi_component(
     *,
     temperature: float = 300.0,
     analysis: str = "ac",
+    state_policy: str = "reject",
 ) -> OsdiModelDescriptor:
     """Load a compiled ``.osdi`` binary and return a descriptor for ``compile_netlist``.
 
@@ -284,6 +310,10 @@ def osdi_component(
                   ac preserves the full current/charge stamp API.
         temperature: Setup temperature in kelvin, retained across parameter
                      updates and both cached/uncached evaluation paths.
+        state_policy: "reject" (default) guards models declaring state slots.
+                      "limiting_only" explicitly asserts the binary's slots are
+                      OpenVAF voltage-limiting buffers. ENABLE_LIM stays disabled;
+                      these buffers are not physical history or circuit unknowns.
 
     Returns:
         :class:`OsdiModelDescriptor` — pass this as a value in the
@@ -292,7 +322,7 @@ def osdi_component(
     Raises:
         ImportError: If ``bosdi`` runtime (``osdi_loader``) is not available.
         ValueError:  If port/param counts don't match the OSDI binary.
-        NotImplementedError: If the model has internal state variables.
+        NotImplementedError: If the model declares ABI state slots and the policy is reject.
 
     Example::
 
@@ -308,6 +338,8 @@ def osdi_component(
             "not be imported. Install circulax[verilog-a] to get OSDI support."
         ) from _BOSDI_ERR
 
+    if state_policy not in {"reject", "limiting_only"}:
+        raise ValueError("state_policy must be reject or limiting_only")
     model = load_osdi_model(osdi_path, temperature=temperature, analysis=analysis)
 
     if model.num_pins != len(ports):
@@ -316,7 +348,7 @@ def osdi_component(
     if param_names is not None and model.num_params != len(param_names):
         msg = f"OSDI model has {model.num_params} params but {len(param_names)} param names given"
         raise ValueError(msg)
-    if model.num_states > 0:
+    if model.num_states > 0 and state_policy == "reject":
         msg = "Stateful OSDI models (num_states > 0) are not yet supported"
         raise NotImplementedError(msg)
 
@@ -326,6 +358,7 @@ def osdi_component(
         param_names=param_names,
         default_params=default_params or {},
         use_schur_reduction=use_schur_reduction,
+        state_policy=state_policy,
     )
 
 
