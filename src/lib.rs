@@ -375,6 +375,7 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedOsdi {
+    temperature:             f64,
     _lib:                    Library,
     layout:                  AbiLayout,
     pub num_terminals:       u32,
@@ -494,6 +495,19 @@ fn fail() -> ModelMetadata {
 
 #[no_mangle]
 pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> ModelMetadata {
+    load_osdi_library_at_temperature(path_ptr, version, 300.0)
+}
+
+/// Register an immutable setup temperature in kelvin for this model id.
+/// Both cached-handle and uncached evaluation use this configuration.
+#[no_mangle]
+pub extern "C" fn load_osdi_library_at_temperature(
+    path_ptr: *const c_char, version: u32, temperature: f64,
+) -> ModelMetadata {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        set_last_error("OSDI: temperature must be finite and positive (kelvin)".into());
+        return fail();
+    }
     let ver = match OsdiVersion::from_u32(version) {
         Some(v) => v,
         None    => { set_last_error(format!("OSDI: unknown version {version}")); return fail(); }
@@ -727,6 +741,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     };
 
     OSDI_REGISTRY.write().unwrap().insert(model_id, LoadedOsdi {
+        temperature,
         _lib: lib,
         layout,
         num_terminals,
@@ -1046,7 +1061,7 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     unsafe {
         (m.setup_instance)(
             std::ptr::null_mut(), inst_ptr, model_ptr,
-            300.0, m.num_terminals, &mut sim_paras, &mut init2,
+            m.temperature, m.num_terminals, &mut sim_paras, &mut init2,
         );
     }
 }
