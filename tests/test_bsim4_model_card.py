@@ -65,12 +65,39 @@ def nmos_param_vec(bsim4):
 
 
 def _eval(bsim4, params, vd, vg, vs=0.0, vb=0.0):
-    """Bias a 4-terminal MOSFET. num_nodes > 4 for BSIM4 (7 internals + aux),
-    so pad with zeros — the Newton iterate starts the internal nodes at 0 V."""
-    V = jnp.zeros((1, bsim4.num_nodes), dtype=jnp.float64)
-    V = V.at[0, 0].set(vd).at[0, 1].set(vg).at[0, 2].set(vs).at[0, 3].set(vb)
-    S = jnp.empty((1, bsim4.num_states), dtype=jnp.float64)
-    return osdi_eval(bsim4.id, V, params, S)
+    """Fix terminal biases and solve physical/internal equality equations."""
+    voltage = np.zeros((1, bsim4.num_nodes))
+    voltage[0, :4] = [vd, vg, vs, vb]
+    # Candidate topology gives a useful starting guess, even when setup keeps
+    # finite parasitic resistances. It does not replace the internal solve.
+    parent = list(range(bsim4.num_nodes))
+    for first, second in bsim4.collapsible_pairs:
+        if first >= len(parent) or second >= len(parent):
+            continue
+        low, high = sorted([parent[first], parent[second]])
+        parent = [low if node == high else node for node in parent]
+    for node in range(4, bsim4.num_nodes):
+        if parent[node] < 4:
+            voltage[0, node] = voltage[0, parent[node]]
+    states = jnp.empty((1, bsim4.num_states), dtype=jnp.float64)
+    inactive = ~np.asarray(bsim4.resistive_mask[4:])
+    for _ in range(60):
+        result = osdi_eval(bsim4.id, jnp.asarray(voltage), params, states)
+        residual = np.asarray(result[0])[0, 4:].copy()
+        matrix = np.asarray(result[1])[0].reshape(bsim4.num_nodes, -1)[4:, 4:].copy()
+        unused = inactive | np.all(matrix == 0, axis=1)
+        assert np.all(np.abs(residual[unused]) < 1e-12)
+        residual[unused] = voltage[0, 4:][unused]
+        matrix[unused] = 0
+        matrix[np.where(unused)[0], np.where(unused)[0]] = 1
+        if np.max(np.abs(residual), initial=0) < 1e-12:
+            return result
+        # Unused auxiliary branches can leave a floating internal gauge.
+        # Least squares fixes that gauge while the residual check above
+        # still requires every physical/equality equation to converge.
+        step = np.linalg.lstsq(matrix, residual, rcond=1e-15)[0]
+        voltage[0, 4:] -= step
+    raise AssertionError("BSIM4 internal operating point did not converge")
 
 
 def test_bsim4_saturation_current(bsim4, nmos_param_vec):
