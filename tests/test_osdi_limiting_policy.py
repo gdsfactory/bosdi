@@ -3,6 +3,7 @@
 import shutil
 import subprocess
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -83,3 +84,44 @@ def test_policy_is_explicit_and_preserved(limiting_binary):
     assert ac.state_policy == "limiting_only"
     assert ac.default_params["r"] == 2000
     assert descriptor.model.analysis == "dc"
+
+
+def test_parameter_updates_use_uncached_evaluation_under_jit(limiting_binary):
+    from bosdi.circulax.osdi_component import OsdiComponentGroup
+
+    model = load_osdi_model(str(limiting_binary), analysis="dc")
+    params = jnp.full((1, model.num_params), jnp.nan)
+    states = jnp.zeros((1, model.num_states))
+    group = OsdiComponentGroup(
+        name="limited",
+        model_id=model.id,
+        num_pins=model.num_pins,
+        num_nodes=model.num_nodes,
+        num_params=model.num_params,
+        num_states=model.num_states,
+        params=params,
+        states=states,
+        var_indices=jnp.array([[0, 1]]),
+        eq_indices=jnp.array([[0, 1]]),
+        jac_rows=jnp.array([0, 0, 1, 1]),
+        jac_cols=jnp.array([0, 1, 0, 1]),
+        reg_diag=jnp.zeros((2, 2)),
+        handle=osdi_setup_batch(model.id, params),
+    )
+    column = model.param_names.index("r")
+    eager = group.with_params(params.at[0, column].set(2000))
+    assert eager.handle is not None
+
+    def current(resistance):
+        updated = group.with_params(params.at[0, column].set(resistance))
+        assert updated.handle is None
+        return osdi_eval(
+            updated.model_id, jnp.array([[1.0, 0.0]]), updated.params, updated.states
+        )[0][0, 0]
+
+    assert float(jax.jit(current)(2000.0)) == pytest.approx(0.0005)
+    np.testing.assert_allclose(
+        jax.jit(jax.vmap(current))(jnp.array([1000.0, 2000.0])),
+        [0.001, 0.0005],
+        atol=1e-15,
+    )

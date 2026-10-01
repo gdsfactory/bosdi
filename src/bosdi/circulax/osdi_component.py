@@ -13,6 +13,7 @@ Requires the ``bosdi`` package to be installed (``osdi_loader`` must be importab
 import difflib
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 
 try:
@@ -146,7 +147,10 @@ class OsdiComponentGroup(eqx.Module):
         try:
             from osdi_jax import osdi_setup_batch
 
-            new_handle = osdi_setup_batch(self.model_id, _np.asarray(new_params))
+            # Traced updates use the uncached FFI path; setup cannot consume
+            # a tracer as a host NumPy array. Eager updates retain cached setup.
+            if not isinstance(new_params, jax.core.Tracer):
+                new_handle = osdi_setup_batch(self.model_id, _np.asarray(new_params))
         except ImportError:
             pass  # older bosdi without Tier-3; legacy path still works
         return OsdiComponentGroup(
