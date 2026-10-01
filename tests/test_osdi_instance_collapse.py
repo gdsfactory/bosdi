@@ -125,11 +125,12 @@ endmodule
 
 
 @pytest.mark.parametrize("cached", [False, True])
-def test_inactive_branch_collapses_to_ground(conditional_branch, cached):
+@pytest.mark.parametrize("analysis", ["dc", "ac", "tran"])
+def test_inactive_branch_collapses_to_ground(conditional_branch, cached, analysis):
     """Ground a disabled flow unknown; retain and solve the enabled branch."""
     from osdi_jax import osdi_residual_eval
 
-    model = load_osdi_model(str(conditional_branch))
+    model = load_osdi_model(str(conditional_branch), analysis=analysis)
     assert any(
         second == -1 or second == 2**32 - 1 for _, second in model.collapsible_pairs
     )

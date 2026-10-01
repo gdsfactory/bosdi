@@ -432,7 +432,7 @@ struct LoadedOsdi {
     pub node_map:             Vec<i32>,
     /// slot_to_out[slot_idx] → output index, -1 for phantom slots.
     pub slot_to_out:          Vec<i32>,
-    /// Number of raw slots retained to keep JAX batch shapes fixed.
+    /// Scratch slots: every raw node plus a private ground slot.
     pub num_slots:             usize,
     /// Terminals plus every raw internal and auxiliary node.
     pub num_all_nodes:         usize,
@@ -812,7 +812,8 @@ fn compute_collapse_topology(
     let mut nm: Vec<i32> = (0..num_nodes as i32).collect();
     for &(n1, n2) in collapsible_pairs {
         // OSDI uses UINT32_MAX for global ground, including inactive
-        // branch-current unknowns. Preserve -1 in the instance node map.
+        // branch-current unknowns. Track ground as -1 while merging; setup
+        // remaps it to the valid private ground slot before native evaluation.
         let slot = |node: u32| {
             if node == u32::MAX { Some(-1) }
             else { nm.get(node as usize).copied() }
