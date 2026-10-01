@@ -11,6 +11,7 @@ Requires the ``bosdi`` package to be installed (``osdi_loader`` must be importab
 """
 
 import difflib
+from collections.abc import Mapping
 
 import equinox as eqx
 import jax
@@ -244,8 +245,25 @@ class OsdiModelDescriptor:
                 temperature=self.model.temperature,
                 analysis=analysis,
                 state_policy=self.state_policy,
+                simparams=dict(self.model.simparams),
             )
         return self._analysis_variants[analysis]
+
+    def with_simparams(self, simparams: Mapping[str, float]) -> "OsdiModelDescriptor":
+        """Return a registration with simulator overrides; never mutate this descriptor."""
+        settings = dict(self.model.simparams)
+        settings.update(simparams)
+        return osdi_component(
+            self.model.path,
+            self.ports,
+            param_names=None if self.is_canonical else self.param_names,
+            default_params=self.default_params.copy(),
+            use_schur_reduction=self.use_schur_reduction,
+            temperature=self.model.temperature,
+            analysis=self.model.analysis,
+            state_policy=self.state_policy,
+            simparams=settings,
+        )
 
     def _canonicalise(self, d: dict, *, source: str) -> dict:
         """Case-insensitive: rewrite ``d``'s keys to match ``self.param_names``.
@@ -294,6 +312,7 @@ def osdi_component(
     temperature: float = 300.0,
     analysis: str = "ac",
     state_policy: str = "reject",
+    simparams: Mapping[str, float] | None = None,
 ) -> OsdiModelDescriptor:
     """Load a compiled ``.osdi`` binary and return a descriptor for ``compile_netlist``.
 
@@ -314,6 +333,11 @@ def osdi_component(
                   ac preserves the full current/charge stamp API.
         temperature: Setup temperature in kelvin, retained across parameter
                      updates and both cached/uncached evaluation paths.
+        simparams: Numeric simulator settings queried through $simparam, e.g.
+                   {"scale": 2.0, "tnom": 27.0}. These are separate from device
+                   parameters, copied at registration, and retained by DC/AC/tran
+                   variants and parameter updates. Names are case-sensitive.
+                   This does not configure the circuit solver's own tolerances.
         state_policy: "reject" (default) guards models declaring state slots.
                       "limiting_only" explicitly asserts the binary's slots are
                       OpenVAF voltage-limiting buffers. ENABLE_LIM stays disabled;
@@ -344,7 +368,9 @@ def osdi_component(
 
     if state_policy not in {"reject", "limiting_only"}:
         raise ValueError("state_policy must be reject or limiting_only")
-    model = load_osdi_model(osdi_path, temperature=temperature, analysis=analysis)
+    model = load_osdi_model(
+        osdi_path, temperature=temperature, analysis=analysis, simparams=simparams
+    )
 
     if model.num_pins != len(ports):
         msg = f"OSDI model has {model.num_pins} pins but {len(ports)} port names given"

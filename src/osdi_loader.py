@@ -1,5 +1,6 @@
 import os
 import math
+from collections.abc import Mapping
 from copy import deepcopy
 from functools import lru_cache
 from threading import RLock
@@ -56,6 +57,7 @@ class OsdiModel:
     temperature: float = 300.0
     analysis: str = "ac"
     path: str = ""
+    simparams: tuple[tuple[str, float], ...] = ()
 
     @property
     def num_resist_jac(self) -> int:
@@ -87,13 +89,14 @@ def load_osdi_model(
     *,
     temperature: float = 300.0,
     analysis: str = "ac",
+    simparams: Mapping[str, float] | None = None,
 ) -> OsdiModel:
     """
     Load an OpenVAF-compiled .osdi binary and register it for JAX evaluation.
 
     Equivalent calls share a process-local native ID through a bounded LRU.
     Returned metadata is independent. Canonical path, file identity, ABI,
-    temperature and analysis mode define the cache key. Native IDs remain
+    temperature, analysis mode and simulator settings define the cache key. Native IDs remain
     registered for the process lifetime, including after Python cache eviction.
 
     Args:
@@ -102,10 +105,29 @@ def load_osdi_model(
         analysis:      Immutable evaluation mode: dc, ac, or tran. The default
                        ac retains the full current/charge stamp API. dc disables
                        integration to impose idt initial-value equations.
+        simparams:     Numeric $simparam settings, shared by setup and evaluation.
+                       Names are case-sensitive; omitted settings use model defaults.
+                       Settings are copied and form part of the registration cache key.
         temperature:   Immutable setup temperature in kelvin for this model id.
                        Changing temperature selects a separate model id; parameter
                        updates and cached handles retain this value.
     """
+    settings = []
+    if simparams is not None:
+        if not isinstance(simparams, Mapping):
+            raise TypeError("simparams must be a mapping of names to finite numbers")
+        for name, value in simparams.items():
+            if not isinstance(name, str) or not name or "\0" in name:
+                raise ValueError(
+                    "Simulator parameter names must be nonempty strings without NUL"
+                )
+            if isinstance(value, (str, bytes)):
+                raise TypeError("Simulator parameter values must be finite numbers")
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError("Simulator parameter values must be finite numbers")
+            settings.append((name, value))
+    settings = tuple(sorted(settings))
     modes = {"dc": 0, "ac": 1, "tran": 2}
     if analysis not in modes:
         raise ValueError("analysis must be dc, ac, or tran")
@@ -133,7 +155,9 @@ def load_osdi_model(
     # Serialize misses as well as hits: lru_cache alone permits duplicate work
     # when two threads concurrently request the same uncached registration.
     with _REGISTRATION_LOCK:
-        model = _load_registration(path, identity, version, temperature, analysis)
+        model = _load_registration(
+            path, identity, version, temperature, analysis, settings
+        )
         # Metadata is mutable for compatibility. Never expose the cached object.
         return deepcopy(model)
 
@@ -145,12 +169,13 @@ def _load_registration(
     version: str,
     temperature: float,
     analysis: str,
+    simparams: tuple[tuple[str, float], ...],
 ) -> OsdiModel:
     """Cache native registration IDs across descriptor and circuit lifetimes."""
     version_int = _VERSION_MAP[version]
     modes = {"dc": 0, "ac": 1, "tran": 2}
     meta = osdi_shim_nb.load_osdi_library(
-        path, version_int, temperature, modes[analysis]
+        path, version_int, temperature, modes[analysis], dict(simparams)
     )
 
     if not meta.success:
@@ -166,6 +191,7 @@ def _load_registration(
         temperature=temperature,
         analysis=analysis,
         path=path,
+        simparams=simparams,
         num_pins=meta.num_pins,
         num_nodes=meta.num_nodes,
         num_params=meta.num_params,

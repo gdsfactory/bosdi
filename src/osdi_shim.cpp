@@ -3,6 +3,8 @@
 #include <vector>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/map.h>
+#include <map>
 #include "xla/ffi/api/ffi.h"
 
 namespace nb = nanobind;
@@ -27,6 +29,8 @@ extern "C" {
     ModelMetadata load_osdi_library(const char* path_ptr, uint32_t version);
     ModelMetadata load_osdi_library_at_temperature(const char* path_ptr, uint32_t version, double temperature);
     ModelMetadata load_osdi_library_with_analysis(const char* path_ptr, uint32_t version, double temperature, uint32_t analysis);
+
+    ModelMetadata load_osdi_library_with_simparams(const char* path_ptr, uint32_t version, double temperature, uint32_t analysis, const char* const* names, const double* values, size_t count);
 
     // Diagnostic
     void dump_model_info(uint32_t model_id);
@@ -365,9 +369,17 @@ NB_MODULE(osdi_shim_nb, m) {
         .def_ro("osdi_version", &ModelMetadata::osdi_version)
         .def_ro("success",      &ModelMetadata::success);
 
-    m.def("load_osdi_library", [](const std::string& path, uint32_t version, double temperature, uint32_t analysis) {
-        return load_osdi_library_with_analysis(path.c_str(), version, temperature, analysis);
-    }, nb::arg("path"), nb::arg("version") = 4u, nb::arg("temperature") = 300.0, nb::arg("analysis") = 1u);
+    m.def("load_osdi_library", [](const std::string& path, uint32_t version, double temperature, uint32_t analysis, const std::map<std::string, double>& simparams) {
+        std::vector<const char*> names;
+        std::vector<double> values;
+        for (const auto& entry : simparams) {
+            if (entry.first.empty() || entry.first.find('\0') != std::string::npos)
+                throw nb::value_error("Simulator parameter names must be nonempty and contain no NUL");
+            names.push_back(entry.first.c_str());
+            values.push_back(entry.second);
+        }
+        return load_osdi_library_with_simparams(path.c_str(), version, temperature, analysis, names.data(), values.data(), names.size());
+    }, nb::arg("path"), nb::arg("version") = 4u, nb::arg("temperature") = 300.0, nb::arg("analysis") = 1u, nb::arg("simparams") = std::map<std::string, double>{});
 
     m.def("batched_osdi_eval", []() {
         return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET");

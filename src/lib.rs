@@ -2,7 +2,7 @@ use libloading::{Library, Symbol};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::sync::RwLock;
 
@@ -163,32 +163,7 @@ struct OsdiSimParas {
     vals_str:  *mut *mut i8,
 }
 unsafe impl Send for OsdiSimParas {}
-impl OsdiSimParas {
-    fn null() -> Self {
-        Self {
-            names:     std::ptr::null_mut(),
-            vals:      std::ptr::null_mut(),
-            names_str: std::ptr::null_mut(),
-            vals_str:  std::ptr::null_mut(),
-        }
-    }
 
-    /// Returns an empty-but-valid OsdiSimParas whose names pointer addresses the
-    /// provided null sentinel slot.  Models that read `sim_paras->names[0]` to
-    /// iterate the parameter list (e.g. the compiled OpenVAF diode) see a null
-    /// first entry and skip the lookup — instead of crashing on a null `names`.
-    ///
-    /// # Safety
-    /// `names_sentinel` must remain valid for the lifetime of the returned struct.
-    unsafe fn with_null_sentinel(names_sentinel: *mut *mut i8) -> Self {
-        Self {
-            names:     names_sentinel,
-            vals:      std::ptr::null_mut(),
-            names_str: std::ptr::null_mut(),
-            vals_str:  std::ptr::null_mut(),
-        }
-    }
-}
 
 /// OsdiSimInfo layout (confirmed by disassembly of eval_0):
 ///   offset  0: paras     (32 bytes)
@@ -375,6 +350,9 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedOsdi {
+    _simparam_names:          Vec<CString>,
+    simparam_name_ptrs:       Vec<*mut i8>,
+    simparam_values:          Vec<f64>,
     temperature:             f64,
     analysis:                u32,
     _lib:                    Library,
@@ -512,6 +490,40 @@ pub extern "C" fn load_osdi_library_at_temperature(
 pub extern "C" fn load_osdi_library_with_analysis(
     path_ptr: *const c_char, version: u32, temperature: f64, analysis: u32,
 ) -> ModelMetadata {
+    load_osdi_library_with_simparams(
+        path_ptr, version, temperature, analysis,
+        std::ptr::null(), std::ptr::null(), 0,
+    )
+}
+
+/// Numeric simulator settings are copied and immutable for this registration.
+/// Caller-provided names must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub extern "C" fn load_osdi_library_with_simparams(
+    path_ptr: *const c_char, version: u32, temperature: f64, analysis: u32,
+    names: *const *const c_char, values: *const f64, count: usize,
+) -> ModelMetadata {
+    if count > 0 && (names.is_null() || values.is_null()) {
+        set_last_error("OSDI: missing simulator parameter arrays".into());
+        return fail();
+    }
+    let mut simparam_names = Vec::with_capacity(count);
+    let mut simparam_values = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = unsafe { *names.add(i) };
+        let value = unsafe { *values.add(i) };
+        if name.is_null() || !value.is_finite() {
+            set_last_error("OSDI: invalid simulator parameter".into());
+            return fail();
+        }
+        let name = unsafe { CStr::from_ptr(name) };
+        if name.to_bytes().is_empty() || simparam_names.iter().any(|n: &CString| n.as_c_str() == name) {
+            set_last_error("OSDI: empty or duplicate simulator parameter name".into());
+            return fail();
+        }
+        simparam_names.push(name.to_owned());
+        simparam_values.push(value);
+    }
     if analysis > 2 {
         set_last_error("OSDI: unknown analysis mode".into());
         return fail();
@@ -746,6 +758,13 @@ pub extern "C" fn load_osdi_library_with_analysis(
         }
     }
 
+    // CString allocations remain stable when moved into the registration.
+    // OSDI queries only read these immutable tables; each invocation owns its
+    // OsdiSimParas struct. Cache the pointer table to avoid hot-path allocation.
+    let mut simparam_name_ptrs: Vec<_> = simparam_names.iter()
+        .map(|n| n.as_ptr() as *mut i8).collect();
+    simparam_name_ptrs.push(std::ptr::null_mut());
+
     let model_id = {
         let mut id = NEXT_MODEL_ID.write().unwrap();
         let cur = *id;
@@ -754,6 +773,9 @@ pub extern "C" fn load_osdi_library_with_analysis(
     };
 
     OSDI_REGISTRY.write().unwrap().insert(model_id, LoadedOsdi {
+        _simparam_names: simparam_names,
+        simparam_name_ptrs,
+        simparam_values,
         temperature,
         analysis,
         _lib: lib,
@@ -1069,9 +1091,13 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     }
 
     // Setup functions may call $simparam just like eval(). Supply a valid
-    // empty, null-terminated parameter table rather than a null struct pointer.
-    let mut names_sentinel: *mut i8 = std::ptr::null_mut();
-    let mut sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
+    // immutable, null-terminated settings table rather than a null struct pointer.
+    let mut sim_paras = OsdiSimParas {
+        names: m.simparam_name_ptrs.as_ptr() as *mut *mut i8,
+        vals: m.simparam_values.as_ptr() as *mut f64,
+        names_str: std::ptr::null_mut(),
+        vals_str: std::ptr::null_mut(),
+    };
     let mut init1 = OsdiInitInfo::default();
     unsafe {
         (m.setup_model)(std::ptr::null_mut(), model_ptr, &mut sim_paras, &mut init1);
@@ -1161,8 +1187,12 @@ fn eval_device_from_setup(
     let model_ptr = model_data.as_mut_ptr() as *mut c_void;
     let inst_ptr  = inst_data.as_mut_ptr() as *mut c_void;
 
-    let mut names_sentinel: *mut i8 = std::ptr::null_mut();
-    let sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
+    let sim_paras = OsdiSimParas {
+        names: m.simparam_name_ptrs.as_ptr() as *mut *mut i8,
+        vals: m.simparam_values.as_ptr() as *mut f64,
+        names_str: std::ptr::null_mut(),
+        vals_str: std::ptr::null_mut(),
+    };
 
     // Provide valid ABI state pointers. ENABLE_LIM is disabled, so OpenVAF
     // voltage-limiting slots do not participate in F/Q evaluation. Physical
