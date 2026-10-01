@@ -40,7 +40,7 @@ def _default_params(model):
 
 
 def _eval_at(model, v_forward):
-    V = jnp.array([[v_forward, 0.0]], dtype=jnp.float64)
+    V = jnp.zeros((1, model.num_nodes), dtype=jnp.float64).at[0, 0].set(v_forward)
     P = _default_params(model)
     S = jnp.empty((1, model.num_states), dtype=jnp.float64)
     return osdi_eval(model.id, V, P, S)
@@ -101,7 +101,7 @@ def test_diode_jax_grad_matches_conductance(diode):
     conductance buffer wrong and this test would return garbage.
     """
     Vf = 0.6
-    V = jnp.array([[Vf, 0.0]], dtype=jnp.float64)
+    V = jnp.zeros((1, diode.num_nodes), dtype=jnp.float64).at[0, 0].set(Vf)
     P = _default_params(diode)
     S = jnp.empty((1, diode.num_states), dtype=jnp.float64)
 
@@ -155,7 +155,9 @@ def test_diode_reactive_jacobian_scatter(diode):
     CJ0_INDEX = 10
     CJ0 = 1.0e-10  # 100 pF — well above numerical noise
 
-    V = jnp.array([[0.3, 0.0]], dtype=jnp.float64)  # mild forward bias
+    V = (
+        jnp.zeros((1, diode.num_nodes), dtype=jnp.float64).at[0, 0].set(0.3)
+    )  # mild forward bias
     P = jnp.full((1, diode.num_params), jnp.nan, dtype=jnp.float64)
     P = P.at[0, 0].set(1.0)  # $mfactor = 1
     P = P.at[0, CJ0_INDEX].set(CJ0)
@@ -179,8 +181,8 @@ def test_diode_reactive_jacobian_scatter(diode):
     C_AA = float(cap[0, 0])
     assert C_AA > 0, f"C_AA must be positive; got {C_AA}"
     np.testing.assert_allclose(
-        cap[0],
-        [C_AA, -C_AA, -C_AA, C_AA],
+        cap[0].reshape(diode.num_nodes, diode.num_nodes)[:2, :2],
+        [[C_AA, -C_AA], [-C_AA, C_AA]],
         rtol=1e-12,
         err_msg=f"Capacitance stamp does not match 2×2 [[C,-C],[-C,C]]: {cap[0]}",
     )
@@ -188,7 +190,11 @@ def test_diode_reactive_jacobian_scatter(diode):
 
 def test_diode_batched_consistent_with_single(diode):
     """Batched eval of 3 identical biases must match single-device evals."""
-    vs = jnp.array([[0.3, 0.0], [0.5, 0.0], [0.7, 0.0]], dtype=jnp.float64)
+    vs = (
+        jnp.zeros((3, diode.num_nodes), dtype=jnp.float64)
+        .at[:, 0]
+        .set(jnp.array([0.3, 0.5, 0.7]))
+    )
     P = jnp.tile(_default_params(diode), (3, 1))
     S = jnp.empty((3, diode.num_states), dtype=jnp.float64)
 
