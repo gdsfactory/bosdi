@@ -35,9 +35,7 @@ class OsdiModel:
 
     id: int
     num_pins: int  # = num_terminals (external pins only)
-    num_nodes: (
-        int  # = num_terminals + num_non_collapsed_internal + branch-current auxiliaries
-    )
+    num_nodes: int  # = all raw OSDI nodes, including collapse equality slots
     num_params: int
     num_states: int
     osdi_version: str

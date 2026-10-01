@@ -93,6 +93,8 @@ extern "C" {
     );
     void osdi_free_handle_ffi(uint64_t handle_id);
     size_t osdi_handle_num_devices(uint64_t handle_id);
+    size_t osdi_handle_num_nodes(uint64_t handle_id);
+    size_t osdi_model_num_nodes(uint32_t model_id);
 
     // Handle-based full eval: skips setup entirely. Rust tiles the handle's
     // snapshots across num_devices (must be a multiple of handle.num_devices).
@@ -150,6 +152,9 @@ ffi::Error batched_osdi_eval_impl(
     size_t num_params  = p_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_model_num_nodes(model_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal model.num_nodes (all raw nodes)");
+    }
     batched_osdi_eval_ffi(
         model_id,
         num_devices,
@@ -210,6 +215,9 @@ ffi::Error batched_osdi_residual_eval_impl(
     size_t num_params  = p_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_model_num_nodes(model_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal model.num_nodes (all raw nodes)");
+    }
     batched_osdi_residual_eval_ffi(
         model_id,
         num_devices,
@@ -265,6 +273,9 @@ ffi::Error batched_osdi_eval_handle_impl(
     size_t num_pins    = v_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_handle_num_nodes(handle_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal handle model.num_nodes (all raw nodes)");
+    }
     batched_osdi_eval_handle_ffi(
         handle_id,
         num_devices,
@@ -310,6 +321,9 @@ ffi::Error batched_osdi_residual_eval_handle_impl(
     size_t num_pins    = v_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_handle_num_nodes(handle_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal handle model.num_nodes (all raw nodes)");
+    }
     batched_osdi_residual_eval_handle_ffi(
         handle_id,
         num_devices,

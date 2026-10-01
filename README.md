@@ -141,6 +141,15 @@ Pass `jnp.nan` for any parameter to use its Verilog-A default. Parameters can be
 - **Stateful models** (`num_states > 0`): evaluation is skipped and outputs are zeroed
 - **VA lowering (alpha):** user-defined `analog function` calls and noise contributions are not yet supported
 
+### Native OSDI node collapse
+
+`OsdiModel.num_nodes` includes every raw OSDI node, including internal nodes that instance setup may collapse. Allocate
+voltage/state buffers using the model metadata rather than the external terminal count. The evaluator applies only
+`setup_instance`'s selected collapse flags, and represents unused raw node slots with voltage-equality equations. This
+preserves a fixed shape for batches whose instances have different parasitic resistances. Both cached and uncached
+native paths use the same mapping. Physical currents and charges are stamped into the surviving node; equality rows
+carry no charge.
+
 ## Releases
 
 The Git tag is the Python and Pixi package version. No manual version bump is needed. `setuptools-scm` writes

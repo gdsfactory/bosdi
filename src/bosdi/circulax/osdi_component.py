@@ -35,8 +35,9 @@ class OsdiComponentGroup(eqx.Module):
     and uses the analytical Jacobians (conductances/capacitances) that the
     OSDI model returns directly — no ``jax.jacfwd`` required.
 
-    Internal OSDI nodes (e.g. PSP103's ``di``, ``si``) that are not collapsed
-    onto a terminal are allocated as extra unknowns in the global state vector,
+    All raw internal OSDI nodes (e.g. PSP103's ``di``, ``si``) are allocated
+    as extra unknowns in the global state vector. Setup-selected collapses
+    use equality constraints in these slots,
     exactly like VoltageSource's ``i_src``.  ``num_nodes`` covers all of them;
     ``num_pins`` is the external terminal count only.
 
@@ -50,7 +51,9 @@ class OsdiComponentGroup(eqx.Module):
     name: str = eqx.field(static=True)
     model_id: int = eqx.field(static=True)  # bosdi registry ID — not differentiable
     num_pins: int = eqx.field(static=True)  # external terminals only
-    num_nodes: int = eqx.field(static=True)  # terminals + non-collapsed internal nodes
+    num_nodes: int = eqx.field(
+        static=True
+    )  # terminals + all raw internal/auxiliary nodes
     num_params: int = eqx.field(static=True)
     num_states: int = eqx.field(static=True)
 
