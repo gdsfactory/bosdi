@@ -263,6 +263,7 @@ def osdi_component(
     use_schur_reduction: bool = False,
     *,
     temperature: float = 300.0,
+    analysis: str = "ac",
 ) -> OsdiModelDescriptor:
     """Load a compiled ``.osdi`` binary and return a descriptor for ``compile_netlist``.
 
@@ -279,6 +280,8 @@ def osdi_component(
         use_schur_reduction: Eliminate OSDI internal nodes via Schur complement
                         before global Newton (experimental).
 
+        analysis: Immutable native evaluation mode (dc, ac, or tran). Default
+                  ac preserves the full current/charge stamp API.
         temperature: Setup temperature in kelvin, retained across parameter
                      updates and both cached/uncached evaluation paths.
 
@@ -305,7 +308,7 @@ def osdi_component(
             "not be imported. Install circulax[verilog-a] to get OSDI support."
         ) from _BOSDI_ERR
 
-    model = load_osdi_model(osdi_path, temperature=temperature)
+    model = load_osdi_model(osdi_path, temperature=temperature, analysis=analysis)
 
     if model.num_pins != len(ports):
         msg = f"OSDI model has {model.num_pins} pins but {len(ports)} port names given"

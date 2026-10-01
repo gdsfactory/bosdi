@@ -50,6 +50,7 @@ class OsdiModel:
     # Per-param canonical (alias 0) names in OSDI order. Length == num_params.
     param_names: list = field(default_factory=list)
     temperature: float = 300.0
+    analysis: str = "ac"
 
     @property
     def num_resist_jac(self) -> int:
@@ -76,7 +77,11 @@ class OsdiModel:
 
 
 def load_osdi_model(
-    osdi_filepath: str, version: str = "0.4", *, temperature: float = 300.0
+    osdi_filepath: str,
+    version: str = "0.4",
+    *,
+    temperature: float = 300.0,
+    analysis: str = "ac",
 ) -> OsdiModel:
     """
     Load an OpenVAF-compiled .osdi binary and register it for JAX evaluation.
@@ -84,10 +89,16 @@ def load_osdi_model(
     Args:
         osdi_filepath: Path to the .osdi ELF binary.
         version:       OSDI standard version to use ("0.4" or "0.5").
+        analysis:      Immutable evaluation mode: dc, ac, or tran. The default
+                       ac retains the full current/charge stamp API. dc disables
+                       integration to impose idt initial-value equations.
         temperature:   Immutable setup temperature in kelvin for this model id.
                        Load a new model id to change temperature; parameter
                        updates and cached handles retain this value.
     """
+    modes = {"dc": 0, "ac": 1, "tran": 2}
+    if analysis not in modes:
+        raise ValueError("analysis must be dc, ac, or tran")
     temperature = float(temperature)
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("temperature must be finite and positive (kelvin)")
@@ -100,7 +111,9 @@ def load_osdi_model(
     if not os.path.exists(osdi_filepath):
         raise FileNotFoundError(f"OSDI binary not found at {osdi_filepath}")
 
-    meta = osdi_shim_nb.load_osdi_library(osdi_filepath, version_int, temperature)
+    meta = osdi_shim_nb.load_osdi_library(
+        osdi_filepath, version_int, temperature, modes[analysis]
+    )
 
     if not meta.success:
         detail = osdi_shim_nb.get_last_error()
@@ -113,6 +126,7 @@ def load_osdi_model(
     return OsdiModel(
         id=mid,
         temperature=temperature,
+        analysis=analysis,
         num_pins=meta.num_pins,
         num_nodes=meta.num_nodes,
         num_params=meta.num_params,

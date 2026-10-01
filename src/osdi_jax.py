@@ -153,8 +153,10 @@ evaluation produces exactly one FFI crossing regardless of batch size.
 #
 # For Newton inner iterations that reuse a frozen Jacobian from the first iter
 # of the timestep, the ∂/∂V stamps (cond, cap) aren't needed — only the residual
-# (currents, charges) and the next state. Skipping the CALC_*_JACOBIAN flags and
-# the write_jacobian_* calls roughly halves per-device OSDI work for strongly-
+# (currents, charges) and the next state. Skipping the resistive Jacobian flag and
+# Jacobian-array extraction avoids unnecessary work. The reactive Jacobian flag
+# remains set in ac/tran mode because OpenVAF uses it to select idt equations.
+# Skipping the write_jacobian_* calls roughly halves per-device OSDI work for strongly-
 # nonlinear transients on BSIM4/PSP103-sized models.
 #
 # No custom_jvp is attached: this is for inner-loop use where differentiability

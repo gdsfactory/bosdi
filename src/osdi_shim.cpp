@@ -26,6 +26,7 @@ extern "C" {
     // Phase 1: The loader — version selects the ABI layout in Rust
     ModelMetadata load_osdi_library(const char* path_ptr, uint32_t version);
     ModelMetadata load_osdi_library_at_temperature(const char* path_ptr, uint32_t version, double temperature);
+    ModelMetadata load_osdi_library_with_analysis(const char* path_ptr, uint32_t version, double temperature, uint32_t analysis);
 
     // Diagnostic
     void dump_model_info(uint32_t model_id);
@@ -364,9 +365,9 @@ NB_MODULE(osdi_shim_nb, m) {
         .def_ro("osdi_version", &ModelMetadata::osdi_version)
         .def_ro("success",      &ModelMetadata::success);
 
-    m.def("load_osdi_library", [](const std::string& path, uint32_t version, double temperature) {
-        return load_osdi_library_at_temperature(path.c_str(), version, temperature);
-    }, nb::arg("path"), nb::arg("version") = 4u, nb::arg("temperature") = 300.0);
+    m.def("load_osdi_library", [](const std::string& path, uint32_t version, double temperature, uint32_t analysis) {
+        return load_osdi_library_with_analysis(path.c_str(), version, temperature, analysis);
+    }, nb::arg("path"), nb::arg("version") = 4u, nb::arg("temperature") = 300.0, nb::arg("analysis") = 1u);
 
     m.def("batched_osdi_eval", []() {
         return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET");

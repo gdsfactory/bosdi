@@ -150,6 +150,19 @@ preserves a fixed shape for batches whose instances have different parasitic res
 native paths use the same mapping. Physical currents and charges are stamped into the surviving node; equality rows
 carry no charge.
 
+### Integral operators and analysis modes
+
+`load_osdi_model(..., analysis="dc" | "ac" | "tran")` and `osdi_component(..., analysis=...)` select an immutable
+evaluation mode for a model registration. The default `"ac"` preserves the full current/charge stamp API. DC disables
+reactive evaluation so `idt` uses its explicit initial-value equation. AC and transient enable integration consistently
+in both full and residual-only evaluation. OpenVAF uses `CALC_REACT_JACOBIAN` to select these integral equations, so
+clearing it only for a residual-only call is incorrect.
+
+To reproduce VACASK AC, first solve DC and retain its conductance matrix. Then evaluate the reactive Jacobian in AC mode
+at that operating point and solve `(G_dc + j*omega*C_ac) x = rhs`. A new registration/handle is required to change mode.
+Transient callers must provide a DC-consistent initial point. This does not add general state-history or `$abstime`
+support.
+
 ## Releases
 
 The Git tag is the Python and Pixi package version. No manual version bump is needed. `setuptools-scm` writes

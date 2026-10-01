@@ -376,6 +376,7 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 
 struct LoadedOsdi {
     temperature:             f64,
+    analysis:                u32,
     _lib:                    Library,
     layout:                  AbiLayout,
     pub num_terminals:       u32,
@@ -504,6 +505,18 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
 pub extern "C" fn load_osdi_library_at_temperature(
     path_ptr: *const c_char, version: u32, temperature: f64,
 ) -> ModelMetadata {
+    load_osdi_library_with_analysis(path_ptr, version, temperature, 1)
+}
+
+/// Analysis mode: 0 = DC, 1 = AC, 2 = transient. Immutable per registration.
+#[no_mangle]
+pub extern "C" fn load_osdi_library_with_analysis(
+    path_ptr: *const c_char, version: u32, temperature: f64, analysis: u32,
+) -> ModelMetadata {
+    if analysis > 2 {
+        set_last_error("OSDI: unknown analysis mode".into());
+        return fail();
+    }
     if !temperature.is_finite() || temperature <= 0.0 {
         set_last_error("OSDI: temperature must be finite and positive (kelvin)".into());
         return fail();
@@ -743,6 +756,7 @@ pub extern "C" fn load_osdi_library_at_temperature(
 
     OSDI_REGISTRY.write().unwrap().insert(model_id, LoadedOsdi {
         temperature,
+        analysis,
         _lib: lib,
         layout,
         num_terminals,
@@ -1117,14 +1131,21 @@ fn eval_device_from_setup(
         (inst_data.as_ptr().add(m.node_map_off + i * 4) as *const i32).read_unaligned()
     }).collect();
 
-    let mut flags = 0u32;
+    let mut flags = match m.analysis {
+        0 => 2048 | 32768, // ANALYSIS_DC | ANALYSIS_STATIC
+        1 => 4096 | 32768, // ANALYSIS_AC | ANALYSIS_STATIC
+        _ => 8192,        // ANALYSIS_TRAN
+    };
     if m.num_resist_jac > 0 {
         flags |= m.layout.flag_calc_resist_residual;
         if !residual_only { flags |= m.layout.flag_calc_resist_jacobian; }
     }
-    if m.num_react_jac > 0 {
+    if m.num_react_jac > 0 && m.analysis != 0 {
         flags |= m.layout.flag_calc_react_residual;
-        if !residual_only { flags |= m.layout.flag_calc_react_jacobian; }
+        // OpenVAF uses this flag to select idt's integration equation. Keep
+        // it set for residual-only calls too, or line searches see a different
+        // equation from the full Newton stamp. Skip array extraction below.
+        flags |= m.layout.flag_calc_react_jacobian;
     }
 
     // Voltages indexed by slot (many-to-one collapse preserves terminal values).
@@ -1204,7 +1225,7 @@ fn eval_device_from_setup(
     }
 
     // Reactive extraction
-    if m.num_react_jac > 0 {
+    if m.num_react_jac > 0 && m.analysis != 0 {
         if let Some(lr) = m.load_residual_react {
             scratch.node_buf.clear();
             scratch.node_buf.resize(num_slots, 0.0);
