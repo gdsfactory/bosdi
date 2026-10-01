@@ -179,6 +179,22 @@ history-dependent models, `$abstime`, and enabled voltage limiting still need a 
 `descriptor.with_analysis("dc" | "ac" | "tran")` returns cached immutable registrations preserving the binary path,
 ports, defaults, temperature, and state policy. Circulax uses these registrations to orchestrate native analyses.
 
+### Registration cache lifetime
+
+`load_osdi_model` reuses native registration IDs across newly created descriptors and circuits using a process-local
+`@lru_cache(maxsize=128)`. The key includes canonical binary path, filesystem identity/size/timestamps, ABI, temperature
+and analysis mode. Concurrent misses are serialized. Callers receive independent metadata copies; port names and
+model-card defaults remain descriptor-local. Failed loads are not cached.
+
+This bounds Python cache entries, not the native registry: native IDs remain alive for existing circuits and JIT
+executables until the process exits. Rebuild binaries under new/content-addressed paths (as Circulax's compilation cache
+does); replacing a live shared-library file in place is not a supported reload strategy. Native IDs and batch handles
+cannot be persisted across processes; compiled binary artifacts can.
+
+Batch setup handles remain circuit-owned because they carry instance parameters and expose `free()`. A global LRU of
+those mutable handles would require shared ownership and invalidation before it could safely be introduced. The
+per-descriptor/per-circuit analysis caches have only three valid modes and retain their local lifetime.
+
 ## Releases
 
 The Git tag is the Python and Pixi package version. No manual version bump is needed. `setuptools-scm` writes

@@ -1,10 +1,14 @@
 import os
 import math
+from copy import deepcopy
+from functools import lru_cache
+from threading import RLock
 from dataclasses import dataclass, field
 import jax.numpy as jnp
 import osdi_shim_nb
 
 _VERSION_MAP = {"0.4": 4, "0.5": 5}
+_REGISTRATION_LOCK = RLock()
 
 # OsdiParamOpvar flag bit decoding (from OSDI 0.4 header).
 _PARA_KIND_MASK = 0xC0000000  # bits 30..31
@@ -87,6 +91,11 @@ def load_osdi_model(
     """
     Load an OpenVAF-compiled .osdi binary and register it for JAX evaluation.
 
+    Equivalent calls share a process-local native ID through a bounded LRU.
+    Returned metadata is independent. Canonical path, file identity, ABI,
+    temperature and analysis mode define the cache key. Native IDs remain
+    registered for the process lifetime, including after Python cache eviction.
+
     Args:
         osdi_filepath: Path to the .osdi ELF binary.
         version:       OSDI standard version to use ("0.4" or "0.5").
@@ -94,7 +103,7 @@ def load_osdi_model(
                        ac retains the full current/charge stamp API. dc disables
                        integration to impose idt initial-value equations.
         temperature:   Immutable setup temperature in kelvin for this model id.
-                       Load a new model id to change temperature; parameter
+                       Changing temperature selects a separate model id; parameter
                        updates and cached handles retain this value.
     """
     modes = {"dc": 0, "ac": 1, "tran": 2}
@@ -112,14 +121,42 @@ def load_osdi_model(
     if not os.path.exists(osdi_filepath):
         raise FileNotFoundError(f"OSDI binary not found at {osdi_filepath}")
 
+    path = os.path.realpath(osdi_filepath)
+    stat = os.stat(path)
+    identity = (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    # Serialize misses as well as hits: lru_cache alone permits duplicate work
+    # when two threads concurrently request the same uncached registration.
+    with _REGISTRATION_LOCK:
+        model = _load_registration(path, identity, version, temperature, analysis)
+        # Metadata is mutable for compatibility. Never expose the cached object.
+        return deepcopy(model)
+
+
+@lru_cache(maxsize=128)
+def _load_registration(
+    path: str,
+    identity: tuple[int, ...],
+    version: str,
+    temperature: float,
+    analysis: str,
+) -> OsdiModel:
+    """Cache native registration IDs across descriptor and circuit lifetimes."""
+    version_int = _VERSION_MAP[version]
+    modes = {"dc": 0, "ac": 1, "tran": 2}
     meta = osdi_shim_nb.load_osdi_library(
-        osdi_filepath, version_int, temperature, modes[analysis]
+        path, version_int, temperature, modes[analysis]
     )
 
     if not meta.success:
         detail = osdi_shim_nb.get_last_error()
         raise RuntimeError(
-            f"Failed to load OSDI binary '{osdi_filepath}' as OSDI {version}. "
+            f"Failed to load OSDI binary '{path}' as OSDI {version}. "
             f"{detail or 'Ensure it is a valid OpenVAF compiled .osdi file.'}"
         )
 
@@ -128,7 +165,7 @@ def load_osdi_model(
         id=mid,
         temperature=temperature,
         analysis=analysis,
-        path=os.path.abspath(osdi_filepath),
+        path=path,
         num_pins=meta.num_pins,
         num_nodes=meta.num_nodes,
         num_params=meta.num_params,

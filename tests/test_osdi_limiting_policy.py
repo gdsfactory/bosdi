@@ -125,3 +125,34 @@ def test_parameter_updates_use_uncached_evaluation_under_jit(limiting_binary):
         [0.001, 0.0005],
         atol=1e-15,
     )
+
+
+def test_fresh_descriptors_share_registration_not_defaults(limiting_binary):
+    first = osdi_component(
+        str(limiting_binary),
+        ("p", "n"),
+        default_params={"r": 2000},
+        state_policy="limiting_only",
+        analysis="dc",
+    )
+    second = osdi_component(
+        str(limiting_binary),
+        ("p", "n"),
+        default_params={"r": 4000},
+        state_policy="limiting_only",
+        analysis="dc",
+    )
+    assert first.model.id == second.model.id
+    assert first.model is not second.model
+    assert first.default_params["r"] == 2000
+    assert second.default_params["r"] == 4000
+    assert first.with_analysis("ac").model.id == second.with_analysis("ac").model.id
+    for descriptor, expected in [(first, 0.0005), (second, 0.00025)]:
+        model = descriptor.model
+        params = jnp.array(
+            [[descriptor.default_params[name] for name in model.param_names]]
+        )
+        current = osdi_eval(
+            model.id, jnp.array([[1.0, 0.0]]), params, jnp.zeros((1, model.num_states))
+        )[0]
+        assert float(current[0, 0]) == pytest.approx(expected)
