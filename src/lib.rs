@@ -665,10 +665,14 @@ pub extern "C" fn load_osdi_library_at_temperature(
 
     // Retain raw node slots: collapse depends on instance parameters, while
     // JAX batch shapes must remain identical for every instance of a module.
-    let num_slots = num_nodes as usize;
-    let num_all_nodes = num_slots;
+    // The extra private slot is global ground. OSDI load_residual() indexes
+    // its destination with node_map entries, so UINT32_MAX/-1 cannot be put
+    // into the runtime map (that would write outside the scratch buffer).
+    let num_all_nodes = num_nodes as usize;
+    let num_slots = num_all_nodes + 1;
     let node_map: Vec<i32> = (0..num_nodes as i32).collect();
-    let slot_to_out = node_map.clone();
+    let mut slot_to_out = node_map.clone();
+    slot_to_out.push(-1);
     let resistive_mask: Vec<bool> = {
         let mut mask = vec![false; num_all_nodes];
         for &(n1, _) in &resist_jac_pairs {
@@ -793,20 +797,25 @@ fn compute_collapse_topology(
 ) -> (Vec<i32>, Vec<i32>, usize, usize) {
     let mut nm: Vec<i32> = (0..num_nodes as i32).collect();
     for &(n1, n2) in collapsible_pairs {
-        let (n1, n2) = (n1 as usize, n2 as usize);
-        if n1 >= num_nodes || n2 >= num_nodes { continue; }
-        let s1 = nm[n1]; let s2 = nm[n2];
+        // OSDI uses UINT32_MAX for global ground, including inactive
+        // branch-current unknowns. Preserve -1 in the instance node map.
+        let slot = |node: u32| {
+            if node == u32::MAX { Some(-1) }
+            else { nm.get(node as usize).copied() }
+        };
+        let (Some(s1), Some(s2)) = (slot(n1), slot(n2)) else { continue; };
         let merged = s1.min(s2); let higher = s1.max(s2);
         for s in nm.iter_mut() { if *s == higher { *s = merged; } }
     }
-    let num_slots = nm.iter().map(|&s| s as usize + 1).max().unwrap_or(num_terminals);
+    let num_slots = nm.iter().filter(|&&s| s >= 0)
+        .map(|&s| s as usize + 1).max().unwrap_or(num_terminals);
 
     let mut slot_occupied = vec![false; num_slots];
-    for &s in &nm { slot_occupied[s as usize] = true; }
+    for &s in &nm { if s >= 0 { slot_occupied[s as usize] = true; } }
 
     let mut slot_to_out = vec![-1i32; num_slots];
     for t in 0..num_terminals {
-        slot_to_out[nm[t] as usize] = t as i32;
+        if nm[t] >= 0 { slot_to_out[nm[t] as usize] = t as i32; }
     }
     let mut next_out = num_terminals;
     for slot in 0..num_slots {
@@ -1079,7 +1088,8 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     );
     for (i, &slot) in node_map.iter().enumerate() {
         unsafe {
-            *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) = slot;
+            *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) =
+                if slot < 0 { m.num_all_nodes as i32 } else { slot };
         }
     }
 }
@@ -1229,7 +1239,13 @@ fn eval_device_from_setup(
     // slots carry equality equations; physical KCL/charge stamps go to the
     // surviving node. These constraints also cover residual-only evaluation.
     for (node, &survivor) in node_map.iter().enumerate() {
-        if survivor >= 0 && survivor as usize != node {
+        if survivor as usize == num_all_nodes {
+            cur[node] = vol[node];
+            chg[node] = 0.0;
+            if !residual_only {
+                cond[node * num_all_nodes + node] = 1.0;
+            }
+        } else if survivor as usize != node {
             let survivor = survivor as usize;
             cur[node] = vol[node] - vol[survivor];
             chg[node] = 0.0;
