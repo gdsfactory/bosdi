@@ -1,0 +1,3 @@
+[submodule "tests/pdks/ihp"]
+	path = tests/pdks/ihp
+	url = https://github.com/gdsfactory/IHP.git

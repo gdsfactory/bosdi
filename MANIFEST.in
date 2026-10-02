@@ -2,3 +2,6 @@ include Cargo.toml
 include Cargo.lock
 recursive-include src *.rs
 recursive-include _nanobind_src *
+
+# Upstream PDK checkout is a test dependency, not package contents.
+prune tests/pdks

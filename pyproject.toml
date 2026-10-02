@@ -131,8 +131,17 @@ python = "3.14.*"
 
 # Temporary integration pin for the public native analysis/settings API in #64.
 # No verilog-a extra: tests must use this bosdi checkout, not a second installation.
+# The test-only VACASK wheels require these minimum runtime platforms.
+[tool.pixi.feature.integration.system-requirements]
+macos = "14.0"
+libc = { family = "glibc", version = "2.34" }
+
 [tool.pixi.feature.integration.pypi-dependencies]
-circulax = { git = "https://github.com/gdsfactory/circulax.git", rev = "2f45d0980681a40904b5a658bdc5754d0e67ddb3" }
+# Newer VACASK builds use OSDI 0.5; this native bridge currently targets 0.4.
+vacask-bin = "==0.3.3.dev2"
+circulax = { git = "https://github.com/gdsfactory/circulax.git", rev = "2f45d0980681a40904b5a658bdc5754d0e67ddb3", extras = [
+  "netlists"
+] }
 
 [tool.pixi.feature.integration.tasks]
 test-integration = { cmd = "pytest tests/integration tests/test_branch_state_names.py -v", depends-on = [
@@ -160,6 +169,8 @@ install-openvaf = "cargo install --git https://github.com/cdaunt/OpenVAF openvaf
 
 # --- PYTEST CONFIGURATION ---
 [tool.pytest.ini_options]
+# The pinned PDK is test data; its own layout/package tests belong upstream.
+norecursedirs = ["pdks", ".*", "build", "dist"]
 # This tells pytest to always add your 'src' folder to the Python path
 pythonpath = ["src"]
 # Optional: explicitly tell it where your tests live
