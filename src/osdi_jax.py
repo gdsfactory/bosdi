@@ -159,8 +159,14 @@ evaluation produces exactly one FFI crossing regardless of batch size.
 # Skipping the write_jacobian_* calls roughly halves per-device OSDI work for strongly-
 # nonlinear transients on BSIM4/PSP103-sized models.
 #
-# No custom_jvp is attached: this is for inner-loop use where differentiability
-# through OSDI isn't needed (the Jacobian is cached from a prior full eval).
+# A custom_jvp IS attached (below), mirroring osdi_eval's: solvers that need
+# the Jacobian only for autodiff (e.g. Harmonic Balance's jax.jacobian(_res))
+# route through this residual-only entry point too, so it must stay
+# differentiable even though its own FFI call never returns cond/cap. The
+# JVP rule recovers G/C by calling the full eval (osdi_eval) only when a
+# tangent is actually requested — the frozen-Jacobian Newton inner loop
+# (transient.py), which never differentiates through this call, pays none
+# of that extra cost.
 
 jffi.register_ffi_target(
     "OsdiResidualEvalCpu",
@@ -190,10 +196,10 @@ def _osdi_residual_eval_impl(model_id, voltages, params, old_state):
     )
 
 
-osdi_residual_eval = jax.custom_batching.custom_vmap(_osdi_residual_eval_impl)
+_osdi_residual_eval_vmap = jax.custom_batching.custom_vmap(_osdi_residual_eval_impl)
 
 
-@osdi_residual_eval.def_vmap
+@_osdi_residual_eval_vmap.def_vmap
 def _osdi_residual_eval_vmap_rule(
     axis_size, in_batched, model_id, voltages, params, old_state
 ):
@@ -228,9 +234,34 @@ def _osdi_residual_eval_vmap_rule(
     return (cur, chg, new_s), (True, True, True)
 
 
+osdi_residual_eval = jax.custom_jvp(_osdi_residual_eval_vmap, nondiff_argnums=(0,))
+
+
+@osdi_residual_eval.defjvp
+def _osdi_residual_eval_jvp_rule(model_id, primals, tangents):
+    v, p, s = primals
+    t_v, t_p, t_s = tangents
+
+    currents, charges, new_state = _osdi_residual_eval_vmap(model_id, v, p, s)
+
+    # The residual-only FFI never computes G/C; recover them from the full
+    # eval (already differentiable) purely to build this JVP's tangents.
+    _, conductances, _, capacitances, _ = osdi_eval(model_id, v, p, s)
+
+    num_devices, num_nodes = v.shape
+    g_matrix = conductances.reshape((num_devices, num_nodes, num_nodes))
+    c_matrix = capacitances.reshape((num_devices, num_nodes, num_nodes))
+
+    t_currents = jnp.einsum("nij,nj->ni", g_matrix, t_v)
+    t_charges = jnp.einsum("nij,nj->ni", c_matrix, t_v)
+    t_new_state = jnp.zeros_like(new_state)
+
+    return (currents, charges, new_state), (t_currents, t_charges, t_new_state)
+
+
 osdi_residual_eval.__doc__ = """
 Residual-only OSDI evaluator: returns ``(currents, charges, new_state)`` and
-skips the conductance/capacitance Jacobian pass.
+skips the conductance/capacitance Jacobian pass in its own FFI call.
 
 Use inside Newton inner iterations where the Jacobian stamp from the first
 iter of the timestep is being reused. Cuts per-device OSDI work roughly in
@@ -238,8 +269,11 @@ half for Jacobian-heavy models (BSIM4, PSP103, PSP, HiSIM, …).
 
 Shape contract and vmap semantics match ``osdi_eval``: ``voltages`` is
 ``(N_dev, model.num_nodes)`` and ``jax.vmap`` collapses the replica axis into
-the device axis (one FFI crossing per call). No ``custom_jvp`` is attached —
-this path is not intended for autodiff.
+the device axis (one FFI crossing per call). A ``custom_jvp`` is attached so
+solvers that differentiate through this entry point for the Jacobian itself
+(e.g. Harmonic Balance's ``jax.jacobian`` over the residual) still work; the
+rule falls back to ``osdi_eval`` to recover G/C only when a tangent is
+actually requested, so the primal-only fast path pays no extra cost.
 """
 
 
@@ -427,6 +461,9 @@ def _osdi_residual_eval_handle_impl(handle_id, voltages, old_state):
 _osdi_residual_eval_handle_vmap = jax.custom_batching.custom_vmap(
     _osdi_residual_eval_handle_impl
 )
+# A custom_jvp is layered on top below (same rationale as osdi_residual_eval
+# above): HB's Newton Jacobian comes from autodiff through this entry point
+# even though it's the handle-based "skip the Jacobian pass" fast path.
 
 
 @_osdi_residual_eval_handle_vmap.def_vmap
@@ -460,11 +497,43 @@ def _osdi_residual_eval_handle_vmap_rule(
     ), (True, True, True)
 
 
+_osdi_residual_eval_handle_jvp = jax.custom_jvp(
+    _osdi_residual_eval_handle_vmap, nondiff_argnums=(0,)
+)
+
+
+@_osdi_residual_eval_handle_jvp.defjvp
+def _osdi_residual_eval_handle_jvp_rule(handle_id, primals, tangents):
+    v, s = primals
+    t_v, t_s = tangents
+
+    currents, charges, new_state = _osdi_residual_eval_handle_vmap(handle_id, v, s)
+
+    # Recover G/C via the full handle eval (differentiable primal-only call);
+    # this only runs when a tangent is actually requested.
+    _, conductances, _, capacitances, _ = _osdi_eval_handle_vmap(handle_id, v, s)
+
+    num_devices, num_nodes = v.shape
+    g_matrix = conductances.reshape((num_devices, num_nodes, num_nodes))
+    c_matrix = capacitances.reshape((num_devices, num_nodes, num_nodes))
+
+    t_currents = jnp.einsum("nij,nj->ni", g_matrix, t_v)
+    t_charges = jnp.einsum("nij,nj->ni", c_matrix, t_v)
+    t_new_state = jnp.zeros_like(new_state)
+
+    return (currents, charges, new_state), (t_currents, t_charges, t_new_state)
+
+
 def osdi_residual_eval_with_handle(handle, voltages, old_state):
     """Residual-only OSDI eval reusing a pre-setup handle. Skips both
-    setup_instance AND the Jacobian pass — the leanest path available and
-    the intended entry point for Newton inner iters with a frozen stamp.
+    setup_instance AND the Jacobian pass in its own FFI call — the leanest
+    path available, intended for Newton inner iters with a frozen stamp.
+
+    A ``custom_jvp`` is attached (falling back to ``osdi_eval_with_handle``
+    to recover G/C only when a tangent is requested) so solvers that
+    differentiate through this entry point for the Jacobian itself — e.g.
+    Harmonic Balance's ``jax.jacobian`` over the residual — still work.
     """
     if not handle._alive:
         raise RuntimeError("osdi_residual_eval_with_handle: handle has been freed.")
-    return _osdi_residual_eval_handle_vmap(handle.handle_id, voltages, old_state)
+    return _osdi_residual_eval_handle_jvp(handle.handle_id, voltages, old_state)

@@ -256,6 +256,94 @@ def test_capacitor_jax_jvp(capacitor_model):
     )
 
 
+def test_resistor_residual_eval_jax_jvp(resistor_model):
+    """``osdi_residual_eval`` has no Jacobian of its own (its FFI call never
+    returns cond/cap) but circulax's Harmonic Balance solver differentiates
+    through it anyway via ``jax.jacobian`` on the residual. Its custom_jvp
+    must recover the same gradient as the full ``osdi_eval`` path.
+    """
+    voltages = jnp.array([[2.0, 0.0]], dtype=jnp.float64)
+    params = jnp.array([[1.0, 100.0]], dtype=jnp.float64)
+    old_state = jnp.empty((1, 0), dtype=jnp.float64)
+
+    def pin_A_current(v):
+        cur, _, _ = osdi_residual_eval(resistor_model.id, v, params, old_state)
+        return cur[0, 0]
+
+    gradient = jax.grad(pin_A_current)(voltages)
+    expected_gradient = np.array([[0.01, -0.01]])
+
+    np.testing.assert_allclose(
+        gradient,
+        expected_gradient,
+        rtol=1e-6,
+        err_msg="osdi_residual_eval's JVP did not match osdi_eval's analytical Jacobian",
+    )
+
+
+def test_resistor_residual_eval_with_handle_jax_jvp(resistor_model):
+    """Same as above, through the Tier-3 handle-based residual entry point
+    (``osdi_residual_eval_with_handle``), which is what HB hits by default
+    once a group has a pre-baked handle.
+    """
+    voltages = jnp.array([[2.0, 0.0]], dtype=jnp.float64)
+    params = jnp.array([[1.0, 100.0]], dtype=jnp.float64)
+    old_state = jnp.empty((1, 0), dtype=jnp.float64)
+
+    handle = osdi_setup_batch(resistor_model.id, params)
+
+    def pin_A_current(v):
+        cur, _, _ = osdi_residual_eval_with_handle(handle, v, old_state)
+        return cur[0, 0]
+
+    gradient = jax.grad(pin_A_current)(voltages)
+    expected_gradient = np.array([[0.01, -0.01]])
+
+    np.testing.assert_allclose(
+        gradient,
+        expected_gradient,
+        rtol=1e-6,
+        err_msg="osdi_residual_eval_with_handle's JVP did not match the analytical Jacobian",
+    )
+
+
+def test_capacitor_residual_eval_jax_jvp(capacitor_model):
+    """Charge-side counterpart of ``test_resistor_residual_eval_jax_jvp``,
+    through both the handle and non-handle residual-only entry points.
+    """
+    C = 1e-12
+    voltages = jnp.array([[1.0, 0.0]], dtype=jnp.float64)
+    params = jnp.array([[1.0, C, 1.0]], dtype=jnp.float64)
+    old_state = jnp.empty((1, 0), dtype=jnp.float64)
+
+    def pin_P_charge(v):
+        _, chg, _ = osdi_residual_eval(capacitor_model.id, v, params, old_state)
+        return chg[0, 0]
+
+    gradient = jax.grad(pin_P_charge)(voltages)
+    expected = np.array([[C, -C]])
+    np.testing.assert_allclose(
+        gradient,
+        expected,
+        rtol=1e-6,
+        err_msg="osdi_residual_eval's JVP did not pipe OSDI capacitance Jacobians",
+    )
+
+    handle = osdi_setup_batch(capacitor_model.id, params)
+
+    def pin_P_charge_handle(v):
+        _, chg, _ = osdi_residual_eval_with_handle(handle, v, old_state)
+        return chg[0, 0]
+
+    gradient_handle = jax.grad(pin_P_charge_handle)(voltages)
+    np.testing.assert_allclose(
+        gradient_handle,
+        expected,
+        rtol=1e-6,
+        err_msg="osdi_residual_eval_with_handle's JVP did not pipe OSDI capacitance Jacobians",
+    )
+
+
 def test_resistor_jit(resistor_model):
     """
     Verify that osdi_eval can be compiled by jax.jit and produces correct results.
