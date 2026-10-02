@@ -65,3 +65,20 @@ def test_missing_sdist_rejected(tmp_path):
     next(tmp_path.glob("*.tar.gz")).unlink()
     with pytest.raises(ValueError, match="both wheels and an sdist"):
         release.validate_dist(tmp_path, Version("0.1.8"))
+
+
+@pytest.mark.parametrize(
+    "entry", ["tests/compiled_osdi/spice_mos6.o1", "tests/pdks/ihp/model.va"]
+)
+def test_generated_or_external_test_artifacts_rejected(tmp_path, entry):
+    distributions(tmp_path)
+    path = next(tmp_path.glob("*.tar.gz"))
+    with tarfile.open(path) as archive:
+        metadata = archive.extractfile("bosdi-0.1.8/PKG-INFO").read()
+    with tarfile.open(path, "w:gz") as archive:
+        for name, content in [("PKG-INFO", metadata), (entry, b"generated")]:
+            member = tarfile.TarInfo(f"bosdi-0.1.8/{name}")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    with pytest.raises(ValueError, match="Generated or external"):
+        release.validate_dist(tmp_path, Version("0.1.8"))

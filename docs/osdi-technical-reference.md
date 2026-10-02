@@ -29,7 +29,7 @@ p = p.at[0, name_to_idx["toxe"]].set(1.85e-9)         # oxide thickness
 p = p.at[0, name_to_idx["ndep"]].set(2.54e18)         # channel doping
 ```
 
-Bosdi can write REAL and INT params through the f64 array (INT is rounded from the float); STR parameters (like BSIM4's
+Bosdi can write REAL and INT params through the f64 array (INT is truncated toward zero); STR parameters (like BSIM4's
 `version="4.8.2"`) are skipped — the model must provide a default for them or be compiled without them as required.
 
 `tests/fixtures/bsim4v82_nmos.json` ships a 213-param BSIM4 NMOS 60 nm card ported from VACASK's
@@ -40,26 +40,32 @@ Bosdi can write REAL and INT params through the f64 array (INT is rounded from t
 `OsdiModel` carries the structural data bosdi decoded from the OSDI descriptor, useful for building Jacobian stamps or
 validating a model before wiring it into a solver:
 
-| Field                              | Meaning                                                                                              |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `num_pins`                         | Number of external terminals                                                                         |
-| `num_nodes`                        | Total unknowns = terminals + internal Kirchhoff nodes + branch-current aux                           |
-| `num_states`                       | Stateful-model limiter state count (non-zero → bosdi skips eval, for now)                            |
-| `num_resist_jac` / `num_react_jac` | Count of Jacobian entries with the variable RESIST / REACT flag                                      |
-| `resist_jac_pairs`                 | `List[(node_1, node_2)]` — raw OSDI indices of each resistive Jacobian entry                         |
-| `react_jac_pairs`                  | `List[(node_1, node_2)]` — same for reactive (dQ/dV)                                                 |
-| `collapsible_pairs`                | `List[(node_1, node_2)]` — internal nodes that collapse onto terminals when a coupling param is zero |
-| `resistive_mask`                   | `List[bool]` of length `num_nodes` — `True` iff that unknown's row can be non-zero at DC             |
-| `param_names`                      | Canonical alias-0 name per param, in OSDI index order                                                |
-| `param_flags`                      | Raw `OsdiParamOpvar.flags` per param (kind/type bits)                                                |
-| `.param_kinds()`                   | Decoded `["INST", "MODEL", "OPVAR", ...]`                                                            |
-| `.param_types()`                   | Decoded `["REAL", "INT", "STR", ...]`                                                                |
+| Field                              | Meaning                                                                                      |
+| ---------------------------------- | -------------------------------------------------------------------------------------------- |
+| `num_pins`                         | Number of external terminals                                                                 |
+| `num_nodes`                        | Total unknowns = terminals + internal Kirchhoff nodes + branch-current aux                   |
+| `num_states`                       | OSDI state-slot count; general history is unsupported (see below)                            |
+| `num_resist_jac` / `num_react_jac` | Count of Jacobian entries with the variable RESIST / REACT flag                              |
+| `resist_jac_pairs`                 | `List[(node_1, node_2)]` — raw OSDI indices of each resistive Jacobian entry                 |
+| `react_jac_pairs`                  | `List[(node_1, node_2)]` — same for reactive (dQ/dV)                                         |
+| `collapsible_pairs`                | `List[(node_1, node_2)]` — candidate node pairs; setup selects active collapses per instance |
+| `resistive_mask`                   | `List[bool]` of length `num_nodes` — `True` iff that unknown's row can be non-zero at DC     |
+| `param_names`                      | Canonical alias-0 name per param, in OSDI index order                                        |
+| `param_flags`                      | Raw `OsdiParamOpvar.flags` per param (kind/type bits)                                        |
+| `.param_kinds()`                   | Decoded `["INST", "MODEL", "OPVAR", ...]`                                                    |
+| `.param_types()`                   | Decoded `["REAL", "INT", "STR", ...]`                                                        |
 
-Indices in `*_jac_pairs` are **raw OSDI node indices** (pre-collapse, 0..num_raw_nodes). After bosdi applies
-`collapsible_pairs`, the resulting `num_nodes`-wide output rows are mapped through an internal `node_map` before the
-scatter. Structural tests should assert against `resist_jac_pairs`/`react_jac_pairs`; callers that want to stamp the
-Jacobian into their host system's matrix should use the `cond`/`cap` outputs, which already run through the collapse and
-are shaped `num_nodes × num_nodes`.
+Indices in `*_jac_pairs` are **raw OSDI node indices** (pre-collapse, 0..num_raw_nodes). After setup selects active
+pairs from `collapsible_pairs`, the resulting `num_nodes`-wide output rows are mapped through an internal `node_map`
+before the scatter. Structural tests should assert against `resist_jac_pairs`/`react_jac_pairs`; callers that want to
+stamp the Jacobian into their host system's matrix should use the `cond`/`cap` outputs, which already run through the
+collapse and are shaped `num_nodes × num_nodes`.
+
+Models with nonzero `num_states` are rejected by the native component adapter by default. The explicit
+`state_policy="limiting_only"` option permits audited models whose slots are used only by `$limit`. Native evaluation
+disables OSDI limiting, so these slots do not require solver history. This option does not provide general hidden-state
+history, `$abstime`, or harmonic-balance support. Charge unknowns in the circuit equations are distinct from OSDI state
+slots and remain part of the circuit state.
 
 ## Outputs
 
