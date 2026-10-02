@@ -80,6 +80,12 @@ class OsdiComponentGroup(eqx.Module):
     is_fdomain: bool = eqx.field(static=True, default=False)
     amplitude_param: str = eqx.field(static=True, default="")
 
+    # OSDI devices never carry circulax's fixed time-delay feature (see
+    # circulax.compiler.ComponentGroup.has_delay); this mirrors that field so
+    # circulax solver code that reads it uniformly across group types (e.g.
+    # the SP/AC-sweep assembly path) doesn't need an OSDI-specific branch.
+    has_delay: bool = eqx.field(static=True, default=False)
+
     # Experimental: use bosdi.osdi_debug.schur_reduce to eliminate internal
     # nodes from the per-device stamp before handing it to global Newton.
     # When True, the assembly pads the reduced 4x4 stamp back to num_nodes with
