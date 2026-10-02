@@ -107,7 +107,8 @@ pip install bosdi
 ```bash
 pixi run build   # compile Rust static lib + C++ extension
 pixi run test    # standalone pytest suite; Circulax is not required
-pixi run --locked -e integration test-integration  # build and test with Circulax
+git submodule update --init tests/pdks/ihp        # pinned IHP device libraries
+pixi run --locked -e integration test-integration  # build and test with Circulax + IHP
 
 # single test
 pixi run pytest tests/test_osdi.py::test_resistor_dc_evaluation -v
@@ -117,8 +118,21 @@ The `integration` environment has its own solve group and includes Circulax only
 native extension before running public DC/AC/transient, simulator-settings and generated-component checks. Both Linux
 and Windows CI run it alongside the standalone suite. Circulax is temporarily pinned to the immutable integration commit
 for PR #64; replace that pin with an upstream release once the required public native APIs are released. No Circulax
-extra is requested, so tests use this checkout's bosdi rather than installing a second copy. OpenVAF must be on PATH;
-JSON lowering tests additionally need the custom compiler's dump support.
+Verilog-A extra is requested, so tests use this checkout's bosdi rather than installing a second copy. The netlists
+extra provides its model-card parser. OpenVAF must be on PATH; JSON lowering tests additionally need the custom
+compiler's dump support.
+
+The IHP integration suite uses the pinned `gdsfactory/IHP` submodule in `tests/pdks/ihp`, rather than copied model
+fixtures. It enumerates all 34 SG13G2 VACASK subcircuits and checks compiled, JIT-executed DC and small-signal responses
+at 1 MHz and 1 GHz against VACASK. Updating the submodule adds a failing catalogue check if new devices need test cases.
+VACASK is pinned to an OSDI 0.4-compatible build and is a test-only dependency.
+
+These are typical-corner device checks at explicit sizes and biases, not complete process qualification. The test
+harness hoists repeated common includes, grounds implicit BJT substrate terminals, and folds varactor voltage terms only
+after verifying their coefficients are zero. Isolation diodes use a nonzero well spacing to avoid an upstream `ln(0)`
+expression; the wrapper forwards public geometry parameters while child cards recompute private derived values. The
+upstream checkout stays unchanged, and these parser adaptations do not imply support for arbitrary voltage-dependent
+model-card expressions. The test-only PDK is excluded from source packages.
 
 ## OSDI outputs
 
