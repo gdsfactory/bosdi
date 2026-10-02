@@ -11,8 +11,10 @@ Requires the ``bosdi`` package to be installed (``osdi_loader`` must be importab
 """
 
 import difflib
+from collections.abc import Mapping
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 
 try:
@@ -35,8 +37,9 @@ class OsdiComponentGroup(eqx.Module):
     and uses the analytical Jacobians (conductances/capacitances) that the
     OSDI model returns directly — no ``jax.jacfwd`` required.
 
-    Internal OSDI nodes (e.g. PSP103's ``di``, ``si``) that are not collapsed
-    onto a terminal are allocated as extra unknowns in the global state vector,
+    All raw internal OSDI nodes (e.g. PSP103's ``di``, ``si``) are allocated
+    as extra unknowns in the global state vector. Setup-selected collapses
+    use equality constraints in these slots,
     exactly like VoltageSource's ``i_src``.  ``num_nodes`` covers all of them;
     ``num_pins`` is the external terminal count only.
 
@@ -50,7 +53,9 @@ class OsdiComponentGroup(eqx.Module):
     name: str = eqx.field(static=True)
     model_id: int = eqx.field(static=True)  # bosdi registry ID — not differentiable
     num_pins: int = eqx.field(static=True)  # external terminals only
-    num_nodes: int = eqx.field(static=True)  # terminals + non-collapsed internal nodes
+    num_nodes: int = eqx.field(
+        static=True
+    )  # terminals + all raw internal/auxiliary nodes
     num_params: int = eqx.field(static=True)
     num_states: int = eqx.field(static=True)
 
@@ -143,7 +148,10 @@ class OsdiComponentGroup(eqx.Module):
         try:
             from osdi_jax import osdi_setup_batch
 
-            new_handle = osdi_setup_batch(self.model_id, _np.asarray(new_params))
+            # Traced updates use the uncached FFI path; setup cannot consume
+            # a tracer as a host NumPy array. Eager updates retain cached setup.
+            if not isinstance(new_params, jax.core.Tracer):
+                new_handle = osdi_setup_batch(self.model_id, _np.asarray(new_params))
         except ImportError:
             pass  # older bosdi without Tier-3; legacy path still works
         return OsdiComponentGroup(
@@ -194,11 +202,15 @@ class OsdiModelDescriptor:
         param_names: tuple | None,
         default_params: dict,
         use_schur_reduction: bool = False,
+        *,
+        state_policy: str = "reject",
     ) -> None:
         self.model = model
         self.ports = ports
         self.states: tuple = ()
         self.use_schur_reduction = use_schur_reduction
+        self.state_policy = state_policy
+        self._analysis_variants = {}
 
         if param_names is None:
             self.param_names = tuple(model.param_names)
@@ -213,6 +225,44 @@ class OsdiModelDescriptor:
 
         self.default_params = self._canonicalise(
             default_params, source="default_params"
+        )
+
+    def with_analysis(self, analysis: str) -> "OsdiModelDescriptor":
+        """Return a cached immutable registration, preserving all model defaults."""
+        if analysis == self.model.analysis:
+            return self
+        if analysis not in self._analysis_variants:
+            if not self.model.path:
+                raise ValueError(
+                    "Changing OSDI analysis requires the binary source path"
+                )
+            self._analysis_variants[analysis] = osdi_component(
+                self.model.path,
+                self.ports,
+                param_names=None if self.is_canonical else self.param_names,
+                default_params=self.default_params.copy(),
+                use_schur_reduction=self.use_schur_reduction,
+                temperature=self.model.temperature,
+                analysis=analysis,
+                state_policy=self.state_policy,
+                simparams=dict(self.model.simparams),
+            )
+        return self._analysis_variants[analysis]
+
+    def with_simparams(self, simparams: Mapping[str, float]) -> "OsdiModelDescriptor":
+        """Return a registration with simulator overrides; never mutate this descriptor."""
+        settings = dict(self.model.simparams)
+        settings.update(simparams)
+        return osdi_component(
+            self.model.path,
+            self.ports,
+            param_names=None if self.is_canonical else self.param_names,
+            default_params=self.default_params.copy(),
+            use_schur_reduction=self.use_schur_reduction,
+            temperature=self.model.temperature,
+            analysis=self.model.analysis,
+            state_policy=self.state_policy,
+            simparams=settings,
         )
 
     def _canonicalise(self, d: dict, *, source: str) -> dict:
@@ -258,6 +308,11 @@ def osdi_component(
     param_names: tuple | None = None,
     default_params: dict | None = None,
     use_schur_reduction: bool = False,
+    *,
+    temperature: float = 300.0,
+    analysis: str = "ac",
+    state_policy: str = "reject",
+    simparams: Mapping[str, float] | None = None,
 ) -> OsdiModelDescriptor:
     """Load a compiled ``.osdi`` binary and return a descriptor for ``compile_netlist``.
 
@@ -274,6 +329,20 @@ def osdi_component(
         use_schur_reduction: Eliminate OSDI internal nodes via Schur complement
                         before global Newton (experimental).
 
+        analysis: Immutable native evaluation mode (dc, ac, or tran). Default
+                  ac preserves the full current/charge stamp API.
+        temperature: Setup temperature in kelvin, retained across parameter
+                     updates and both cached/uncached evaluation paths.
+        simparams: Numeric simulator settings queried through $simparam, e.g.
+                   {"scale": 2.0, "tnom": 27.0}. These are separate from device
+                   parameters, copied at registration, and retained by DC/AC/tran
+                   variants and parameter updates. Names are case-sensitive.
+                   This does not configure the circuit solver's own tolerances.
+        state_policy: "reject" (default) guards models declaring state slots.
+                      "limiting_only" explicitly asserts the binary's slots are
+                      OpenVAF voltage-limiting buffers. ENABLE_LIM stays disabled;
+                      these buffers are not physical history or circuit unknowns.
+
     Returns:
         :class:`OsdiModelDescriptor` — pass this as a value in the
         ``models_map`` argument of :func:`~circulax.compiler.compile_netlist`.
@@ -281,7 +350,7 @@ def osdi_component(
     Raises:
         ImportError: If ``bosdi`` runtime (``osdi_loader``) is not available.
         ValueError:  If port/param counts don't match the OSDI binary.
-        NotImplementedError: If the model has internal state variables.
+        NotImplementedError: If the model declares ABI state slots and the policy is reject.
 
     Example::
 
@@ -297,7 +366,11 @@ def osdi_component(
             "not be imported. Install circulax[verilog-a] to get OSDI support."
         ) from _BOSDI_ERR
 
-    model = load_osdi_model(osdi_path)
+    if state_policy not in {"reject", "limiting_only"}:
+        raise ValueError("state_policy must be reject or limiting_only")
+    model = load_osdi_model(
+        osdi_path, temperature=temperature, analysis=analysis, simparams=simparams
+    )
 
     if model.num_pins != len(ports):
         msg = f"OSDI model has {model.num_pins} pins but {len(ports)} port names given"
@@ -305,7 +378,7 @@ def osdi_component(
     if param_names is not None and model.num_params != len(param_names):
         msg = f"OSDI model has {model.num_params} params but {len(param_names)} param names given"
         raise ValueError(msg)
-    if model.num_states > 0:
+    if model.num_states > 0 and state_policy == "reject":
         msg = "Stateful OSDI models (num_states > 0) are not yet supported"
         raise NotImplementedError(msg)
 
@@ -315,6 +388,7 @@ def osdi_component(
         param_names=param_names,
         default_params=default_params or {},
         use_schur_reduction=use_schur_reduction,
+        state_policy=state_policy,
     )
 
 

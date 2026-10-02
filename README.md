@@ -106,11 +106,19 @@ pip install bosdi
 
 ```bash
 pixi run build   # compile Rust static lib + C++ extension
-pixi run test    # run pytest suite
+pixi run test    # standalone pytest suite; Circulax is not required
+pixi run --locked -e integration test-integration  # build and test with Circulax
 
 # single test
 pixi run pytest tests/test_osdi.py::test_resistor_dc_evaluation -v
 ```
+
+The `integration` environment has its own solve group and includes Circulax only for testing. It builds this checkout's
+native extension before running public DC/AC/transient, simulator-settings and generated-component checks. Both Linux
+and Windows CI run it alongside the standalone suite. Circulax is temporarily pinned to the immutable integration commit
+for PR #64; replace that pin with an upstream release once the required public native APIs are released. No Circulax
+extra is requested, so tests use this checkout's bosdi rather than installing a second copy. OpenVAF must be on PATH;
+JSON lowering tests additionally need the custom compiler's dump support.
 
 ## OSDI outputs
 
@@ -138,8 +146,62 @@ Pass `jnp.nan` for any parameter to use its Verilog-A default. Parameters can be
   compile from `.va` sources via [openvaf-r](https://github.com/cdaunt/OpenVAF) on each target
 - **OSDI differentiability:** `jax.grad()` works through node voltages only, not model parameters — use the VA path for
   parameter gradients
-- **Stateful models** (`num_states > 0`): evaluation is skipped and outputs are zeroed
+- **ABI states** (`num_states > 0`): the descriptor rejects these by default. Audited OpenVAF voltage-limiting slots may
+  use the explicit policy described below; generic history-dependent state is unsupported.
 - **VA lowering (alpha):** user-defined `analog function` calls and noise contributions are not yet supported
+
+### Native OSDI node collapse
+
+`OsdiModel.num_nodes` includes every raw OSDI node, including internal nodes that instance setup may collapse. Allocate
+voltage/state buffers using the model metadata rather than the external terminal count. The evaluator applies only
+`setup_instance`'s selected collapse flags, and represents unused raw node slots with voltage-equality equations. This
+preserves a fixed shape for batches whose instances have different parasitic resistances. Both cached and uncached
+native paths use the same mapping. Physical currents and charges are stamped into the surviving node; equality rows
+carry no charge.
+
+### Integral operators and analysis modes
+
+`load_osdi_model(..., analysis="dc" | "ac" | "tran")` and `osdi_component(..., analysis=...)` select an immutable
+evaluation mode for a model registration. The default `"ac"` preserves the full current/charge stamp API. DC disables
+reactive evaluation so `idt` uses its explicit initial-value equation. AC and transient enable integration consistently
+in both full and residual-only evaluation. OpenVAF uses `CALC_REACT_JACOBIAN` to select these integral equations, so
+clearing it only for a residual-only call is incorrect.
+
+To reproduce VACASK AC, first solve DC and retain its conductance matrix. Then evaluate the reactive Jacobian in AC mode
+at that operating point and solve `(G_dc + j*omega*C_ac) x = rhs`. A new registration/handle is required to change mode.
+Transient callers must provide a DC-consistent initial point. This does not add general state-history or `$abstime`
+support.
+
+### OpenVAF voltage-limiting slots
+
+OpenVAF derives OSDI `num_states` from its `$limit` slots. These Newton limiting buffers are distinct from physical
+`ddt` charges and `idt` unknowns, which are represented by the circuit DAE. For an audited binary whose slots serve only
+voltage limiting, use `osdi_component(..., state_policy="limiting_only")`. Bosdi leaves `ENABLE_LIM` disabled, evaluates
+the unmodified device equations, and does not propagate ABI state outputs. This can reduce convergence robustness
+compared with a simulator that enables limiting. It does not add fictitious delayed unknowns.
+
+The default `state_policy="reject"` remains appropriate for an unaudited binary. The ABI does not describe what its
+state slots mean; `limiting_only` is an explicit assertion by the caller, not automatic compiler detection. Generic
+history-dependent models, `$abstime`, and enabled voltage limiting still need a simulator lifecycle implementation.
+
+`descriptor.with_analysis("dc" | "ac" | "tran")` returns cached immutable registrations preserving the binary path,
+ports, defaults, temperature, and state policy. Circulax uses these registrations to orchestrate native analyses.
+
+### Registration cache lifetime
+
+`load_osdi_model` reuses native registration IDs across newly created descriptors and circuits using a process-local
+`@lru_cache(maxsize=128)`. The key includes canonical binary path, filesystem identity/size/timestamps, ABI, temperature
+and analysis mode. Concurrent misses are serialized. Callers receive independent metadata copies; port names and
+model-card defaults remain descriptor-local. Failed loads are not cached.
+
+This bounds Python cache entries, not the native registry: native IDs remain alive for existing circuits and JIT
+executables until the process exits. Rebuild binaries under new/content-addressed paths (as Circulax's compilation cache
+does); replacing a live shared-library file in place is not a supported reload strategy. Native IDs and batch handles
+cannot be persisted across processes; compiled binary artifacts can.
+
+Batch setup handles remain circuit-owned because they carry instance parameters and expose `free()`. A global LRU of
+those mutable handles would require shared ownership and invalidation before it could safely be introduced. The
+per-descriptor/per-circuit analysis caches have only three valid modes and retain their local lifetime.
 
 ## Releases
 

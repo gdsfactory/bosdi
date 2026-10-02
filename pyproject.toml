@@ -129,8 +129,19 @@ python = "3.13.*"
 [tool.pixi.feature.py314.dependencies]
 python = "3.14.*"
 
+# Temporary integration pin for the public native analysis/settings API in #64.
+# No verilog-a extra: tests must use this bosdi checkout, not a second installation.
+[tool.pixi.feature.integration.pypi-dependencies]
+circulax = { git = "https://github.com/gdsfactory/circulax.git", rev = "2f45d0980681a40904b5a658bdc5754d0e67ddb3" }
+
+[tool.pixi.feature.integration.tasks]
+test-integration = { cmd = "pytest tests/integration tests/test_branch_state_names.py -v", depends-on = [
+  "build"
+] }
+
 [tool.pixi.environments]
 default = { features = ["py313"], solve-group = "py313" }
+integration = { features = ["py313", "integration"], solve-group = "integration" }
 py311 = { features = ["py311"], solve-group = "py311" }
 py312 = { features = ["py312"], solve-group = "py312" }
 py313 = { features = ["py313"], solve-group = "py313" }

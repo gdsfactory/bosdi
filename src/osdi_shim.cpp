@@ -3,6 +3,8 @@
 #include <vector>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/map.h>
+#include <map>
 #include "xla/ffi/api/ffi.h"
 
 namespace nb = nanobind;
@@ -25,6 +27,10 @@ struct ModelMetadata {
 extern "C" {
     // Phase 1: The loader — version selects the ABI layout in Rust
     ModelMetadata load_osdi_library(const char* path_ptr, uint32_t version);
+    ModelMetadata load_osdi_library_at_temperature(const char* path_ptr, uint32_t version, double temperature);
+    ModelMetadata load_osdi_library_with_analysis(const char* path_ptr, uint32_t version, double temperature, uint32_t analysis);
+
+    ModelMetadata load_osdi_library_with_simparams(const char* path_ptr, uint32_t version, double temperature, uint32_t analysis, const char* const* names, const double* values, size_t count);
 
     // Diagnostic
     void dump_model_info(uint32_t model_id);
@@ -92,6 +98,8 @@ extern "C" {
     );
     void osdi_free_handle_ffi(uint64_t handle_id);
     size_t osdi_handle_num_devices(uint64_t handle_id);
+    size_t osdi_handle_num_nodes(uint64_t handle_id);
+    size_t osdi_model_num_nodes(uint32_t model_id);
 
     // Handle-based full eval: skips setup entirely. Rust tiles the handle's
     // snapshots across num_devices (must be a multiple of handle.num_devices).
@@ -149,6 +157,9 @@ ffi::Error batched_osdi_eval_impl(
     size_t num_params  = p_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_model_num_nodes(model_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal model.num_nodes (all raw nodes)");
+    }
     batched_osdi_eval_ffi(
         model_id,
         num_devices,
@@ -209,6 +220,9 @@ ffi::Error batched_osdi_residual_eval_impl(
     size_t num_params  = p_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_model_num_nodes(model_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal model.num_nodes (all raw nodes)");
+    }
     batched_osdi_residual_eval_ffi(
         model_id,
         num_devices,
@@ -264,6 +278,9 @@ ffi::Error batched_osdi_eval_handle_impl(
     size_t num_pins    = v_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_handle_num_nodes(handle_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal handle model.num_nodes (all raw nodes)");
+    }
     batched_osdi_eval_handle_ffi(
         handle_id,
         num_devices,
@@ -309,6 +326,9 @@ ffi::Error batched_osdi_residual_eval_handle_impl(
     size_t num_pins    = v_dims[1];
     size_t num_states  = s_dims[1];
 
+    if (num_pins != osdi_handle_num_nodes(handle_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal handle model.num_nodes (all raw nodes)");
+    }
     batched_osdi_residual_eval_handle_ffi(
         handle_id,
         num_devices,
@@ -349,9 +369,17 @@ NB_MODULE(osdi_shim_nb, m) {
         .def_ro("osdi_version", &ModelMetadata::osdi_version)
         .def_ro("success",      &ModelMetadata::success);
 
-    m.def("load_osdi_library", [](const std::string& path, uint32_t version) {
-        return load_osdi_library(path.c_str(), version);
-    }, nb::arg("path"), nb::arg("version") = 4u);
+    m.def("load_osdi_library", [](const std::string& path, uint32_t version, double temperature, uint32_t analysis, const std::map<std::string, double>& simparams) {
+        std::vector<const char*> names;
+        std::vector<double> values;
+        for (const auto& entry : simparams) {
+            if (entry.first.empty() || entry.first.find('\0') != std::string::npos)
+                throw nb::value_error("Simulator parameter names must be nonempty and contain no NUL");
+            names.push_back(entry.first.c_str());
+            values.push_back(entry.second);
+        }
+        return load_osdi_library_with_simparams(path.c_str(), version, temperature, analysis, names.data(), values.data(), names.size());
+    }, nb::arg("path"), nb::arg("version") = 4u, nb::arg("temperature") = 300.0, nb::arg("analysis") = 1u, nb::arg("simparams") = std::map<std::string, double>{});
 
     m.def("batched_osdi_eval", []() {
         return nb::capsule((void*)&OsdiEvalCpu, "xla._CUSTOM_CALL_TARGET");

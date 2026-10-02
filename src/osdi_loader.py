@@ -1,9 +1,15 @@
 import os
+import math
+from collections.abc import Mapping
+from copy import deepcopy
+from functools import lru_cache
+from threading import RLock
 from dataclasses import dataclass, field
 import jax.numpy as jnp
 import osdi_shim_nb
 
 _VERSION_MAP = {"0.4": 4, "0.5": 5}
+_REGISTRATION_LOCK = RLock()
 
 # OsdiParamOpvar flag bit decoding (from OSDI 0.4 header).
 _PARA_KIND_MASK = 0xC0000000  # bits 30..31
@@ -34,9 +40,7 @@ class OsdiModel:
 
     id: int
     num_pins: int  # = num_terminals (external pins only)
-    num_nodes: (
-        int  # = num_terminals + num_non_collapsed_internal + branch-current auxiliaries
-    )
+    num_nodes: int  # = all raw OSDI nodes, including collapse equality slots
     num_params: int
     num_states: int
     osdi_version: str
@@ -50,6 +54,10 @@ class OsdiModel:
     param_flags: list = field(default_factory=list)
     # Per-param canonical (alias 0) names in OSDI order. Length == num_params.
     param_names: list = field(default_factory=list)
+    temperature: float = 300.0
+    analysis: str = "ac"
+    path: str = ""
+    simparams: tuple[tuple[str, float], ...] = ()
 
     @property
     def num_resist_jac(self) -> int:
@@ -75,14 +83,57 @@ class OsdiModel:
         }
 
 
-def load_osdi_model(osdi_filepath: str, version: str = "0.4") -> OsdiModel:
+def load_osdi_model(
+    osdi_filepath: str,
+    version: str = "0.4",
+    *,
+    temperature: float = 300.0,
+    analysis: str = "ac",
+    simparams: Mapping[str, float] | None = None,
+) -> OsdiModel:
     """
     Load an OpenVAF-compiled .osdi binary and register it for JAX evaluation.
+
+    Equivalent calls share a process-local native ID through a bounded LRU.
+    Returned metadata is independent. Canonical path, file identity, ABI,
+    temperature, analysis mode and simulator settings define the cache key. Native IDs remain
+    registered for the process lifetime, including after Python cache eviction.
 
     Args:
         osdi_filepath: Path to the .osdi ELF binary.
         version:       OSDI standard version to use ("0.4" or "0.5").
+        analysis:      Immutable evaluation mode: dc, ac, or tran. The default
+                       ac retains the full current/charge stamp API. dc disables
+                       integration to impose idt initial-value equations.
+        simparams:     Numeric $simparam settings, shared by setup and evaluation.
+                       Names are case-sensitive; omitted settings use model defaults.
+                       Settings are copied and form part of the registration cache key.
+        temperature:   Immutable setup temperature in kelvin for this model id.
+                       Changing temperature selects a separate model id; parameter
+                       updates and cached handles retain this value.
     """
+    settings = []
+    if simparams is not None:
+        if not isinstance(simparams, Mapping):
+            raise TypeError("simparams must be a mapping of names to finite numbers")
+        for name, value in simparams.items():
+            if not isinstance(name, str) or not name or "\0" in name:
+                raise ValueError(
+                    "Simulator parameter names must be nonempty strings without NUL"
+                )
+            if isinstance(value, (str, bytes)):
+                raise TypeError("Simulator parameter values must be finite numbers")
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError("Simulator parameter values must be finite numbers")
+            settings.append((name, value))
+    settings = tuple(sorted(settings))
+    modes = {"dc": 0, "ac": 1, "tran": 2}
+    if analysis not in modes:
+        raise ValueError("analysis must be dc, ac, or tran")
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive (kelvin)")
     version_int = _VERSION_MAP.get(version)
     if version_int is None:
         raise ValueError(
@@ -92,18 +143,55 @@ def load_osdi_model(osdi_filepath: str, version: str = "0.4") -> OsdiModel:
     if not os.path.exists(osdi_filepath):
         raise FileNotFoundError(f"OSDI binary not found at {osdi_filepath}")
 
-    meta = osdi_shim_nb.load_osdi_library(osdi_filepath, version_int)
+    path = os.path.realpath(osdi_filepath)
+    stat = os.stat(path)
+    identity = (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    # Serialize misses as well as hits: lru_cache alone permits duplicate work
+    # when two threads concurrently request the same uncached registration.
+    with _REGISTRATION_LOCK:
+        model = _load_registration(
+            path, identity, version, temperature, analysis, settings
+        )
+        # Metadata is mutable for compatibility. Never expose the cached object.
+        return deepcopy(model)
+
+
+@lru_cache(maxsize=128)
+def _load_registration(
+    path: str,
+    identity: tuple[int, ...],
+    version: str,
+    temperature: float,
+    analysis: str,
+    simparams: tuple[tuple[str, float], ...],
+) -> OsdiModel:
+    """Cache native registration IDs across descriptor and circuit lifetimes."""
+    version_int = _VERSION_MAP[version]
+    modes = {"dc": 0, "ac": 1, "tran": 2}
+    meta = osdi_shim_nb.load_osdi_library(
+        path, version_int, temperature, modes[analysis], dict(simparams)
+    )
 
     if not meta.success:
         detail = osdi_shim_nb.get_last_error()
         raise RuntimeError(
-            f"Failed to load OSDI binary '{osdi_filepath}' as OSDI {version}. "
+            f"Failed to load OSDI binary '{path}' as OSDI {version}. "
             f"{detail or 'Ensure it is a valid OpenVAF compiled .osdi file.'}"
         )
 
     mid = meta.model_id
     return OsdiModel(
         id=mid,
+        temperature=temperature,
+        analysis=analysis,
+        path=path,
+        simparams=simparams,
         num_pins=meta.num_pins,
         num_nodes=meta.num_nodes,
         num_params=meta.num_params,

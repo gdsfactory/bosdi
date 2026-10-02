@@ -168,10 +168,10 @@ def diode():
     return load_osdi_model(str(FOLDER / "compiled_osdi" / "diode.osdi"))
 
 
-def test_schur_reduce_diode_noop(diode):
-    # diode.osdi has num_pins=2 and num_nodes=2 (internal CI is statically
-    # collapsed). So schur_reduce at α=0 should return j_eff=cond, r_eff=cur.
-    V = jnp.array([[0.6, 0.0]])
+def test_schur_reduce_diode_collapsed_internal(diode):
+    # Raw CI remains allocated; its equality constraint disappears under
+    # Schur reduction, preserving the physical terminal stamp.
+    V = jnp.zeros((1, diode.num_nodes)).at[0, 0].set(0.6)
     P = jnp.full((1, diode.num_params), jnp.nan).at[0, 0].set(1.0)
     S = jnp.empty((1, diode.num_states))
     cur, cond, chg, cap, _ = osdi_eval(diode.id, V, P, S)
@@ -180,8 +180,8 @@ def test_schur_reduce_diode_noop(diode):
     C = cap[0].reshape(diode.num_nodes, diode.num_nodes)
 
     r = schur_reduce(cur[0], G, chg[0], C, num_pins=diode.num_pins, alpha=0.0)
-    np.testing.assert_allclose(r.j_eff, G, rtol=1e-12)
-    np.testing.assert_allclose(r.r_eff, cur[0], rtol=1e-12)
+    np.testing.assert_allclose(r.j_eff, G[:2, :2], rtol=1e-12)
+    np.testing.assert_allclose(r.r_eff, cur[0, :2], rtol=1e-12)
 
 
 @pytest.fixture(scope="module")
@@ -300,7 +300,7 @@ def test_format_jacobian_table_readable():
 
 
 def test_dump_jacobian_diode_osdi(diode):
-    V = jnp.array([[0.6, 0.0]])
+    V = jnp.zeros((1, diode.num_nodes)).at[0, 0].set(0.6)
     P = jnp.full((1, diode.num_params), jnp.nan).at[0, 0].set(1.0)
     S = jnp.empty((1, diode.num_states))
     _, cond, _, cap, _ = osdi_eval(diode.id, V, P, S)
@@ -310,6 +310,5 @@ def test_dump_jacobian_diode_osdi(diode):
     entries = dump_jacobian(G, C)
     # Diode at 0.6 V forward has non-zero G entries on all four cells.
     assert len(entries) >= 2
-    # No row should classify as a constraint — the constraint row exists
-    # only in the raw pre-collapse form.
-    assert not any(e.is_likely_constraint for e in entries)
+    # Fixed raw-node layouts retain the collapsed CI equality constraint.
+    assert any(e.is_likely_constraint for e in entries)

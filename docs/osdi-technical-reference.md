@@ -155,3 +155,16 @@ rows = classify_rows(G, C)  # one of: physics / constraint / reactive_only / emp
 can `jax.vmap` or `jax.jit` it over a batch of devices. The α-reduced Jacobian is not decomposed back into
 `(G_eff, C_eff)` — the Schur complement of `G + α·C` is nonlinear in α in general, so there's no clean split. Call at
 two α values and finite-difference if you really need a separated capacitance.
+
+## Simulator parameters
+
+`load_osdi_model(path, simparams={"scale": 2.0, "tnom": 27.0})` and `osdi_component(path, ports, simparams={...})`
+supply numeric settings to Verilog-A `$simparam` queries. These settings are distinct from model and instance
+parameters; their names are case-sensitive and omitted entries retain model-defined defaults. Values must be finite
+numbers. String-valued simulator settings are not supported by this API.
+
+The native registration owns a copy of the settings and supplies the same table in model setup, instance setup and
+evaluation. The registration LRU includes the settings in its key, so different settings cannot reuse incompatible setup
+handles. Analysis variants preserve them, and normal device parameter updates retain them. Re-register to change
+simulator settings. This configures model queries only, not the host solver's tolerances, leakage or numerical
+algorithms.

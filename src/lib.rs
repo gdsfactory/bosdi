@@ -2,7 +2,7 @@ use libloading::{Library, Symbol};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::sync::RwLock;
 
@@ -163,32 +163,7 @@ struct OsdiSimParas {
     vals_str:  *mut *mut i8,
 }
 unsafe impl Send for OsdiSimParas {}
-impl OsdiSimParas {
-    fn null() -> Self {
-        Self {
-            names:     std::ptr::null_mut(),
-            vals:      std::ptr::null_mut(),
-            names_str: std::ptr::null_mut(),
-            vals_str:  std::ptr::null_mut(),
-        }
-    }
 
-    /// Returns an empty-but-valid OsdiSimParas whose names pointer addresses the
-    /// provided null sentinel slot.  Models that read `sim_paras->names[0]` to
-    /// iterate the parameter list (e.g. the compiled OpenVAF diode) see a null
-    /// first entry and skip the lookup — instead of crashing on a null `names`.
-    ///
-    /// # Safety
-    /// `names_sentinel` must remain valid for the lifetime of the returned struct.
-    unsafe fn with_null_sentinel(names_sentinel: *mut *mut i8) -> Self {
-        Self {
-            names:     names_sentinel,
-            vals:      std::ptr::null_mut(),
-            names_str: std::ptr::null_mut(),
-            vals_str:  std::ptr::null_mut(),
-        }
-    }
-}
 
 /// OsdiSimInfo layout (confirmed by disassembly of eval_0):
 ///   offset  0: paras     (32 bytes)
@@ -375,6 +350,11 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedOsdi {
+    _simparam_names:          Vec<CString>,
+    simparam_name_ptrs:       Vec<*mut i8>,
+    simparam_values:          Vec<f64>,
+    temperature:             f64,
+    analysis:                u32,
     _lib:                    Library,
     layout:                  AbiLayout,
     pub num_terminals:       u32,
@@ -385,6 +365,7 @@ struct LoadedOsdi {
     pub model_size:          usize,
     /// Byte offset within inst where the u32 node-index array begins.
     pub node_map_off:        usize,
+    pub collapsed_off:       usize,
     // Functions with NULL descriptor slots — looked up by name:
     pub setup_model:         SetupModelFn,
     pub setup_instance:      SetupInstanceFn,
@@ -412,8 +393,8 @@ struct LoadedOsdi {
     pub react_jac_pairs:      Vec<(u32, u32)>,
     /// Collapsible node pairs from the descriptor. When a coupling element
     /// (e.g. drain series resistance) is zero, these two nodes become
-    /// electrically identical. bosdi always collapses them so internal node
-    /// voltages match their terminal counterparts.
+    /// electrically identical. setup_instance selects the active pairs via
+    /// the Boolean array at collapsed_off; candidate pairs alone are insufficient.
     pub collapsible_pairs:    Vec<(u32, u32)>,
     /// resistive_mask[out_idx] = true iff output node out_idx appears as the row
     /// in at least one resist_jac_pair (i.e. F[out_idx] can be non-zero at DC).
@@ -424,18 +405,16 @@ struct LoadedOsdi {
     /// Empty strings for params with a null name pointer (shouldn't happen in
     /// well-formed .osdi binaries).
     pub param_names:          Vec<String>,
-    // ── precomputed collapse topology (depends on collapsible_pairs only) ────
-    /// node_map[raw_node_idx] → slot_idx after running the collapse algorithm.
-    /// Written verbatim into inst_data[node_map_off ..] during setup.
+    // ── fixed raw-node buffer layout; topology is selected during setup ─────
+    /// Identity mapping written before setup; replaced by the active topology.
     pub node_map:             Vec<i32>,
     /// slot_to_out[slot_idx] → output index, -1 for phantom slots.
     pub slot_to_out:          Vec<i32>,
-    /// Number of distinct slots after collapse (max of node_map + 1).
+    /// Scratch slots: every raw node plus a private ground slot.
     pub num_slots:             usize,
-    /// num_terminals + num_non_collapsed_internal.
+    /// Terminals plus every raw internal and auxiliary node.
     pub num_all_nodes:         usize,
-    /// Number of NQS charge-partition state variables (e.g. 5 for BSIM3v3/4).
-    /// Zero for purely resistive models like the diode.
+    /// Number of ABI state slots. OpenVAF uses these for voltage limiting.
     pub num_states:            usize,
 }
 unsafe impl Send for LoadedOsdi {}
@@ -494,6 +473,65 @@ fn fail() -> ModelMetadata {
 
 #[no_mangle]
 pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> ModelMetadata {
+    load_osdi_library_at_temperature(path_ptr, version, 300.0)
+}
+
+/// Register an immutable setup temperature in kelvin for this model id.
+/// Both cached-handle and uncached evaluation use this configuration.
+#[no_mangle]
+pub extern "C" fn load_osdi_library_at_temperature(
+    path_ptr: *const c_char, version: u32, temperature: f64,
+) -> ModelMetadata {
+    load_osdi_library_with_analysis(path_ptr, version, temperature, 1)
+}
+
+/// Analysis mode: 0 = DC, 1 = AC, 2 = transient. Immutable per registration.
+#[no_mangle]
+pub extern "C" fn load_osdi_library_with_analysis(
+    path_ptr: *const c_char, version: u32, temperature: f64, analysis: u32,
+) -> ModelMetadata {
+    load_osdi_library_with_simparams(
+        path_ptr, version, temperature, analysis,
+        std::ptr::null(), std::ptr::null(), 0,
+    )
+}
+
+/// Numeric simulator settings are copied and immutable for this registration.
+/// Caller-provided names must be valid NUL-terminated strings for this call.
+#[no_mangle]
+pub extern "C" fn load_osdi_library_with_simparams(
+    path_ptr: *const c_char, version: u32, temperature: f64, analysis: u32,
+    names: *const *const c_char, values: *const f64, count: usize,
+) -> ModelMetadata {
+    if count > 0 && (names.is_null() || values.is_null()) {
+        set_last_error("OSDI: missing simulator parameter arrays".into());
+        return fail();
+    }
+    let mut simparam_names = Vec::with_capacity(count);
+    let mut simparam_values = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = unsafe { *names.add(i) };
+        let value = unsafe { *values.add(i) };
+        if name.is_null() || !value.is_finite() {
+            set_last_error("OSDI: invalid simulator parameter".into());
+            return fail();
+        }
+        let name = unsafe { CStr::from_ptr(name) };
+        if name.to_bytes().is_empty() || simparam_names.iter().any(|n: &CString| n.as_c_str() == name) {
+            set_last_error("OSDI: empty or duplicate simulator parameter name".into());
+            return fail();
+        }
+        simparam_names.push(name.to_owned());
+        simparam_values.push(value);
+    }
+    if analysis > 2 {
+        set_last_error("OSDI: unknown analysis mode".into());
+        return fail();
+    }
+    if !temperature.is_finite() || temperature <= 0.0 {
+        set_last_error("OSDI: temperature must be finite and positive (kelvin)".into());
+        return fail();
+    }
     let ver = match OsdiVersion::from_u32(version) {
         Some(v) => v,
         None    => { set_last_error(format!("OSDI: unknown version {version}")); return fail(); }
@@ -632,9 +670,8 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     // ── collapsible node pairs ────────────────────────────────────────────────
     // OsdiCollapsibleNode: {node_1: u32, node_2: u32} = 8 bytes.
     // When the coupling element between node_1 and node_2 is zero, the simulator
-    // collapses them to the same MNA row. bosdi always collapses them so internal
-    // node voltages match their terminal counterparts and device current reaches
-    // the terminal outputs correctly.
+    // collapses them to the same MNA row only if setup_instance marks the
+    // corresponding collapsed flag. Preserve all candidates for per-instance setup.
     let num_collapsible = unsafe { read_u32(desc, layout.desc_num_collapsible) };
     let collapsible_pairs: Vec<(u32, u32)> = if num_collapsible > 0 {
         let coll_ptr = unsafe {
@@ -650,24 +687,26 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         Vec::new()
     };
 
-    // ── collapse topology + resistive_mask: one pass at load time ───────────
-    // Run the deterministic collapse algorithm once per model; all subsequent
-    // evaluations reuse these buffers. Phantom slots (numbered but not mapped to
-    // by any node, e.g. PSP103's gap between slots 3 and 12) stay at -1 in
-    // slot_to_out and are skipped in every scatter operation.
-    let (node_map, slot_to_out, num_slots, num_all_nodes) =
-        compute_collapse_topology(num_nodes as usize, num_terminals as usize, &collapsible_pairs);
-
+    // Retain raw node slots: collapse depends on instance parameters, while
+    // JAX batch shapes must remain identical for every instance of a module.
+    // The extra private slot is global ground. OSDI load_residual() indexes
+    // its destination with node_map entries, so UINT32_MAX/-1 cannot be put
+    // into the runtime map (that would write outside the scratch buffer).
+    let num_all_nodes = num_nodes as usize;
+    let num_slots = num_all_nodes + 1;
+    let node_map: Vec<i32> = (0..num_nodes as i32).collect();
+    let mut slot_to_out = node_map.clone();
+    slot_to_out.push(-1);
     let resistive_mask: Vec<bool> = {
         let mut mask = vec![false; num_all_nodes];
         for &(n1, _) in &resist_jac_pairs {
-            let n1 = n1 as usize;
-            if n1 < node_map.len() {
-                let slot = node_map[n1] as usize;
-                if slot < slot_to_out.len() {
-                    let out = slot_to_out[slot];
-                    if out >= 0 { mask[out as usize] = true; }
-                }
+            if (n1 as usize) < mask.len() { mask[n1 as usize] = true; }
+        }
+        // Collapsed slots receive voltage-equality equations below, so they
+        // must not also receive the reactive-only diagonal regularisation.
+        for &(n1, n2) in &collapsible_pairs {
+            for n in [n1, n2] {
+                if (n as usize) < mask.len() { mask[n as usize] = true; }
             }
         }
         mask
@@ -719,6 +758,13 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         }
     }
 
+    // CString allocations remain stable when moved into the registration.
+    // OSDI queries only read these immutable tables; each invocation owns its
+    // OsdiSimParas struct. Cache the pointer table to avoid hot-path allocation.
+    let mut simparam_name_ptrs: Vec<_> = simparam_names.iter()
+        .map(|n| n.as_ptr() as *mut i8).collect();
+    simparam_name_ptrs.push(std::ptr::null_mut());
+
     let model_id = {
         let mut id = NEXT_MODEL_ID.write().unwrap();
         let cur = *id;
@@ -727,6 +773,11 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
     };
 
     OSDI_REGISTRY.write().unwrap().insert(model_id, LoadedOsdi {
+        _simparam_names: simparam_names,
+        simparam_name_ptrs,
+        simparam_values,
+        temperature,
+        analysis,
         _lib: lib,
         layout,
         num_terminals,
@@ -736,6 +787,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
         instance_size,
         model_size,
         node_map_off,
+        collapsed_off: unsafe { read_u32(desc, 56) } as usize,
         setup_model,
         setup_instance,
         eval,
@@ -772,7 +824,7 @@ pub extern "C" fn load_osdi_library(path_ptr: *const c_char, version: u32) -> Mo
 
 /// Deterministic collapse: fold `collapsible_pairs` into an index map, build
 /// the slot→output index array, and report the total distinct-slots count.
-/// Shared by the loader (for resistive_mask) and the evaluator (via cache).
+/// Called after instance setup with only the pairs selected by its flags.
 fn compute_collapse_topology(
     num_nodes: usize,
     num_terminals: usize,
@@ -780,20 +832,26 @@ fn compute_collapse_topology(
 ) -> (Vec<i32>, Vec<i32>, usize, usize) {
     let mut nm: Vec<i32> = (0..num_nodes as i32).collect();
     for &(n1, n2) in collapsible_pairs {
-        let (n1, n2) = (n1 as usize, n2 as usize);
-        if n1 >= num_nodes || n2 >= num_nodes { continue; }
-        let s1 = nm[n1]; let s2 = nm[n2];
+        // OSDI uses UINT32_MAX for global ground, including inactive
+        // branch-current unknowns. Track ground as -1 while merging; setup
+        // remaps it to the valid private ground slot before native evaluation.
+        let slot = |node: u32| {
+            if node == u32::MAX { Some(-1) }
+            else { nm.get(node as usize).copied() }
+        };
+        let (Some(s1), Some(s2)) = (slot(n1), slot(n2)) else { continue; };
         let merged = s1.min(s2); let higher = s1.max(s2);
         for s in nm.iter_mut() { if *s == higher { *s = merged; } }
     }
-    let num_slots = nm.iter().map(|&s| s as usize + 1).max().unwrap_or(num_terminals);
+    let num_slots = nm.iter().filter(|&&s| s >= 0)
+        .map(|&s| s as usize + 1).max().unwrap_or(num_terminals);
 
     let mut slot_occupied = vec![false; num_slots];
-    for &s in &nm { slot_occupied[s as usize] = true; }
+    for &s in &nm { if s >= 0 { slot_occupied[s as usize] = true; } }
 
     let mut slot_to_out = vec![-1i32; num_slots];
     for t in 0..num_terminals {
-        slot_to_out[nm[t] as usize] = t as i32;
+        if nm[t] >= 0 { slot_to_out[nm[t] as usize] = t as i32; }
     }
     let mut next_out = num_terminals;
     for slot in 0..num_slots {
@@ -805,6 +863,13 @@ fn compute_collapse_topology(
     let num_all_nodes = next_out;
 
     (nm, slot_to_out, num_slots, num_all_nodes)
+}
+
+/// Expected voltage width for an OSDI model; zero for an unknown id.
+#[no_mangle]
+pub extern "C" fn osdi_model_num_nodes(model_id: u32) -> usize {
+    OSDI_REGISTRY.read().unwrap().get(&model_id)
+        .map(|m| m.num_all_nodes).unwrap_or(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -977,7 +1042,7 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     debug_assert_eq!(model_data.len(), m.model_size);
     debug_assert_eq!(inst_data.len(), m.instance_size);
 
-    // Write the cached post-collapse node_map into inst_data.
+    // Initialise the raw node mapping before model/instance setup.
     for (i, &slot) in m.node_map.iter().enumerate() {
         unsafe {
             *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) = slot;
@@ -1025,9 +1090,17 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
         write_param(i, val, kind, flags & PARA_TY_MASK);
     }
 
+    // Setup functions may call $simparam just like eval(). Supply a valid
+    // immutable, null-terminated settings table rather than a null struct pointer.
+    let mut sim_paras = OsdiSimParas {
+        names: m.simparam_name_ptrs.as_ptr() as *mut *mut i8,
+        vals: m.simparam_values.as_ptr() as *mut f64,
+        names_str: std::ptr::null_mut(),
+        vals_str: std::ptr::null_mut(),
+    };
     let mut init1 = OsdiInitInfo::default();
     unsafe {
-        (m.setup_model)(std::ptr::null_mut(), model_ptr, std::ptr::null_mut(), &mut init1);
+        (m.setup_model)(std::ptr::null_mut(), model_ptr, &mut sim_paras, &mut init1);
     }
 
     // Pass 2: instance params (after setup_model, before setup_instance)
@@ -1042,8 +1115,22 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     unsafe {
         (m.setup_instance)(
             std::ptr::null_mut(), inst_ptr, model_ptr,
-            300.0, m.num_terminals, std::ptr::null_mut(), &mut init2,
+            m.temperature, m.num_terminals, &mut sim_paras, &mut init2,
         );
+    }
+    let active_pairs: Vec<_> = m.collapsible_pairs.iter().enumerate()
+        .filter_map(|(i, &pair)| {
+            let collapsed = inst_data[m.collapsed_off + i] != 0;
+            collapsed.then_some(pair)
+        }).collect();
+    let (node_map, _, _, _) = compute_collapse_topology(
+        m.num_nodes as usize, m.num_terminals as usize, &active_pairs,
+    );
+    for (i, &slot) in node_map.iter().enumerate() {
+        unsafe {
+            *(inst_data.as_mut_ptr().add(m.node_map_off + i * 4) as *mut i32) =
+                if slot < 0 { m.num_all_nodes as i32 } else { slot };
+        }
     }
 }
 
@@ -1066,15 +1153,25 @@ fn eval_device_from_setup(
 ) {
     let num_slots = m.num_slots;
     let num_all_nodes = m.num_all_nodes;
+    let node_map: Vec<i32> = (0..num_all_nodes).map(|i| unsafe {
+        (inst_data.as_ptr().add(m.node_map_off + i * 4) as *const i32).read_unaligned()
+    }).collect();
 
-    let mut flags = 0u32;
+    let mut flags = match m.analysis {
+        0 => 2048 | 32768, // ANALYSIS_DC | ANALYSIS_STATIC
+        1 => 4096 | 32768, // ANALYSIS_AC | ANALYSIS_STATIC
+        _ => 8192,        // ANALYSIS_TRAN
+    };
     if m.num_resist_jac > 0 {
         flags |= m.layout.flag_calc_resist_residual;
         if !residual_only { flags |= m.layout.flag_calc_resist_jacobian; }
     }
-    if m.num_react_jac > 0 {
+    if m.num_react_jac > 0 && m.analysis != 0 {
         flags |= m.layout.flag_calc_react_residual;
-        if !residual_only { flags |= m.layout.flag_calc_react_jacobian; }
+        // OpenVAF uses this flag to select idt's integration equation. Keep
+        // it set for residual-only calls too, or line searches see a different
+        // equation from the full Newton stamp. Skip array extraction below.
+        flags |= m.layout.flag_calc_react_jacobian;
     }
 
     // Voltages indexed by slot (many-to-one collapse preserves terminal values).
@@ -1090,14 +1187,18 @@ fn eval_device_from_setup(
     let model_ptr = model_data.as_mut_ptr() as *mut c_void;
     let inst_ptr  = inst_data.as_mut_ptr() as *mut c_void;
 
-    let mut names_sentinel: *mut i8 = std::ptr::null_mut();
-    let sim_paras = unsafe { OsdiSimParas::with_null_sentinel(&mut names_sentinel) };
+    let sim_paras = OsdiSimParas {
+        names: m.simparam_name_ptrs.as_ptr() as *mut *mut i8,
+        vals: m.simparam_values.as_ptr() as *mut f64,
+        names_str: std::ptr::null_mut(),
+        vals_str: std::ptr::null_mut(),
+    };
 
-    // Stateful models (BSIM3v3/4, etc.) write NQS charge-partition states to
-    // next_state and may read prev_state.  Pass zero-initialised scratch buffers
-    // so the model has valid pointers.  For DC analysis the states start at zero
-    // and the written values are discarded; for transient the caller propagates
-    // them explicitly (future work).
+    // Provide valid ABI state pointers. ENABLE_LIM is disabled, so OpenVAF
+    // voltage-limiting slots do not participate in F/Q evaluation. Physical
+    // charges and integration unknowns are carried by the DAE, not these slots.
+    // Generic binaries with history-dependent state still require a separate
+    // state lifecycle; the high-level API rejects them unless explicitly opted in.
     let (prev_state_ptr, next_state_ptr) = if m.num_states > 0 {
         scratch.state_buf.clear();
         scratch.state_buf.resize(2 * m.num_states as usize, 0.0);
@@ -1140,8 +1241,8 @@ fn eval_device_from_setup(
             scratch.jac_buf.resize(m.num_resist_jac as usize, 0.0);
             unsafe { (m.write_jacobian)(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
             for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
-                let s1 = m.node_map.get(n1 as usize).copied().unwrap_or(-1);
-                let s2 = m.node_map.get(n2 as usize).copied().unwrap_or(-1);
+                let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
                 if s1 >= 0 && s2 >= 0 {
                     let o1 = m.slot_to_out[s1 as usize];
                     let o2 = m.slot_to_out[s2 as usize];
@@ -1154,7 +1255,7 @@ fn eval_device_from_setup(
     }
 
     // Reactive extraction
-    if m.num_react_jac > 0 {
+    if m.num_react_jac > 0 && m.analysis != 0 {
         if let Some(lr) = m.load_residual_react {
             scratch.node_buf.clear();
             scratch.node_buf.resize(num_slots, 0.0);
@@ -1172,8 +1273,8 @@ fn eval_device_from_setup(
                 scratch.jac_buf.resize(m.num_react_jac as usize, 0.0);
                 unsafe { wj(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
                 for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
-                    let s1 = m.node_map.get(n1 as usize).copied().unwrap_or(-1);
-                    let s2 = m.node_map.get(n2 as usize).copied().unwrap_or(-1);
+                    let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                    let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
                     if s1 >= 0 && s2 >= 0 {
                         let o1 = m.slot_to_out[s1 as usize];
                         let o2 = m.slot_to_out[s2 as usize];
@@ -1185,6 +1286,27 @@ fn eval_device_from_setup(
             }
         }
     }
+    // Keep a fixed raw-node shape even when setup merges nodes. Unused raw
+    // slots carry equality equations; physical KCL/charge stamps go to the
+    // surviving node. These constraints also cover residual-only evaluation.
+    for (node, &survivor) in node_map.iter().enumerate() {
+        if survivor as usize == num_all_nodes {
+            cur[node] = vol[node];
+            chg[node] = 0.0;
+            if !residual_only {
+                cond[node * num_all_nodes + node] = 1.0;
+            }
+        } else if survivor as usize != node {
+            let survivor = survivor as usize;
+            cur[node] = vol[node] - vol[survivor];
+            chg[node] = 0.0;
+            if !residual_only {
+                cond[node * num_all_nodes + node] = 1.0;
+                cond[node * num_all_nodes + survivor] = -1.0;
+            }
+        }
+    }
+
 }
 
 /// Stateless eval: re-run setup every call using thread-local scratch.
@@ -1285,13 +1407,8 @@ pub extern "C" fn batched_osdi_eval_ffi(
                 });
         }
     } else {
-        // Stateful models: initialise state to zero and evaluate.
-        // States (NQS charge-partition variables in BSIM3v3/4, etc.) are not yet
-        // carried across Newton steps — they start at zero each call.  This gives
-        // correct resistive (DC / low-frequency) behaviour and is sufficient for
-        // operating-point finding and ring-oscillator frequency benchmarking.
-        // Reactive (capacitive) accuracy requires state propagation; that is a
-        // future enhancement.
+        // ABI state outputs are intentionally not propagated: voltage limiting
+        // is disabled. Do not interpret these zero outputs as physical history.
         let new_state = unsafe {
             std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
         };
@@ -1530,6 +1647,13 @@ pub extern "C" fn osdi_handle_num_devices(handle_id: u64) -> usize {
         .get(&handle_id)
         .map(|h| h.num_devices)
         .unwrap_or(0)
+}
+
+/// Expected voltage width for the model belonging to a cached handle.
+#[no_mangle]
+pub extern "C" fn osdi_handle_num_nodes(handle_id: u64) -> usize {
+    let model_id = HANDLES.read().unwrap().get(&handle_id).map(|h| h.model_id);
+    model_id.map(|id| osdi_model_num_nodes(id)).unwrap_or(0)
 }
 
 /// Full-stamp batched eval reusing the handle's pre-setup state.
