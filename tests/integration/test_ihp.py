@@ -152,7 +152,31 @@ def test_every_shipped_device_has_a_case(compiler):
 
 
 @pytest.fixture(scope="module")
-def libraries(compiler, tmp_path_factory):
+def primitives(compiler, tmp_path_factory):
+    """Compile VACASK primitives consistently, including wheels without modules."""
+    devices = Path(__file__).parents[1] / "devices"
+    root = tmp_path_factory.mktemp("ihp-primitives")
+    # Match VACASK's five-terminal VBIC build flags without modifying its source.
+    vbic = root / "vbic_1p3_5t.va"
+    vbic.write_text(
+        "`define __NGSPICE__\n`define fiveTerminal\n"
+        f'`include "{(devices / "vbic" / "vbic_1p3.va").as_posix()}"\n'
+    )
+    sources = {
+        "spice/capacitor.osdi": devices / "spice" / "capacitor.va",
+        "spice/diode.osdi": devices / "spice" / "diode.va",
+        "spice/full/bjt.osdi": devices / "spice" / "full" / "bjt.va",
+        "spice/inductor.osdi": devices / "spice" / "inductor.va",
+        "spice/resistor.osdi": devices / "spice" / "resistor.va",
+        "vbic_1p3_5t.osdi": vbic,
+    }
+    return {
+        name: compile_va(source, compiler=compiler) for name, source in sources.items()
+    }
+
+
+@pytest.fixture(scope="module")
+def libraries(compiler, primitives, tmp_path_factory):
     """Materialize include-once libraries without touching the pinned checkout.
 
     Upstream converted cards each include the same common parameter declaration;
@@ -173,7 +197,7 @@ def libraries(compiler, tmp_path_factory):
                 path = (
                     MODELS / reference
                     if reference.endswith(".va")
-                    else Path(vacask_bin.MOD_DIR) / reference
+                    else primitives[reference]
                 )
                 return f'load "{path.resolve().as_posix()}"'
 
@@ -229,8 +253,7 @@ def native_reference(deck, resolved, compiler, directory):
                 compile_va(source, compiler=compiler),
                 directory / (source.stem + ".osdi"),
             )
-    config = "[Paths]\nmodule_path_prefix=" + json.dumps([vacask_bin.MOD_DIR])
-    config += "\n[Binaries]\nopenvaf=" + json.dumps(compiler) + "\n"
+    config = "[Binaries]\nopenvaf=" + json.dumps(compiler) + "\n"
     (directory / ".vacaskrc.toml").write_text(config)
     # Inject -1 A into the output: V(out) is its small-signal driving-point
     # impedance. Convert it to the same 50-ohm reflection measured by sp().
@@ -299,7 +322,6 @@ def test_device_dc_and_ac(
         assert any(leaf.name.startswith("dut/") for leaf in resolved.instances)
     circuit = resolved.compile(
         compiler=compiler,
-        module_paths=(Path(vacask_bin.MOD_DIR),),
         state_policy="limiting_only",
     )
     dc = jax.jit(circuit.dc)()

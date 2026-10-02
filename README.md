@@ -125,7 +125,8 @@ compiler's dump support.
 The IHP integration suite uses the pinned `gdsfactory/IHP` submodule in `tests/pdks/ihp`, rather than copied model
 fixtures. It enumerates all 34 SG13G2 VACASK subcircuits and checks compiled, JIT-executed DC and small-signal responses
 at 1 MHz and 1 GHz against VACASK. Updating the submodule adds a failing catalogue check if new devices need test cases.
-VACASK is pinned to an OSDI 0.4-compatible build and is a test-only dependency.
+VACASK is pinned to an OSDI 0.4-compatible build and is a test-only dependency. Its SPICE primitives are compiled from
+the existing test sources on every platform because the Windows wheel does not bundle OSDI modules.
 
 These are typical-corner device checks at explicit sizes and biases, not complete process qualification. The test
 harness hoists repeated common includes, grounds implicit BJT substrate terminals, and folds varactor voltage terms only
