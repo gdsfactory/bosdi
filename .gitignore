@@ -23,3 +23,6 @@ src/*.egg-info/*
 
 #vscode
 settings.json
+
+# Generated from Git tags by setuptools-scm
+src/bosdi/_version.py
