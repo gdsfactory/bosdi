@@ -140,3 +140,30 @@ Pass `jnp.nan` for any parameter to use its Verilog-A default. Parameters can be
   parameter gradients
 - **Stateful models** (`num_states > 0`): evaluation is skipped and outputs are zeroed
 - **VA lowering (alpha):** user-defined `analog function` calls and noise contributions are not yet supported
+
+## Releases
+
+The Git tag is the Python and Pixi package version. No manual version bump is needed. `setuptools-scm` writes
+`bosdi/_version.py` during the build and preserves the version in source archives. The Cargo package is a private static
+library with its own internal version; it is not published to crates.io.
+
+After merging the changes to `main`, tag the release commit and push the tag:
+
+```bash
+git switch main
+git pull --ff-only
+git tag -a v0.1.8 -m "Release 0.1.8"
+git push origin v0.1.8
+```
+
+Use the next unused version. The release workflow builds Python 3.12/3.13 wheels for Linux, macOS, and Windows, runs the
+release tests, and checks every artifact's filename and embedded version against the tag before publishing. Stable tags
+(`vX.Y.Z`) publish to PyPI; prereleases (`vX.Y.Za1`, `vX.Y.Zb1`, `vX.Y.Zrc1`, or `vX.Y.Z.dev1`) publish to TestPyPI and
+are marked as prereleases on GitHub.
+
+An existing GitHub release is updated and receives the build artifacts. Failed workflow jobs can be rerun; already
+published PyPI filenames are skipped. Package contents for a published version are immutable, so code changes require a
+new tag. Tagging alone does not update the committed changelog; review its Unreleased section before releasing.
+
+The old `v0.1.7` release did not publish a `0.1.7` package. Publish the repaired setup under a new unused tag rather
+than moving the existing release tag.

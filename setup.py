@@ -2,13 +2,9 @@ import os
 import sys
 import shutil
 import subprocess
-import tomllib
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 import nanobind
-
-with open(os.path.join(os.path.dirname(__file__), "pyproject.toml"), "rb") as _f:
-    _version = tomllib.load(_f)["project"]["version"]
 
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -120,7 +116,6 @@ osdi_extension = Extension(
 
 setup(
     name="bosdi",
-    version=_version,
     # --- THIS IS THE KEY CHANGE ---
     package_dir={"": "src"},
     # Top-level modules (back-compat): existing callers do

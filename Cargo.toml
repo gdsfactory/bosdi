@@ -1,9 +1,10 @@
 [package]
 name = "bosdi"
-version = "0.1.3"  # Keep in sync with pyproject.toml [project].version
+version = "0.1.3"  # Internal static library; Python distribution version comes from Git tags.
 edition = "2021"
 description = "Rust core for BOSDI: batched OSDI device model evaluation via libloading + Rayon"
 license = "MIT"
+publish = false
 
 [lib]
 crate-type = ["staticlib"]
