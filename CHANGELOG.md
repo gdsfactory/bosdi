@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Native Kelvin temperature and case-sensitive numeric `$simparam` settings at setup and evaluation, with immutable DC,
+  AC and transient analysis modes.
+- A process-local registration LRU keyed by binary identity, ABI and simulation settings. Native IDs remain registered
+  for the process lifetime after cache eviction.
+- Explicit `limiting_only` policy for audited models using state slots solely for `$limit`; native evaluation disables
+  limiting. General hidden-state history and native harmonic balance remain unsupported.
+- A separate Circulax integration environment and IHP device comparisons.
+- Git-derived release versions, artifact version validation and support for updating an existing GitHub release.
+- Installed-wheel smoke checks and Linux/Windows integration gates before publishing release artifacts.
+
 ### Removed
 
 - `bosdi/va/binding.py` and the optional `openvaf_py` PyO3 dependency. `bosdi.va.compile_va` now resolves to
@@ -15,6 +27,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Consumers that installed `openvaf-py` solely to call `compile_va` no longer need it.
 
 ### Fixed
+
+- Select node collapses during per-instance setup instead of applying all descriptor candidates, preserving active
+  resistance networks, ground sentinel handling and raw node layouts.
+
+- Apply eager and traced native parameter updates consistently.
+
+- Keep native imports independent of Circulax and lazily import VA adapter exports; use public Circulax Signals/States.
+
+- Correct backend and state-policy documentation, and exclude generated compiler files from source archives.
 
 - Four test files (`test_collapse_allowlist`, `test_branch_state_names`, `test_safe_divide_mode`,
   `test_emitter_keyword_params`) were gated behind `pytest.importorskip("openvaf_py")` and so never ran in CI — which

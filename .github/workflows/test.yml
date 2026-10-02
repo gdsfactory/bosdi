@@ -21,6 +21,9 @@ jobs:
       - run: pixi run install-openvaf
       - run: pixi run build
       - run: pixi run test
+      - run: pixi run wheel
+      - name: Check installed wheel
+        run: pixi run python scripts/smoke_wheel.py --install-from dist --model tests/compiled_osdi/resistor_va.osdi
       - name: Test Circulax integration
         run: pixi run --locked -e integration test-integration
 
@@ -51,5 +54,8 @@ jobs:
           Get-ChildItem test_resistor.osdi
 
       - run: pixi run test
+      - run: pixi run wheel
+      - name: Check installed wheel
+        run: pixi run python scripts/smoke_wheel.py --install-from dist --model tests/compiled_osdi/resistor_va.osdi
       - name: Test Circulax integration
         run: pixi run --locked -e integration test-integration

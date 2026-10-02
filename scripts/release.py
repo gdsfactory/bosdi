@@ -41,6 +41,12 @@ def validate_dist(directory: Path, version: Version) -> None:
         elif path.name.endswith(".tar.gz"):
             name, file_version = parse_sdist_filename(path.name)
             with tarfile.open(path) as archive:
+                for member in archive.getmembers():
+                    relative = member.name.partition("/")[2]
+                    if relative.startswith(("tests/compiled_osdi/", "tests/pdks/")):
+                        raise ValueError(
+                            f"Generated or external test artifact in {path.name}: {relative}"
+                        )
                 entries = [
                     m
                     for m in archive.getmembers()
