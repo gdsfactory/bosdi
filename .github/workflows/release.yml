@@ -1,11 +1,17 @@
 name: release
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and publish (for example v0.1.8)
+        required: true
+        type: string
   push:
     tags: ["v*.*.*"]
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -17,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
@@ -25,19 +32,24 @@ jobs:
       - name: Validate release tag
         id: tag
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: python scripts/release.py "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
   build-linux:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: pypa/cibuildwheel@v2.22
         env:
+          CIBW_ENVIRONMENT_PASS_LINUX: SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI
           CIBW_BUILD: "cp312-manylinux_x86_64 cp313-manylinux_x86_64"
           CIBW_TEST_COMMAND: "python {project}/scripts/smoke_wheel.py"
 
@@ -48,6 +60,9 @@ jobs:
 
   test-linux:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -89,6 +105,9 @@ jobs:
 
   build-macos:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -120,6 +140,9 @@ jobs:
 
   build-windows:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -129,6 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -165,6 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
           submodules: true
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -182,6 +207,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
           submodules: true
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -206,6 +232,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
@@ -222,7 +249,7 @@ jobs:
 
       - name: Validate artifact versions and metadata
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           python scripts/release.py "$RELEASE_TAG" --dist dist
           python -m twine check --strict dist/*
@@ -245,7 +272,7 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           PRERELEASE: ${{ needs.validate-tag.outputs.prerelease }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
