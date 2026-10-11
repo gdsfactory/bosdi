@@ -118,3 +118,50 @@ def test_va_decorator_jacobian_and_parameter_gradient():
         jax.grad(lambda r: resistor._fast_physics(voltage, resistor(r=r), 0.0)[0][0])
     )(2000.0)
     assert float(gradient) == pytest.approx(-1 / 2000**2)
+
+
+def test_va_decorator_accepts_circulax_delay_history():
+    """Circulax's solver entry passes a fourth ``hist`` argument."""
+    from bosdi.circulax import va_component
+
+    def jacobian(signals, s, r=1000):
+        conductance = jnp.array([[1, -1], [-1, 1]]) / r
+        return conductance, jnp.zeros((2, 2))
+
+    @va_component(ports=("p", "n"), jacobian_fn=jacobian, differentiable_params=("r",))
+    def resistor(signals, s, r=1000):
+        current = (signals.p - signals.n) / r
+        return {"p": current, "n": -current}, {}
+
+    voltage = jnp.array([1.0, 0.0])
+    for hist in (None, jnp.zeros(2)):
+        conductance = jax.jit(
+            jax.jacfwd(lambda y: resistor.solver_call(0.0, y, resistor(), hist)[0])
+        )(voltage)
+        np.testing.assert_allclose(
+            conductance, [[1e-3, -1e-3], [-1e-3, 1e-3]], atol=1e-15
+        )
+        gradient = jax.jit(
+            jax.grad(
+                lambda r: resistor.solver_call(0.0, voltage, resistor(r=r), hist)[0][0]
+            )
+        )(2000.0)
+        assert float(gradient) == pytest.approx(-1 / 2000**2)
+
+    netlist = {
+        "instances": {
+            "r": {"component": "resistor"},
+            "bias": {"component": "isource", "settings": {"I": -1e-3}},
+            "gnd": {"component": "ground"},
+        },
+        "connections": {"r,p": "bias,p1", "r,n": ["bias,p2", "gnd,p1"]},
+        "ports": {"out": "r,p"},
+    }
+    circuit = compile_circuit(
+        netlist,
+        {"resistor": resistor, "isource": CurrentSource},
+        backend="dense",
+        is_complex=False,
+        g_leak=0,
+    )
+    assert float(circuit.port(circuit.dc(), "out")) == pytest.approx(1.0)

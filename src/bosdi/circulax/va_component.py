@@ -266,9 +266,13 @@ def _install_custom_jvp(
         q_vals = jnp.array([q_dict.get(k, 0.0) for k in (ports + states)])
         return f_vals, q_vals, j_f, j_q
 
+    # Circulax with fixed-delay support calls ``_fast_physics(y, args, t, hist)``
+    # (``hist`` is None unless the group has a delay). Lowered Verilog-A has
+    # no delayed dependence, so ``hist`` is accepted and ignored here and in
+    # the JVP rule; older Circulax calls with three arguments.
     @jax.custom_jvp
     def fast_physics(
-        vars_vec: jax.Array, params: Any, t: float
+        vars_vec: jax.Array, params: Any, t: float, hist: Any = None
     ) -> tuple[jax.Array, jax.Array]:
         if _has_combined:
             f, q, _j_f, _j_q = _fast_combined(vars_vec, params, t)
@@ -276,11 +280,11 @@ def _install_custom_jvp(
         return raw_physics(vars_vec, params, t)
 
     def fast_physics_jvp(
-        primals: tuple[jax.Array, Any, float],
-        tangents: tuple[jax.Array, Any, float],
+        primals: tuple[jax.Array, Any, float, Any],
+        tangents: tuple[jax.Array, Any, float, Any],
     ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
-        y, params, t = primals
-        y_dot, params_dot, t_dot = tangents
+        y, params, t, _hist = primals
+        y_dot, params_dot, t_dot, _hist_dot = tangents
 
         # With symbolic_zeros=True JAX passes ``SymbolicZero`` (or ``Zero``)
         # for unperturbed arguments.  Materialise only when needed.
