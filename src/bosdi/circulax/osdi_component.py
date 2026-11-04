@@ -248,6 +248,7 @@ class OsdiModelDescriptor:
                 param_names=None if self.is_canonical else self.param_names,
                 default_params=self.default_params.copy(),
                 use_schur_reduction=self.use_schur_reduction,
+                version=self.model.osdi_version,
                 temperature=self.model.temperature,
                 analysis=analysis,
                 state_policy=self.state_policy,
@@ -265,6 +266,7 @@ class OsdiModelDescriptor:
             param_names=None if self.is_canonical else self.param_names,
             default_params=self.default_params.copy(),
             use_schur_reduction=self.use_schur_reduction,
+            version=self.model.osdi_version,
             temperature=self.model.temperature,
             analysis=self.model.analysis,
             state_policy=self.state_policy,
@@ -315,6 +317,7 @@ def osdi_component(
     default_params: dict | None = None,
     use_schur_reduction: bool = False,
     *,
+    version: str = "0.4",
     temperature: float = 300.0,
     analysis: str = "ac",
     state_policy: str = "reject",
@@ -335,6 +338,7 @@ def osdi_component(
         use_schur_reduction: Eliminate OSDI internal nodes via Schur complement
                         before global Newton (experimental).
 
+        version: OSDI ABI version ("0.4" or "0.5"); retained by variants.
         analysis: Immutable native evaluation mode (dc, ac, or tran). Default
                   ac preserves the full current/charge stamp API.
         temperature: Setup temperature in kelvin, retained across parameter
@@ -375,7 +379,11 @@ def osdi_component(
     if state_policy not in {"reject", "limiting_only"}:
         raise ValueError("state_policy must be reject or limiting_only")
     model = load_osdi_model(
-        osdi_path, temperature=temperature, analysis=analysis, simparams=simparams
+        osdi_path,
+        version=version,
+        temperature=temperature,
+        analysis=analysis,
+        simparams=simparams,
     )
 
     if model.num_pins != len(ports):

@@ -46,7 +46,7 @@ fn use_parallel(num_devices: usize) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OsdiVersion {
     V04 = 4,
-    V05 = 5,  // placeholder — layout not yet defined
+    V05 = 5,
 }
 
 impl OsdiVersion {
@@ -108,8 +108,17 @@ impl AbiLayout {
     fn for_version(ver: OsdiVersion) -> Option<Self> {
         match ver {
             OsdiVersion::V04 => Some(Self::v04()),
-            OsdiVersion::V05 => None,  // not yet implemented
+            OsdiVersion::V05 => Some(Self::v05()),
         }
+    }
+
+    // The mb-experimental OSDI 0.5 header preserves every descriptor field
+    // used by this evaluator, OsdiSimInfo, parameter/Jacobian entries, flags,
+    // and callback signatures from 0.4. Its appended delay metadata does not
+    // change this prefix. Keep the versions explicit so future ABI changes
+    // cannot silently alter the 0.4 path.
+    fn v05() -> Self {
+        Self::v04()
     }
 
     fn v04() -> Self {
@@ -151,7 +160,7 @@ impl AbiLayout {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. OSDI 0.4 ABI TYPES  (must match osdi_0_4.h layout exactly)
+// 2. SHARED OSDI 0.4 / 0.5 ABI TYPES
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// OsdiSimParas — 4 pointers, 32 bytes total.
@@ -173,7 +182,7 @@ unsafe impl Send for OsdiSimParas {}
 ///   offset 56: next_state
 ///   offset 64: flags     (u32)        ← eval checks CALC_RESIST_RESIDUAL here
 ///
-/// OSDI 0.4 only. For V05: use layout-driven raw buffer (see AbiLayout::sim_info_*).
+/// Shared by osdi_0_4.h and the experimental osdi_0_5.h.
 #[repr(C)]
 struct OsdiSimInfo {
     paras:      OsdiSimParas,
@@ -264,8 +273,7 @@ type SetupInstanceFn = unsafe extern "C" fn(
 
 /// Called each Newton step to compute residuals.
 /// Returns EVAL_RET_FLAG_* bits (0 = ok).
-/// Last arg is *mut c_void (not *mut OsdiSimInfo) so the 0.4 typed path and a
-/// future layout-driven raw-buffer path can both use the same fn pointer type.
+/// Both supported versions use the same OsdiSimInfo layout.
 type EvalFn = unsafe extern "C" fn(
     handle:   *mut c_void,
     inst:     *mut c_void,
@@ -569,6 +577,18 @@ pub extern "C" fn load_osdi_library_with_simparams(
             };
             *s
         }};
+    }
+
+    // Validate before interpreting any descriptor memory. A caller-selected
+    // version must agree with the binary even when the consumed prefix matches.
+    let major_ptr = sym!(lib, b"OSDI_VERSION_MAJOR", *const u32);
+    let minor_ptr = sym!(lib, b"OSDI_VERSION_MINOR", *const u32);
+    let (major, minor) = unsafe { (*major_ptr, *minor_ptr) };
+    if major != 0 || minor != version {
+        set_last_error(format!(
+            "OSDI: binary exports ABI {major}.{minor}, requested 0.{version}"
+        ));
+        return fail();
     }
 
     // ── read descriptor metadata ──────────────────────────────────────────────

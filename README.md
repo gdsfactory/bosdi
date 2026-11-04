@@ -157,13 +157,21 @@ Pass `jnp.nan` for any parameter to use its Verilog-A default. Parameters can be
 
 ## Limitations
 
-- **Platform:** Linux, macOS, and Windows; Python 3.11+; OSDI 0.4 ABI only. `.osdi` binaries are platform-specific —
-  compile from `.va` sources via [openvaf-r](https://github.com/cdaunt/OpenVAF) on each target
+- **Platform:** Linux, macOS, and Windows; Python 3.11+; OSDI 0.4 and experimental 0.5 ABIs. `.osdi` binaries are
+  platform-specific — compile from `.va` sources via [openvaf-r](https://github.com/cdaunt/OpenVAF) on each target
 - **OSDI differentiability:** `jax.grad()` works through node voltages only, not model parameters — use the VA path for
   parameter gradients
 - **ABI states** (`num_states > 0`): the descriptor rejects these by default. Audited OpenVAF voltage-limiting slots may
   use the explicit policy described below; generic history-dependent state is unsupported.
 - **VA lowering (alpha):** user-defined `analog function` calls and noise contributions are not yet supported
+
+### OSDI ABI version
+
+For binaries compiled by OpenVAF's `mb-experimental` branch, use `load_osdi_model(path, version="0.5")` or
+`osdi_component(path, ports, version="0.5")`. The default remains `"0.4"`. Bosdi checks the binary's exported version
+before reading its descriptor. Analysis and simulator-setting variants retain the selected ABI. Both versions support
+the same F/Q and Jacobian API; the 0.5 delay metadata does not add delay-history, `$abstime`, noise, or nature-aware
+simulation support.
 
 ### Native OSDI node collapse
 

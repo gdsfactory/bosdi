@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Experimental OSDI 0.5 ABI support via `version="0.5"` in `load_osdi_model` and `osdi_component`, preserving the
+  selected ABI across analysis and simulator-setting variants. Binary ABI exports are checked before descriptor access.
+
 ### Removed
 
 - `bosdi/va/binding.py` and the optional `openvaf_py` PyO3 dependency. `bosdi.va.compile_va` now resolves to
