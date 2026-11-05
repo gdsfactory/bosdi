@@ -67,6 +67,9 @@ disables OSDI limiting, so these slots do not require solver history. This optio
 history, `$abstime`, or harmonic-balance support. Charge unknowns in the circuit equations are distinct from OSDI state
 slots and remain part of the circuit state.
 
+For actual configured per-instance mappings, use `OsdiBatchHandle.topology`, not candidate pairs. See
+[configured batch topology](batch_topology.md) for the complete reduced-assembly contract.
+
 ## Outputs
 
 Outputs are one row per *unknown* — terminals first, then internal Kirchhoff nodes and branch-current auxiliaries.

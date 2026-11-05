@@ -46,7 +46,7 @@ fn use_parallel(num_devices: usize) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OsdiVersion {
     V04 = 4,
-    V05 = 5,  // placeholder — layout not yet defined
+    V05 = 5,
 }
 
 impl OsdiVersion {
@@ -108,8 +108,17 @@ impl AbiLayout {
     fn for_version(ver: OsdiVersion) -> Option<Self> {
         match ver {
             OsdiVersion::V04 => Some(Self::v04()),
-            OsdiVersion::V05 => None,  // not yet implemented
+            OsdiVersion::V05 => Some(Self::v05()),
         }
+    }
+
+    // The mb-experimental OSDI 0.5 header preserves every descriptor field
+    // used by this evaluator, OsdiSimInfo, parameter/Jacobian entries, flags,
+    // and callback signatures from 0.4. Its appended delay metadata does not
+    // change this prefix. Keep the versions explicit so future ABI changes
+    // cannot silently alter the 0.4 path.
+    fn v05() -> Self {
+        Self::v04()
     }
 
     fn v04() -> Self {
@@ -151,7 +160,7 @@ impl AbiLayout {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. OSDI 0.4 ABI TYPES  (must match osdi_0_4.h layout exactly)
+// 2. SHARED OSDI 0.4 / 0.5 ABI TYPES
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// OsdiSimParas — 4 pointers, 32 bytes total.
@@ -173,7 +182,7 @@ unsafe impl Send for OsdiSimParas {}
 ///   offset 56: next_state
 ///   offset 64: flags     (u32)        ← eval checks CALC_RESIST_RESIDUAL here
 ///
-/// OSDI 0.4 only. For V05: use layout-driven raw buffer (see AbiLayout::sim_info_*).
+/// Shared by osdi_0_4.h and the experimental osdi_0_5.h.
 #[repr(C)]
 struct OsdiSimInfo {
     paras:      OsdiSimParas,
@@ -264,8 +273,7 @@ type SetupInstanceFn = unsafe extern "C" fn(
 
 /// Called each Newton step to compute residuals.
 /// Returns EVAL_RET_FLAG_* bits (0 = ok).
-/// Last arg is *mut c_void (not *mut OsdiSimInfo) so the 0.4 typed path and a
-/// future layout-driven raw-buffer path can both use the same fn pointer type.
+/// Both supported versions use the same OsdiSimInfo layout.
 type EvalFn = unsafe extern "C" fn(
     handle:   *mut c_void,
     inst:     *mut c_void,
@@ -569,6 +577,18 @@ pub extern "C" fn load_osdi_library_with_simparams(
             };
             *s
         }};
+    }
+
+    // Validate before interpreting any descriptor memory. A caller-selected
+    // version must agree with the binary even when the consumed prefix matches.
+    let major_ptr = sym!(lib, b"OSDI_VERSION_MAJOR", *const u32);
+    let minor_ptr = sym!(lib, b"OSDI_VERSION_MINOR", *const u32);
+    let (major, minor) = unsafe { (*major_ptr, *minor_ptr) };
+    if major != 0 || minor != version {
+        set_last_error(format!(
+            "OSDI: binary exports ABI {major}.{minor}, requested 0.{version}"
+        ));
+        return fail();
     }
 
     // ── read descriptor metadata ──────────────────────────────────────────────
@@ -1654,6 +1674,32 @@ pub extern "C" fn osdi_handle_num_devices(handle_id: u64) -> usize {
 pub extern "C" fn osdi_handle_num_nodes(handle_id: u64) -> usize {
     let model_id = HANDLES.read().unwrap().get(&handle_id).map(|h| h.model_id);
     model_id.map(|id| osdi_model_num_nodes(id)).unwrap_or(0)
+}
+
+/// Copy the exact post-setup map used by handle evaluation, device-major.
+/// Values are raw surviving indices; -1 denotes the private ground sink.
+/// Returns the external terminal count, or -1 for an invalid handle/length.
+/// No topology is recomputed and evaluation never mutates these snapshots.
+#[no_mangle]
+pub unsafe extern "C" fn osdi_handle_topology_ffi(
+    handle_id: u64, out: *mut i32, len: usize,
+) -> i32 {
+    let handles = HANDLES.read().unwrap();
+    let Some(h) = handles.get(&handle_id) else { return -1; };
+    let registry = OSDI_REGISTRY.read().unwrap();
+    let Some(m) = registry.get(&h.model_id) else { return -1; };
+    if len != h.num_devices * m.num_all_nodes || (len > 0 && out.is_null()) {
+        return -1;
+    }
+    for device in 0..h.num_devices {
+        for node in 0..m.num_all_nodes {
+            let offset = device * m.instance_size + m.node_map_off + node * 4;
+            let slot = (h.inst_data_flat.as_ptr().add(offset) as *const i32).read_unaligned();
+            *out.add(device * m.num_all_nodes + node) =
+                if slot == m.num_all_nodes as i32 { -1 } else { slot };
+        }
+    }
+    m.num_terminals as i32
 }
 
 /// Full-stamp batched eval reusing the handle's pre-setup state.

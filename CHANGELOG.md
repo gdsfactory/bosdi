@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Experimental OSDI 0.5 ABI support via `version="0.5"` in `load_osdi_model` and `osdi_component`, preserving the
+  selected ABI across analysis and simulator-setting variants. Binary ABI exports are checked before descriptor access.
 - Native Kelvin temperature and case-sensitive numeric `$simparam` settings at setup and evaluation, with immutable DC,
   AC and transient analysis modes.
 - A process-local registration LRU keyed by binary identity, ABI and simulation settings. Native IDs remain registered
