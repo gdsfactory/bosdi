@@ -1,11 +1,17 @@
 name: release
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and publish (for example v0.1.8)
+        required: true
+        type: string
   push:
     tags: ["v*.*.*"]
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -17,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
@@ -25,20 +32,26 @@ jobs:
       - name: Validate release tag
         id: tag
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: python scripts/release.py "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
   build-linux:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: pypa/cibuildwheel@v2.22
         env:
+          CIBW_ENVIRONMENT_PASS_LINUX: SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI
           CIBW_BUILD: "cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+          CIBW_TEST_COMMAND: "python {project}/scripts/smoke_wheel.py"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -47,6 +60,9 @@ jobs:
 
   test-linux:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -88,6 +105,9 @@ jobs:
 
   build-macos:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -109,6 +130,9 @@ jobs:
       - name: Build wheel
         run: pixi run -e ${{ matrix.python-env }} wheel
 
+      - name: Check installed wheel
+        run: pixi run -e ${{ matrix.python-env }} python scripts/smoke_wheel.py --install-from dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos-${{ matrix.python-env }}
@@ -116,6 +140,9 @@ jobs:
 
   build-windows:
     needs: validate-tag
+    env:
+      # Packaging must use the validated tag even if build tools dirty the checkout.
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BOSDI: ${{ needs.validate-tag.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -125,6 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -147,13 +175,55 @@ jobs:
       - name: Build wheel
         run: pixi run -e ${{ matrix.python-env }} wheel
 
+      - name: Check installed wheel
+        run: pixi run -e ${{ matrix.python-env }} python scripts/smoke_wheel.py --install-from dist --model tests/compiled_osdi/resistor_va.osdi
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-windows-${{ matrix.python-env }}
           path: dist/
 
+  integration-linux:
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          fetch-depth: 0
+          submodules: true
+      - uses: prefix-dev/setup-pixi@v0.8.1
+      - name: Install LLVM 18
+        run: |
+          sudo apt-get install -y llvm-18-dev llvm-18 clang-18 libclang-18-dev
+          sudo ln -sf /usr/bin/llvm-lib-18 /usr/bin/llvm-lib
+      - run: pixi run install-openvaf
+      - name: Test Circulax integration
+        run: pixi run --locked -e integration test-integration
+
+  integration-windows:
+    needs: validate-tag
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          fetch-depth: 0
+          submodules: true
+      - uses: prefix-dev/setup-pixi@v0.8.1
+
+      - name: Install openvaf-r (pre-built)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://fides.fe.uni-lj.si/openvaf/download/openvaf-reloaded-20260616-2-gc592eed6-win_x64.zip" -OutFile openvaf.zip
+          Expand-Archive openvaf.zip -DestinationPath "$env:USERPROFILE\.local\bin"
+          echo "$env:USERPROFILE\.local\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Test Circulax integration
+        run: pixi run --locked -e integration test-integration
+
   publish:
-    needs: [validate-tag, build-linux, test-linux, build-macos, build-windows]
+    needs: [validate-tag, build-linux, test-linux, build-macos, build-windows, integration-linux, integration-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -162,6 +232,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
@@ -178,7 +249,7 @@ jobs:
 
       - name: Validate artifact versions and metadata
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           python scripts/release.py "$RELEASE_TAG" --dist dist
           python -m twine check --strict dist/*
@@ -201,7 +272,7 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           PRERELEASE: ${{ needs.validate-tag.outputs.prerelease }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

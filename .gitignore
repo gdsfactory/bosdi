@@ -10,6 +10,7 @@ src/devices/ihp_sg13g2/
 
 # Compiled OSDI binaries (built at test time from .va sources)
 *.osdi
+tests/compiled_osdi/
 
 # build artifacts
 build/

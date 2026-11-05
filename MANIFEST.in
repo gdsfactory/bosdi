@@ -5,3 +5,6 @@ recursive-include _nanobind_src *
 
 # Upstream PDK checkout is a test dependency, not package contents.
 prune tests/pdks
+
+# Generated model libraries and compiler intermediates are not source inputs.
+prune tests/compiled_osdi

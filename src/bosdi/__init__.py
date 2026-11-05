@@ -1,20 +1,14 @@
-"""bosdi — Verilog-A support for circulax (compiled OSDI + differentiable MIR).
+"""Verilog-A support through compiled OSDI libraries and differentiable MIR.
 
-Two backends are exposed:
+Native modules (``osdi_loader``, ``osdi_jax``, ``osdi_debug``) evaluate
+OpenVAF-compiled shared libraries through the Rust/C++ JAX FFI. Voltage
+Jacobians are supported; compiled model parameters are not differentiable.
+Native imports do not require Circulax.
 
-- ``bosdi.osdi``  — load OpenVAF-compiled ``.osdi`` shared libraries and
-  evaluate them via Rayon-parallel C FFI calls (see ``osdi_loader``,
-  ``osdi_jax``, ``osdi_debug``).  This is the static / non-differentiable
-  path; the OSDI library does the physics in compiled C.
-
-- ``bosdi.va``    — read the compiler's MIR via the ``openvaf_py`` PyO3
-  binding, run SCCP / dead-block elimination on it, and lower to JAX-
-  traceable Python code.  Slower per-step but parameters stay as JAX
-  inputs so ``jax.grad`` and ``jax.vmap`` work end-to-end.
-
-The two paths share the bosdi Rust core; the VA backend is opt-in (it
-needs ``openvaf_py`` installed; if absent only the OSDI path is
-available).
+``bosdi.va`` obtains MIR using the external ``openvaf-r --dump-json``
+compiler, simplifies it and emits JAX-traceable Python. This path supports
+parameter differentiation and requires a compiler with the JSON dump option,
+not an ``openvaf_py`` Python binding.
 """
 
 # OSDI path — top-level modules are still importable directly
