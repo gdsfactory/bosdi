@@ -182,6 +182,11 @@ preserves a fixed shape for batches whose instances have different parasitic res
 native paths use the same mapping. Physical currents and charges are stamped into the surviving node; equality rows
 carry no charge.
 
+For sparse local stamps, `osdi_eval_sparse_with_handle(handle, voltages, states)` returns raw OSDI Jacobian values with
+shape `(B, nnz)` and no dense matrix intermediate. `handle.sparse_pattern` provides per-device row/column targets and
+separate equality derivatives. The [raw-entry API and benchmark](docs/batch_topology.md#opt-in-raw-entry-jacobians)
+describe assembly, JAX differentiation, and the native C ABI. The dense API remains the default.
+
 `handle.topology` exposes each configured instance's actual raw-slot-to-survivor mapping, including ground and a
 physical-row mask for reduced global assembly. Evaluation buffer shapes stay unchanged. See the
 [configured batch topology API and Circulax consumer example](docs/batch_topology.md) for allocation, gathering,
