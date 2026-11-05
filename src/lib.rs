@@ -1676,6 +1676,32 @@ pub extern "C" fn osdi_handle_num_nodes(handle_id: u64) -> usize {
     model_id.map(|id| osdi_model_num_nodes(id)).unwrap_or(0)
 }
 
+/// Copy the exact post-setup map used by handle evaluation, device-major.
+/// Values are raw surviving indices; -1 denotes the private ground sink.
+/// Returns the external terminal count, or -1 for an invalid handle/length.
+/// No topology is recomputed and evaluation never mutates these snapshots.
+#[no_mangle]
+pub unsafe extern "C" fn osdi_handle_topology_ffi(
+    handle_id: u64, out: *mut i32, len: usize,
+) -> i32 {
+    let handles = HANDLES.read().unwrap();
+    let Some(h) = handles.get(&handle_id) else { return -1; };
+    let registry = OSDI_REGISTRY.read().unwrap();
+    let Some(m) = registry.get(&h.model_id) else { return -1; };
+    if len != h.num_devices * m.num_all_nodes || (len > 0 && out.is_null()) {
+        return -1;
+    }
+    for device in 0..h.num_devices {
+        for node in 0..m.num_all_nodes {
+            let offset = device * m.instance_size + m.node_map_off + node * 4;
+            let slot = (h.inst_data_flat.as_ptr().add(offset) as *const i32).read_unaligned();
+            *out.add(device * m.num_all_nodes + node) =
+                if slot == m.num_all_nodes as i32 { -1 } else { slot };
+        }
+    }
+    m.num_terminals as i32
+}
+
 /// Full-stamp batched eval reusing the handle's pre-setup state.
 /// `num_devices` is the number of devices the CALLER wants evaluated (derived
 /// from the voltages buffer). If it's greater than `h.num_devices`, the

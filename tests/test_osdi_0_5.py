@@ -123,6 +123,17 @@ def test_rc_stamp_and_voltage_gradient(binary, analysis, cached):
         np.testing.assert_allclose(gradient, [[g, -g]])
 
 
+def test_batch_topology_identity_and_update(binary):
+    descriptor = osdi_component(str(binary), ("p", "n"), version="0.5")
+    handle = descriptor.setup_batch([{"r": 500}, {"r": 2000}])
+    np.testing.assert_array_equal(handle.topology.raw_to_representative, [[0, 1]] * 2)
+    assert handle.topology.physical_row_mask.all()
+    assert handle.topology.num_terminals == 2
+    updated = handle.with_params(np.full((2, descriptor.model.num_params), np.nan))
+    assert updated.handle_id != handle.handle_id
+    np.testing.assert_array_equal(updated.topology.raw_to_representative, [[0, 1]] * 2)
+
+
 def test_defaults_and_variants(binary):
     descriptor = osdi_component(str(binary), ("p", "n"), version="0.5")
     for variant in [

@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -309,6 +311,32 @@ jffi.register_ffi_target(
 )
 
 
+@dataclass(frozen=True, eq=False)
+class OsdiBatchTopology:
+    """Immutable topology snapshot belonging to one configured handle.
+
+    ``raw_to_representative[d, r]`` is a raw slot index, or -1 for ground
+    (including setup-disabled auxiliary slots). Representatives map to
+    themselves. External terminals occupy ``0:num_terminals``; remaining
+    representatives are internal unknowns, including active dynamics/noise
+    auxiliaries. Only setup-selected collapses remove slots.
+
+    ``physical_row_mask`` excludes equality rows and ground rows. Apply it
+    before scattering F, Q, G, C; gather voltages through the map. Shapes of
+    all evaluation buffers stay unchanged. See docs/batch_topology.md.
+    """
+
+    handle_id: int
+    model_id: int
+    num_terminals: int
+    raw_to_representative: np.ndarray
+
+    @property
+    def physical_row_mask(self):
+        mapping = self.raw_to_representative
+        return mapping == np.arange(mapping.shape[1])
+
+
 class OsdiBatchHandle:
     """Opaque handle holding pre-setup (model_data, inst_data) snapshots for N
     devices. Returned by :func:`osdi_setup_batch`. Auto-freed on garbage
@@ -323,6 +351,32 @@ class OsdiBatchHandle:
         self.num_devices = int(num_devices)
         self.num_params = int(num_params)
         self._alive = True
+
+    @property
+    def topology(self):
+        """Read the exact native post-setup map; raises after :meth:`free`."""
+        if not self._alive:
+            raise RuntimeError("OsdiBatchHandle has been freed.")
+        mapping, devices, nodes, terminals = osdi_shim_nb.osdi_handle_topology(
+            self.handle_id
+        )
+        # Bytes-backed storage cannot be made writable by a consumer.
+        array = np.frombuffer(
+            np.asarray(mapping, dtype=np.int32).tobytes(), dtype=np.int32
+        ).reshape(devices, nodes)
+        return OsdiBatchTopology(self.handle_id, self.model_id, terminals, array)
+
+    def with_params(self, params):
+        """Configure a new independent handle and topology for updated parameters.
+
+        The original handle stays valid for existing compiled evaluations.
+        Rebuild global indexing if the new topology differs. Temperature,
+        analysis and simulator settings are fixed by the model registration;
+        changing them requires a new registration and batch.
+        """
+        if not self._alive:
+            raise RuntimeError("OsdiBatchHandle has been freed.")
+        return osdi_setup_batch(self.model_id, params)
 
     def free(self):
         if self._alive:

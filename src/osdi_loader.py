@@ -45,8 +45,8 @@ class OsdiModel:
     num_states: int
     osdi_version: str
     resistive_mask: list  # len == num_nodes; True iff G[i,:] can be non-zero at DC
-    # Raw OSDI node-index pairs (0..num_nodes, pre-collapse). Use the collapsible
-    # pairs to compute which internal slots merge onto terminals.
+    # Raw candidate node pairs (pre-collapse); these are NOT setup decisions.
+    # Use OsdiBatchHandle.topology for the actual per-instance mapping.
     resist_jac_pairs: list = field(default_factory=list)
     react_jac_pairs: list = field(default_factory=list)
     collapsible_pairs: list = field(default_factory=list)

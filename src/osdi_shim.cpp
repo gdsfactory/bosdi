@@ -3,6 +3,7 @@
 #include <vector>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 #include <nanobind/stl/map.h>
 #include <map>
 #include "xla/ffi/api/ffi.h"
@@ -96,6 +97,7 @@ extern "C" {
         size_t num_params,
         const double* params
     );
+    int32_t osdi_handle_topology_ffi(uint64_t handle_id, int32_t* out, size_t len);
     void osdi_free_handle_ffi(uint64_t handle_id);
     size_t osdi_handle_num_devices(uint64_t handle_id);
     size_t osdi_handle_num_nodes(uint64_t handle_id);
@@ -405,6 +407,15 @@ NB_MODULE(osdi_shim_nb, m) {
         );
     }, nb::arg("model_id"), nb::arg("num_devices"),
        nb::arg("num_params"), nb::arg("params_addr"));
+
+    m.def("osdi_handle_topology", [](uint64_t handle_id) {
+        size_t devices = osdi_handle_num_devices(handle_id);
+        size_t nodes = osdi_handle_num_nodes(handle_id);
+        std::vector<int32_t> mapping(devices * nodes);
+        int32_t terminals = osdi_handle_topology_ffi(handle_id, mapping.data(), mapping.size());
+        if (terminals < 0) throw nb::value_error("Unknown or freed OSDI batch handle");
+        return nb::make_tuple(mapping, devices, nodes, terminals);
+    }, nb::arg("handle_id"));
 
     m.def("osdi_free_handle", [](uint64_t handle_id) {
         osdi_free_handle_ffi(handle_id);

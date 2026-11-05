@@ -40,26 +40,29 @@ Bosdi can write REAL and INT params through the f64 array (INT is rounded from t
 `OsdiModel` carries the structural data bosdi decoded from the OSDI descriptor, useful for building Jacobian stamps or
 validating a model before wiring it into a solver:
 
-| Field                              | Meaning                                                                                              |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `num_pins`                         | Number of external terminals                                                                         |
-| `num_nodes`                        | Total unknowns = terminals + internal Kirchhoff nodes + branch-current aux                           |
-| `num_states`                       | Stateful-model limiter state count (non-zero → bosdi skips eval, for now)                            |
-| `num_resist_jac` / `num_react_jac` | Count of Jacobian entries with the variable RESIST / REACT flag                                      |
-| `resist_jac_pairs`                 | `List[(node_1, node_2)]` — raw OSDI indices of each resistive Jacobian entry                         |
-| `react_jac_pairs`                  | `List[(node_1, node_2)]` — same for reactive (dQ/dV)                                                 |
-| `collapsible_pairs`                | `List[(node_1, node_2)]` — internal nodes that collapse onto terminals when a coupling param is zero |
-| `resistive_mask`                   | `List[bool]` of length `num_nodes` — `True` iff that unknown's row can be non-zero at DC             |
-| `param_names`                      | Canonical alias-0 name per param, in OSDI index order                                                |
-| `param_flags`                      | Raw `OsdiParamOpvar.flags` per param (kind/type bits)                                                |
-| `.param_kinds()`                   | Decoded `["INST", "MODEL", "OPVAR", ...]`                                                            |
-| `.param_types()`                   | Decoded `["REAL", "INT", "STR", ...]`                                                                |
+| Field                              | Meaning                                                                                   |
+| ---------------------------------- | ----------------------------------------------------------------------------------------- |
+| `num_pins`                         | Number of external terminals                                                              |
+| `num_nodes`                        | Total unknowns = terminals + internal Kirchhoff nodes + branch-current aux                |
+| `num_states`                       | Stateful-model limiter state count (non-zero → bosdi skips eval, for now)                 |
+| `num_resist_jac` / `num_react_jac` | Count of Jacobian entries with the variable RESIST / REACT flag                           |
+| `resist_jac_pairs`                 | `List[(node_1, node_2)]` — raw OSDI indices of each resistive Jacobian entry              |
+| `react_jac_pairs`                  | `List[(node_1, node_2)]` — same for reactive (dQ/dV)                                      |
+| `collapsible_pairs`                | `List[(node_1, node_2)]` — candidate raw-node collapses; not per-instance setup decisions |
+| `resistive_mask`                   | `List[bool]` of length `num_nodes` — `True` iff that unknown's row can be non-zero at DC  |
+| `param_names`                      | Canonical alias-0 name per param, in OSDI index order                                     |
+| `param_flags`                      | Raw `OsdiParamOpvar.flags` per param (kind/type bits)                                     |
+| `.param_kinds()`                   | Decoded `["INST", "MODEL", "OPVAR", ...]`                                                 |
+| `.param_types()`                   | Decoded `["REAL", "INT", "STR", ...]`                                                     |
 
-Indices in `*_jac_pairs` are **raw OSDI node indices** (pre-collapse, 0..num_raw_nodes). After bosdi applies
-`collapsible_pairs`, the resulting `num_nodes`-wide output rows are mapped through an internal `node_map` before the
+Indices in `*_jac_pairs` are **raw OSDI node indices** (pre-collapse, 0..num_raw_nodes). After instance setup selects
+active collapse flags, the resulting `num_nodes`-wide output rows are mapped through an internal `node_map` before the
 scatter. Structural tests should assert against `resist_jac_pairs`/`react_jac_pairs`; callers that want to stamp the
 Jacobian into their host system's matrix should use the `cond`/`cap` outputs, which already run through the collapse and
 are shaped `num_nodes × num_nodes`.
+
+For actual configured per-instance mappings, use `OsdiBatchHandle.topology`, not candidate pairs. See
+[configured batch topology](batch_topology.md) for the complete reduced-assembly contract.
 
 ## Outputs
 

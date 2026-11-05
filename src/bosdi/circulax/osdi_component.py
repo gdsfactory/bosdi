@@ -293,6 +293,25 @@ class OsdiModelDescriptor:
             out[self.param_names[idx]] = v
         return out
 
+    def setup_batch(self, instances):
+        """Configure instance settings and return a handle with actual topology.
+
+        ``instances`` is an iterable of settings mappings in batch order.
+        Defaults and case-insensitive names follow :meth:`make_instance`.
+        Parameter columns follow this descriptor's order, as in the existing
+        compiler API (explicit ``param_names`` rename columns positionally).
+        Use the returned handle for both topology inspection and evaluation.
+        """
+        import numpy as np
+        from osdi_jax import osdi_setup_batch
+
+        settings = [self.make_instance(dict(instance)) for instance in instances]
+        params = np.asarray(
+            [[values[name] for name in self.param_names] for values in settings],
+            dtype=np.float64,
+        ).reshape(len(settings), self.model.num_params)
+        return osdi_setup_batch(self.model.id, params)
+
     def make_instance(self, settings: dict) -> dict:
         """Merge per-instance ``settings`` into ``default_params`` by canonical name."""
         merged = dict(self.default_params)

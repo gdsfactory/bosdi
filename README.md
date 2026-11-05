@@ -182,6 +182,11 @@ preserves a fixed shape for batches whose instances have different parasitic res
 native paths use the same mapping. Physical currents and charges are stamped into the surviving node; equality rows
 carry no charge.
 
+`handle.topology` exposes each configured instance's actual raw-slot-to-survivor mapping, including ground and a
+physical-row mask for reduced global assembly. Evaluation buffer shapes stay unchanged. See the
+[configured batch topology API and Circulax consumer example](docs/batch_topology.md) for allocation, gathering,
+scattering, and parameter-update requirements.
+
 ### Integral operators and analysis modes
 
 `load_osdi_model(..., analysis="dc" | "ac" | "tran")` and `osdi_component(..., analysis=...)` select an immutable
