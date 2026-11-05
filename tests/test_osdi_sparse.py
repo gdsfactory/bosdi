@@ -45,6 +45,11 @@ def assert_equivalent(handle, v, s):
         assert sparse[index].tobytes() == dense[index].tobytes()
     pattern = handle.sparse_pattern
     nodes = v.shape[1]
+    physical_rows = handle.topology.physical_row_mask
+    for pairs in (pattern.resist_pairs, pattern.react_pairs):
+        for d, entries in enumerate(pairs):
+            rows = entries[:, 0]
+            assert physical_rows[d, rows[rows >= 0]].all()
     g = reconstruct(sparse[1], pattern.resist_pairs, nodes)
     # Dense equality rows overwrite these positions after the raw scatter.
     for d, entries in enumerate(pattern.equality_pairs):
@@ -165,7 +170,7 @@ def test_sparse_invalid_shapes_and_freed_handle(series_rc):
     model = series_rc
     handle = osdi_setup_batch(model.id, np.full((2, model.num_params), np.nan))
     state = jnp.zeros((2, model.num_states))
-    with pytest.raises(Exception, match="voltage width must equal"):
+    with pytest.raises(ValueError, match="voltage width must equal"):
         osdi_eval_sparse_with_handle(handle, jnp.zeros((2, model.num_pins)), state)[
             0
         ].block_until_ready()
@@ -211,3 +216,30 @@ def test_sparse_05_header(binary, analysis):
     assert_equivalent(
         handle, jnp.ones((3, model.num_nodes)), jnp.zeros((3, model.num_states))
     )
+
+
+@pytest.mark.parametrize("width_delta", [-1, 1])
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("residual_only", [False, True])
+def test_sparse_wrong_width_rejected_before_ffi(
+    series_rc, monkeypatch, width_delta, compiled, residual_only
+):
+    model = series_rc
+    handle = osdi_setup_batch(model.id, np.full((2, model.num_params), np.nan))
+    state = jnp.zeros((2, model.num_states))
+    voltage = jnp.zeros((2, model.num_nodes + width_delta))
+
+    def unexpected_ffi(*args, **kwargs):
+        pytest.fail("wrong-width sparse call reached the FFI")
+
+    monkeypatch.setattr("osdi_jax.jffi.ffi_call", unexpected_ffi)
+
+    def evaluate(v):
+        if residual_only:
+            return osdi_residual_eval_with_handle(handle, v, state, sparse=True)
+        return osdi_eval_sparse_with_handle(handle, v, state)
+
+    if compiled:
+        evaluate = jax.jit(evaluate)
+    with pytest.raises(ValueError, match="voltage width must equal"):
+        evaluate(voltage)

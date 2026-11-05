@@ -435,7 +435,9 @@ class OsdiBatchHandle:
             raise RuntimeError("OsdiBatchHandle has been freed.")
         if self._sparse_evaluators is None:
             self._sparse_evaluators = _make_sparse_handle_evaluators(
-                self.handle_id, self.sparse_pattern
+                self.handle_id,
+                self.sparse_pattern,
+                self.topology.raw_to_representative.shape[1],
             )
         return self._sparse_evaluators
 
@@ -694,11 +696,20 @@ def _sparse_matvec(values, pairs, tangent):
     ).reshape(devices, nodes)
 
 
-def _make_sparse_handle_evaluators(handle_id, pattern):
+def _make_sparse_handle_evaluators(handle_id, pattern, num_nodes):
     resist_n, react_n = pattern.resist_pairs.shape[1], pattern.react_pairs.shape[1]
 
-    def impl(voltages, old_state):
+    def validate_voltages(voltages):
         v = jnp.asarray(voltages, dtype=jnp.float64)
+        if v.ndim != 2 or v.shape[1] != num_nodes:
+            raise ValueError(
+                f"OSDI sparse voltage width must equal handle model.num_nodes "
+                f"({num_nodes} all raw nodes); expected (B, {num_nodes}), got {v.shape}"
+            )
+        return v
+
+    def impl(voltages, old_state):
+        v = validate_voltages(voltages)
         s = jnp.asarray(old_state, dtype=jnp.float64)
         devices, nodes = v.shape
         shapes = tuple(
@@ -737,6 +748,8 @@ def _make_sparse_handle_evaluators(handle_id, pattern):
             jnp.asarray(pattern.equality_values),
             (t_v.shape[0] // pattern.equality_values.shape[0], 1),
         )
+        # Raw rows map to survivors, so equality rows have no raw entries.
+        # Adding the equality stamp is equivalent to the dense overwrite.
         t_f += _sparse_matvec(eq_values, pattern.equality_pairs, t_v)
         t_q = _sparse_matvec(c, pattern.react_pairs, t_v)
         return t_f, t_q, jnp.zeros_like(ns)
@@ -758,7 +771,7 @@ def _make_sparse_handle_evaluators(handle_id, pattern):
 
     @jax.custom_jvp
     def residual(v, s):
-        return _osdi_residual_eval_handle_vmap(handle_id, v, s)
+        return _osdi_residual_eval_handle_vmap(handle_id, validate_voltages(v), s)
 
     @residual.defjvp
     def residual_jvp(primals, tangent_values):

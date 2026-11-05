@@ -181,9 +181,11 @@ analysis, reactive values are zero. Zero-entry arrays have width zero and requir
 Equality derivatives are not raw OSDI entries. After accumulating raw entries, apply `pattern.equality_pairs` /
 `pattern.equality_values` to the resistive Jacobian. These device-major arrays have shapes `(B, 2*N, 2)` and `(B, 2*N)`;
 unused entries have target `(-1, -1)` and value zero. Grounded slots have a `+1` diagonal; other collapsed slots also
-have a `-1` in the survivor column. The equality entries overwrite their target positions, matching the dense path. They
-do not contribute to the reactive Jacobian. Reduced global assembly can exclude equality rows with
-`handle.topology.physical_row_mask` instead.
+have a `-1` in the survivor column. The dense path overwrites these target positions. Raw entry rows map through
+`node_map` to surviving rows (or are ignored for ground), so they never target a collapsed raw row carrying an equality
+equation. Those positions are therefore zero after raw accumulation: adding the equality stamp, as the sparse JVP does,
+is equivalent to overwriting them. Equality derivatives do not contribute to the reactive Jacobian. Reduced global
+assembly can exclude equality rows with `handle.topology.physical_row_mask` instead.
 
 Both sparse adapters support `jax.jit`, `jax.vmap`, and first voltage derivatives of F/Q. Their JVP gathers tangent
 columns and uses segment sums, then adds the separate equality stamp; it never constructs a dense local matrix. As with
