@@ -154,4 +154,86 @@ representative: 0 1 2 3 4 1 2 0 3 3  3  3 12
 Thus seven slots are eliminated and six survive: four terminals plus both noise auxiliaries. The count is asserted from
 setup output, never used to construct it. Reduced PSP103 F/Q/G/C match projection of full stamps for DC, transient and
 AC registrations at representative biases. This validates the model cards and local assembly, not a full c6288 circuit
-simulation or a noise analysis. No runtime or memory performance improvement has been measured.
+simulation or a noise analysis. The raw-entry benchmark below measures local stamp evaluation separately.
+
+## Opt-in raw-entry Jacobians
+
+`osdi_eval_sparse_with_handle` avoids the dense local `N × N` Jacobian buffers. The existing dense and residual APIs
+retain their default behavior.
+
+```python
+from osdi_jax import osdi_eval_sparse_with_handle, osdi_residual_eval_with_handle
+
+pattern = handle.sparse_pattern  # immutable, queried once from native setup
+f, g_values, q, c_values, new_state = osdi_eval_sparse_with_handle(handle, v, state)
+# g_values: (B, model.num_resist_jac), c_values: (B, model.num_react_jac)
+# f, q: (B, model.num_nodes), including collapsed-slot equality equations
+
+# Residual-only primal; use sparse Jacobians only when requesting its JVP.
+f, q, new_state = osdi_residual_eval_with_handle(handle, v, state, sparse=True)
+```
+
+`pattern.resist_pairs` and `pattern.react_pairs` are `(B, nnz, 2)` arrays of output `(row, column)` targets in **raw
+OSDI descriptor order**. An ignored entry has target `(-1, -1)`. Entries that collapse onto the same target stay
+separate: sum their values in raw-entry order, starting from zero, to reproduce the dense Jacobian bitwise. In DC
+analysis, reactive values are zero. Zero-entry arrays have width zero and require no dummy entries.
+
+Equality derivatives are not raw OSDI entries. After accumulating raw entries, apply `pattern.equality_pairs` /
+`pattern.equality_values` to the resistive Jacobian. These device-major arrays have shapes `(B, 2*N, 2)` and `(B, 2*N)`;
+unused entries have target `(-1, -1)` and value zero. Grounded slots have a `+1` diagonal; other collapsed slots also
+have a `-1` in the survivor column. The dense path overwrites these target positions. Raw entry rows map through
+`node_map` to surviving rows (or are ignored for ground), so they never target a collapsed raw row carrying an equality
+equation. Those positions are therefore zero after raw accumulation: adding the equality stamp, as the sparse JVP does,
+is equivalent to overwriting them. Equality derivatives do not contribute to the reactive Jacobian. Reduced global
+assembly can exclude equality rows with `handle.topology.physical_row_mask` instead.
+
+Both sparse adapters support `jax.jit`, `jax.vmap`, and first voltage derivatives of F/Q. Their JVP gathers tangent
+columns and uses segment sums, then adds the separate equality stamp; it never constructs a dense local matrix. As with
+the existing OSDI adapter, derivatives of Jacobian outputs, parameters and ABI history are unsupported. Keep the handle
+alive until all compiled evaluations finish. Changing parameters creates a new handle and requires querying its new
+pattern.
+
+### Native ABI
+
+The new C ABI uses the same arguments and state conventions as the dense handle entry point, with different Jacobian
+buffer widths:
+
+```c
+void batched_osdi_eval_handle_sparse_ffi(
+    uint64_t handle_id, size_t num_devices, size_t num_nodes, size_t num_states,
+    const double *voltages, const double *old_state,
+    double *currents, double *resist_values, double *charges,
+    double *react_values, double *new_state);
+size_t osdi_handle_jac_count_ffi(uint64_t handle_id, bool reactive);
+int32_t osdi_handle_jac_pairs_ffi(
+    uint64_t handle_id, bool reactive, int32_t *out, size_t len);
+```
+
+Pass `reactive=false` for G and `true` for C. The count query returns the raw entry width (zero for an invalid handle).
+The pairs query copies flattened `(handle.num_devices, nnz, 2)` targets, requires `len` to equal that element count, and
+returns `0` on success or `-1` for an invalid handle/buffer length. Equality stamps can be derived from
+`osdi_handle_topology_ffi`: for every `map[d, node] != node`, set the resistive diagonal to `1` and, if the target is
+nonnegative, the survivor column to `-1`. Pair metadata already applies the native `node_map` / `slot_to_out` mapping,
+including ignored ground entries.
+
+The evaluation caller allocates all buffers, passes the model's full raw node width, and ensures `num_devices` is a
+multiple of the configured handle's device count. Replica batches tile the handle's snapshots and pattern in device
+order. Raw values are written directly into caller buffers, with no dense zero-fill or scatter. The XLA FFI target is
+`OsdiEvalHandleSparseCpu`.
+
+### Benchmark
+
+Run `PYTHONPATH=src pixi run python scripts/benchmark_sparse_handle.py` after building and compiling the test fixtures.
+The script compares synchronized, JIT-compiled dense and sparse calls, alternating their order after warmup. It uses
+both c6288 model cards with 5,056 instances per polarity and varying bias.
+
+One local CPU run (50 paired samples, 5 warmups; AC analysis) measured:
+
+| Measurement                 |      Dense | Raw-entry sparse |
+| --------------------------- | ---------: | ---------------: |
+| Jacobian output bytes       | 27,342,848 |        6,957,056 |
+| Median time for both groups |   3.193 ms |         2.643 ms |
+
+The model has 13 raw nodes and 53 resistive / 33 reactive raw entries. This run used 74.6% less Jacobian output memory
+and was 1.21× faster. Timings depend on hardware, Rayon scheduling and model configuration; this measures handle
+evaluation, not an entire circuit integration or global assembly.

@@ -98,6 +98,8 @@ extern "C" {
         const double* params
     );
     int32_t osdi_handle_topology_ffi(uint64_t handle_id, int32_t* out, size_t len);
+    size_t osdi_handle_jac_count_ffi(uint64_t handle_id, bool reactive);
+    int32_t osdi_handle_jac_pairs_ffi(uint64_t handle_id, bool reactive, int32_t* out, size_t len);
     void osdi_free_handle_ffi(uint64_t handle_id);
     size_t osdi_handle_num_devices(uint64_t handle_id);
     size_t osdi_handle_num_nodes(uint64_t handle_id);
@@ -106,6 +108,20 @@ extern "C" {
     // Handle-based full eval: skips setup entirely. Rust tiles the handle's
     // snapshots across num_devices (must be a multiple of handle.num_devices).
     void batched_osdi_eval_handle_ffi(
+        uint64_t handle_id,
+        size_t num_devices,
+        size_t num_pins,
+        size_t num_states,
+        const double* voltages,
+        const double* old_state,
+        double* currents,
+        double* conductances,
+        double* charges,
+        double* capacitances,
+        double* new_state
+    );
+
+    void batched_osdi_eval_handle_sparse_ffi(
         uint64_t handle_id,
         size_t num_devices,
         size_t num_pins,
@@ -311,6 +327,73 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiEvalHandleCpu, batched_osdi_eval_handle_impl,
         .Ret<ffi::Buffer<ffi::DataType::F64>>()
 );
 
+ffi::Error batched_osdi_eval_handle_sparse_impl(
+    ffi::Buffer<ffi::DataType::U64> handle_id_buf,
+    ffi::Buffer<ffi::DataType::F64> voltages,
+    ffi::Buffer<ffi::DataType::F64> old_state,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> currents,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> conductances,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> charges,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> capacitances,
+    ffi::Result<ffi::Buffer<ffi::DataType::F64>> new_state
+) {
+
+    if (handle_id_buf.element_count() != 1 || voltages.dimensions().size() != 2 || old_state.dimensions().size() != 2) {
+        return ffi::Error::InvalidArgument("OSDI sparse eval expects rank-2 voltage/state buffers");
+    }
+    uint64_t handle_id = handle_id_buf.typed_data()[0];
+    auto v_dims = voltages.dimensions();
+    auto s_dims = old_state.dimensions();
+
+    size_t num_devices = v_dims[0];
+    size_t num_pins    = v_dims[1];
+    size_t num_states  = s_dims[1];
+
+    if (num_pins != osdi_handle_num_nodes(handle_id)) {
+        return ffi::Error::InvalidArgument("OSDI voltage width must equal handle model.num_nodes (all raw nodes)");
+    }
+    size_t handle_devices = osdi_handle_num_devices(handle_id);
+    auto shape_is = [](auto buffer, size_t rows, size_t cols) {
+        auto dims = buffer.dimensions();
+        return dims.size() == 2 && dims[0] == static_cast<int64_t>(rows) && dims[1] == static_cast<int64_t>(cols);
+    };
+    if (handle_devices == 0 || num_devices % handle_devices != 0 ||
+        !shape_is(old_state, num_devices, num_states) ||
+        !shape_is(*currents, num_devices, num_pins) ||
+        !shape_is(*charges, num_devices, num_pins) ||
+        !shape_is(*new_state, num_devices, num_states) ||
+        !shape_is(*conductances, num_devices, osdi_handle_jac_count_ffi(handle_id, false)) ||
+        !shape_is(*capacitances, num_devices, osdi_handle_jac_count_ffi(handle_id, true))) {
+        return ffi::Error::InvalidArgument("OSDI sparse eval buffer shapes do not match handle");
+    }
+    batched_osdi_eval_handle_sparse_ffi(
+        handle_id,
+        num_devices,
+        num_pins,
+        num_states,
+        voltages.typed_data(),
+        old_state.typed_data(),
+        currents->typed_data(),
+        conductances->typed_data(),
+        charges->typed_data(),
+        capacitances->typed_data(),
+        new_state->typed_data()
+    );
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiEvalHandleSparseCpu, batched_osdi_eval_handle_sparse_impl,
+    ffi::Ffi::Bind()
+        .Arg<ffi::Buffer<ffi::DataType::U64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Arg<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+        .Ret<ffi::Buffer<ffi::DataType::F64>>()
+);
+
 ffi::Error batched_osdi_residual_eval_handle_impl(
     ffi::Buffer<ffi::DataType::U64> handle_id_buf,
     ffi::Buffer<ffi::DataType::F64> voltages,
@@ -394,6 +477,19 @@ NB_MODULE(osdi_shim_nb, m) {
     m.def("batched_osdi_eval_handle", []() {
         return nb::capsule((void*)&OsdiEvalHandleCpu, "xla._CUSTOM_CALL_TARGET");
     });
+
+    m.def("batched_osdi_eval_handle_sparse", []() {
+        return nb::capsule((void*)&OsdiEvalHandleSparseCpu, "xla._CUSTOM_CALL_TARGET");
+    });
+
+    m.def("osdi_handle_jac_pairs", [](uint64_t handle_id, bool reactive) {
+        size_t devices = osdi_handle_num_devices(handle_id);
+        size_t count = osdi_handle_jac_count_ffi(handle_id, reactive);
+        std::vector<int32_t> pairs(devices * count * 2);
+        if (osdi_handle_jac_pairs_ffi(handle_id, reactive, pairs.data(), pairs.size()) < 0)
+            throw nb::value_error("Unknown or freed OSDI batch handle");
+        return nb::make_tuple(pairs, devices, count);
+    }, nb::arg("handle_id"), nb::arg("reactive"));
 
     m.def("batched_osdi_residual_eval_handle", []() {
         return nb::capsule((void*)&OsdiResidualEvalHandleCpu, "xla._CUSTOM_CALL_TARGET");

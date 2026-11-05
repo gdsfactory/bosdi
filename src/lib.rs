@@ -1169,6 +1169,7 @@ fn eval_device_from_setup(
     chg: &mut [f64],
     cap: &mut [f64],
     residual_only: bool,
+    sparse: bool,
     scratch: &mut SmallScratch,
 ) {
     let num_slots = m.num_slots;
@@ -1257,17 +1258,21 @@ fn eval_device_from_setup(
         }
 
         if !residual_only {
-            scratch.jac_buf.clear();
-            scratch.jac_buf.resize(m.num_resist_jac as usize, 0.0);
-            unsafe { (m.write_jacobian)(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
-            for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
-                let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
-                let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
-                if s1 >= 0 && s2 >= 0 {
-                    let o1 = m.slot_to_out[s1 as usize];
-                    let o2 = m.slot_to_out[s2 as usize];
-                    if o1 >= 0 && o2 >= 0 {
-                        cond[o1 as usize * num_all_nodes + o2 as usize] += scratch.jac_buf[idx];
+            if sparse {
+                unsafe { (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr()); }
+            } else {
+                scratch.jac_buf.clear();
+                scratch.jac_buf.resize(m.num_resist_jac as usize, 0.0);
+                unsafe { (m.write_jacobian)(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
+                for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
+                    let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                    let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
+                    if s1 >= 0 && s2 >= 0 {
+                        let o1 = m.slot_to_out[s1 as usize];
+                        let o2 = m.slot_to_out[s2 as usize];
+                        if o1 >= 0 && o2 >= 0 {
+                            cond[o1 as usize * num_all_nodes + o2 as usize] += scratch.jac_buf[idx];
+                        }
                     }
                 }
             }
@@ -1289,17 +1294,21 @@ fn eval_device_from_setup(
         }
         if !residual_only {
             if let Some(wj) = m.write_jacobian_react {
-                scratch.jac_buf.clear();
-                scratch.jac_buf.resize(m.num_react_jac as usize, 0.0);
-                unsafe { wj(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
-                for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
-                    let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
-                    let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
-                    if s1 >= 0 && s2 >= 0 {
-                        let o1 = m.slot_to_out[s1 as usize];
-                        let o2 = m.slot_to_out[s2 as usize];
-                        if o1 >= 0 && o2 >= 0 {
-                            cap[o1 as usize * num_all_nodes + o2 as usize] += scratch.jac_buf[idx];
+                if sparse {
+                    unsafe { wj(inst_ptr, model_ptr, cap.as_mut_ptr()); }
+                } else {
+                    scratch.jac_buf.clear();
+                    scratch.jac_buf.resize(m.num_react_jac as usize, 0.0);
+                    unsafe { wj(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
+                    for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
+                        let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                        let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
+                        if s1 >= 0 && s2 >= 0 {
+                            let o1 = m.slot_to_out[s1 as usize];
+                            let o2 = m.slot_to_out[s2 as usize];
+                            if o1 >= 0 && o2 >= 0 {
+                                cap[o1 as usize * num_all_nodes + o2 as usize] += scratch.jac_buf[idx];
+                            }
                         }
                     }
                 }
@@ -1313,14 +1322,14 @@ fn eval_device_from_setup(
         if survivor as usize == num_all_nodes {
             cur[node] = vol[node];
             chg[node] = 0.0;
-            if !residual_only {
+            if !residual_only && !sparse {
                 cond[node * num_all_nodes + node] = 1.0;
             }
         } else if survivor as usize != node {
             let survivor = survivor as usize;
             cur[node] = vol[node] - vol[survivor];
             chg[node] = 0.0;
-            if !residual_only {
+            if !residual_only && !sparse {
                 cond[node * num_all_nodes + node] = 1.0;
                 cond[node * num_all_nodes + survivor] = -1.0;
             }
@@ -1353,7 +1362,7 @@ fn eval_one_device(
         let EvalScratch { model_data, inst_data, small } = &mut *scratch;
         setup_device(m, param, model_data, inst_data);
         eval_device_from_setup(
-            m, model_data, inst_data, vol, cur, cond, chg, cap, residual_only, small,
+            m, model_data, inst_data, vol, cur, cond, chg, cap, residual_only, false, small,
         );
     });
 }
@@ -1702,6 +1711,46 @@ pub unsafe extern "C" fn osdi_handle_topology_ffi(
     m.num_terminals as i32
 }
 
+/// Raw resistive/reactive entry count for the handle's model (zero if invalid).
+#[no_mangle]
+pub extern "C" fn osdi_handle_jac_count_ffi(handle_id: u64, reactive: bool) -> usize {
+    let handles = HANDLES.read().unwrap();
+    let Some(h) = handles.get(&handle_id) else { return 0; };
+    let registry = OSDI_REGISTRY.read().unwrap();
+    let Some(m) = registry.get(&h.model_id) else { return 0; };
+    if reactive { m.num_react_jac as usize } else { m.num_resist_jac as usize }
+}
+
+/// Output (row, column) per raw entry, device-major. (-1,-1) means ignored.
+/// Duplicate targets remain explicit and must be summed in raw-entry order.
+/// Equality derivatives are separate from this pattern. Returns 0 or -1.
+#[no_mangle]
+pub unsafe extern "C" fn osdi_handle_jac_pairs_ffi(
+    handle_id: u64, reactive: bool, out: *mut i32, len: usize,
+) -> i32 {
+    let handles = HANDLES.read().unwrap();
+    let Some(h) = handles.get(&handle_id) else { return -1; };
+    let registry = OSDI_REGISTRY.read().unwrap();
+    let Some(m) = registry.get(&h.model_id) else { return -1; };
+    let pairs = if reactive { &m.react_jac_pairs } else { &m.resist_jac_pairs };
+    if len != h.num_devices * pairs.len() * 2 || (len > 0 && out.is_null()) { return -1; }
+    for device in 0..h.num_devices {
+        let map = |node: u32| -> i32 {
+            if node as usize >= m.num_all_nodes { return -1; }
+            let offset = device * m.instance_size + m.node_map_off + node as usize * 4;
+            let slot = (h.inst_data_flat.as_ptr().add(offset) as *const i32).read_unaligned();
+            if slot < 0 { -1 } else { m.slot_to_out.get(slot as usize).copied().unwrap_or(-1) }
+        };
+        for (entry, &(row, col)) in pairs.iter().enumerate() {
+            let (r, c) = (map(row), map(col));
+            let offset = (device * pairs.len() + entry) * 2;
+            *out.add(offset) = if r >= 0 && c >= 0 { r } else { -1 };
+            *out.add(offset + 1) = if r >= 0 && c >= 0 { c } else { -1 };
+        }
+    }
+    0
+}
+
 /// Full-stamp batched eval reusing the handle's pre-setup state.
 /// `num_devices` is the number of devices the CALLER wants evaluated (derived
 /// from the voltages buffer). If it's greater than `h.num_devices`, the
@@ -1726,7 +1775,33 @@ pub extern "C" fn batched_osdi_eval_handle_ffi(
         voltages_ptr,
         currents_ptr, Some(conductances_ptr), charges_ptr, Some(capacitances_ptr),
         new_state_ptr,
-        false,
+        false, false,
+    );
+}
+
+/// Raw OSDI Jacobian arrays, device-major, in descriptor entry order.
+/// Widths are osdi_handle_jac_count_ffi(handle_id, false/true). Residuals
+/// retain dense raw-node layout; equality derivatives are NOT raw entries.
+#[no_mangle]
+pub extern "C" fn batched_osdi_eval_handle_sparse_ffi(
+    handle_id:        u64,
+    num_devices:      usize,
+    num_pins:         usize,
+    num_states:       usize,
+    voltages_ptr:     *const f64,
+    _old_state_ptr:   *const f64,
+    currents_ptr:     *mut f64,
+    conductances_ptr: *mut f64,
+    charges_ptr:      *mut f64,
+    capacitances_ptr: *mut f64,
+    new_state_ptr:    *mut f64,
+) {
+    run_handle_eval(
+        handle_id, num_devices, num_pins, num_states,
+        voltages_ptr,
+        currents_ptr, Some(conductances_ptr), charges_ptr, Some(capacitances_ptr),
+        new_state_ptr,
+        false, true,
     );
 }
 
@@ -1748,7 +1823,7 @@ pub extern "C" fn batched_osdi_residual_eval_handle_ffi(
         voltages_ptr,
         currents_ptr, None, charges_ptr, None,
         new_state_ptr,
-        true,
+        true, false,
     );
 }
 
@@ -1769,6 +1844,7 @@ fn run_handle_eval(
     capacitances_ptr: Option<*mut f64>,
     new_state_ptr:    *mut f64,
     residual_only:    bool,
+    sparse:           bool,
 ) {
     let handles = HANDLES.read().unwrap();
     let h = match handles.get(&handle_id) {
@@ -1780,6 +1856,11 @@ fn run_handle_eval(
         Some(m) => m,
         None => { eprintln!("osdi handle-eval: model {} gone", h.model_id); return; }
     };
+
+    if sparse && num_pins != m.num_all_nodes {
+        eprintln!("osdi sparse handle-eval: voltage width must equal model.num_nodes");
+        return;
+    }
 
     let jac_size        = num_pins * num_pins;
     let model_size      = m.model_size;
@@ -1816,7 +1897,47 @@ fn run_handle_eval(
     // parallel) — extracting them into a closure measurably hurt parallel
     // throughput at N=54 (rayon's task-stealing scheduler doesn't always
     // inline closures cleanly, leaving an indirect call per work item).
-    if residual_only {
+    if sparse {
+        let resist_n = m.num_resist_jac as usize;
+        let react_n = m.num_react_jac as usize;
+        // Each work item owns disjoint device-major output regions. Keep the
+        // addresses as integers so zero-width Jacobians need no dummy buffers
+        // and no zero-sized chunk iterators (which would panic).
+        let resist_addr = conductances_ptr.unwrap() as usize;
+        let react_addr = capacitances_ptr.unwrap() as usize;
+        let work = |(device_idx, ((cur, chg), vol)): (usize, ((&mut [f64], &mut [f64]), &[f64]))| {
+            let cond = if resist_n == 0 { &mut [] } else { unsafe {
+                std::slice::from_raw_parts_mut((resist_addr as *mut f64).add(device_idx * resist_n), resist_n)
+            }};
+            let cap = if react_n == 0 { &mut [] } else { unsafe {
+                std::slice::from_raw_parts_mut((react_addr as *mut f64).add(device_idx * react_n), react_n)
+            }};
+            cur.fill(0.0);
+            chg.fill(0.0);
+            // DC and missing reactive callbacks must still produce defined zeros.
+            cond.fill(0.0);
+            cap.fill(0.0);
+            let snap_idx = device_idx % handle_n_devs;
+            SCRATCH.with(|s| {
+                let mut scratch = s.borrow_mut();
+                scratch.model_data.clear();
+                scratch.model_data.extend_from_slice(&h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size]);
+                scratch.inst_data.clear();
+                scratch.inst_data.extend_from_slice(&h.inst_data_flat[snap_idx * inst_size .. (snap_idx + 1) * inst_size]);
+                let EvalScratch { model_data, inst_data, small } = &mut *scratch;
+                eval_device_from_setup(m, model_data, inst_data, vol, cur, cond, chg, cap, false, true, small);
+            });
+        };
+        if use_parallel(num_devices) {
+            currents.par_chunks_exact_mut(num_pins)
+                .zip(charges.par_chunks_exact_mut(num_pins))
+                .zip(voltages.par_chunks_exact(num_pins)).enumerate().for_each(work);
+        } else {
+            currents.chunks_exact_mut(num_pins)
+                .zip(charges.chunks_exact_mut(num_pins))
+                .zip(voltages.chunks_exact(num_pins)).enumerate().for_each(work);
+        }
+    } else if residual_only {
         if use_parallel(num_devices) {
             currents.par_chunks_exact_mut(num_pins)
                 .zip(charges.par_chunks_exact_mut(num_pins))
@@ -1840,7 +1961,7 @@ fn run_handle_eval(
                         eval_device_from_setup(
                             m, model_data, inst_data, vol,
                             cur, &mut cond_ignored, chg, &mut cap_ignored,
-                            true, small,
+                            true, false, small,
                         );
                     });
                 });
@@ -1867,7 +1988,7 @@ fn run_handle_eval(
                         eval_device_from_setup(
                             m, model_data, inst_data, vol,
                             cur, &mut cond_ignored, chg, &mut cap_ignored,
-                            true, small,
+                            true, false, small,
                         );
                     });
                 });
@@ -1905,7 +2026,7 @@ fn run_handle_eval(
                         eval_device_from_setup(
                             m, model_data, inst_data, vol,
                             cur, cond, chg, cap,
-                            false, small,
+                            false, false, small,
                         );
                     });
                 });
@@ -1934,7 +2055,7 @@ fn run_handle_eval(
                         eval_device_from_setup(
                             m, model_data, inst_data, vol,
                             cur, cond, chg, cap,
-                            false, small,
+                            false, false, small,
                         );
                     });
                 });

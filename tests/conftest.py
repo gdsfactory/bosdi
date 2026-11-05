@@ -109,6 +109,7 @@ def _compile_one(openvaf: str, va_rel: str, osdi_name: str, extra_flags: tuple) 
 
 _OSDI_TEST_MODULES = {
     "test_osdi",
+    "test_osdi_sparse",
     "test_diode_behaviour",
     "test_diode_structure",
     "test_osdi_debug",
