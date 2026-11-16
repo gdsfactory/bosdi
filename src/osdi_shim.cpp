@@ -1,3 +1,4 @@
+#include "../include/bosdi_runtime.h"
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -444,6 +445,33 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(OsdiResidualEvalHandleCpu, batched_osdi_residual_e
 
 NB_MODULE(osdi_shim_nb, m) {
     m.doc() = "OSDI Batched Evaluator for JAX";
+
+    // Address lookup keeps the native C ABI available to Python even when the
+    // extension linker hides C symbols (notably Windows). ctypes calls release
+    // the GIL; Python owns and retains every registered array.
+    m.def("runtime_addresses", []() {
+        return std::map<std::string, uintptr_t>{
+            {"set_num_threads", reinterpret_cast<uintptr_t>(&bosdi_set_num_threads)},
+            {"num_threads", reinterpret_cast<uintptr_t>(&bosdi_num_threads)},
+            {"set_parallel_policy", reinterpret_cast<uintptr_t>(&bosdi_set_parallel_policy)},
+            {"set_handle_parallel_policy", reinterpret_cast<uintptr_t>(&bosdi_set_handle_parallel_policy)},
+            {"qualify_handle", reinterpret_cast<uintptr_t>(&bosdi_qualify_handle)},
+            {"bind_buffers", reinterpret_cast<uintptr_t>(&bosdi_bind_buffers)},
+            {"rebind_buffers", reinterpret_cast<uintptr_t>(&bosdi_rebind_buffers)},
+            {"unbind_buffers", reinterpret_cast<uintptr_t>(&bosdi_unbind_buffers)},
+            {"binding_generation", reinterpret_cast<uintptr_t>(&bosdi_binding_generation)},
+            {"qualify_binding", reinterpret_cast<uintptr_t>(&bosdi_qualify_binding)},
+            {"eval_bound", reinterpret_cast<uintptr_t>(&bosdi_eval_bound)},
+            {"load_osdi_library_with_analysis", reinterpret_cast<uintptr_t>(&load_osdi_library_with_analysis)},
+            {"osdi_setup_batch_ffi", reinterpret_cast<uintptr_t>(&osdi_setup_batch_ffi)},
+            {"osdi_free_handle_ffi", reinterpret_cast<uintptr_t>(&osdi_free_handle_ffi)},
+            {"batched_osdi_eval_handle_ffi", reinterpret_cast<uintptr_t>(&batched_osdi_eval_handle_ffi)},
+            {"batched_osdi_eval_handle_sparse_ffi", reinterpret_cast<uintptr_t>(&batched_osdi_eval_handle_sparse_ffi)},
+            {"batched_osdi_residual_eval_handle_ffi", reinterpret_cast<uintptr_t>(&batched_osdi_residual_eval_handle_ffi)},
+            {"osdi_handle_jac_count_ffi", reinterpret_cast<uintptr_t>(&osdi_handle_jac_count_ffi)},
+            {"bosdi_qualify_handle", reinterpret_cast<uintptr_t>(&bosdi_qualify_handle)}
+        };
+    });
 
     nb::class_<ModelMetadata>(m, "ModelMetadata")
         .def_ro("model_id",     &ModelMetadata::model_id)

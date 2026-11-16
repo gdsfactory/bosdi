@@ -120,7 +120,7 @@ setup(
     package_dir={"": "src"},
     # Top-level modules (back-compat): existing callers do
     # ``import osdi_loader`` / ``import osdi_jax`` directly.
-    py_modules=["osdi_loader", "osdi_jax", "osdi_debug"],
+    py_modules=["osdi_loader", "osdi_jax", "osdi_debug", "osdi_runtime"],
     # Verilog-A → JAX-traceable lowering (the differentiable backend).
     # Imported as ``from bosdi.va import compile_va, lower, ...``.  Optional
     # at runtime — needs the ``openvaf_py`` PyO3 binding to compile ``.va``
