@@ -1,4 +1,4 @@
-"""Native caller-owned handle buffers and thread control.
+"""Native caller-owned handle buffers, thread control, and opt-in bypass.
 
 JAX entry points remain exact and retain their tiling semantics. This mutable
 API is for native-style simulator loops, outside JAX transformations. A binding
@@ -6,6 +6,7 @@ owns references to its arrays; callers must not access them during evaluation.
 """
 
 import ctypes as ct
+from dataclasses import dataclass
 from threading import RLock
 
 import numpy as np
@@ -18,6 +19,25 @@ class _Buffers(ct.Structure):
         for label in ("voltages", "currents", "conductances", "charges", "capacitances")
         for name, kind in ((label, ct.c_void_p), (label + "_len", ct.c_size_t))
     ]
+
+
+class _Bypass(ct.Structure):
+    _fields_ = [
+        ("previous_voltages", ct.c_void_p),
+        ("previous_voltages_len", ct.c_size_t),
+        ("valid", ct.c_void_p),
+        ("valid_len", ct.c_size_t),
+        ("bypassed", ct.c_void_p),
+        ("bypassed_len", ct.c_size_t),
+        ("generation", ct.c_uint64),
+        ("reltol", ct.c_double),
+        ("vntol", ct.c_double),
+        ("dry_run", ct.c_bool),
+    ]
+
+
+class _Stats(ct.Structure):
+    _fields_ = [(k, ct.c_size_t) for k in ("evaluated", "bypassed", "eligible")]
 
 
 _addresses = osdi_shim_nb.runtime_addresses()
@@ -40,12 +60,17 @@ _unbind = _function("unbind_buffers", None, ct.c_uint64)
 _generation = _function("binding_generation", ct.c_uint64, ct.c_uint64)
 _qualify = _function("qualify_binding", ct.c_bool, ct.c_uint64, ct.c_bool)
 _eval = _function(
-    "eval_bound",
+    "eval_bound", ct.c_int32, ct.c_uint64, ct.c_uint64, ct.c_bool, ct.c_bool
+)
+_eval_bypass = _function(
+    "eval_bound_bypass",
     ct.c_int32,
     ct.c_uint64,
     ct.c_uint64,
     ct.c_bool,
     ct.c_bool,
+    ct.POINTER(_Bypass),
+    ct.POINTER(_Stats),
 )
 
 
@@ -92,6 +117,20 @@ def qualify_handle(handle, qualified=True):
         raise ValueError("Cannot qualify handle (freed or ABI-state model)")
 
 
+@dataclass
+class BypassCache:
+    """Caller-owned state corresponding to outputs currently in a binding.
+
+    Validity 1 means F/Q; 3 means F/Q/G/C. Update only evaluated lanes whose
+    outputs you accept. After parameter, temperature, mode, or binding changes,
+    clear validity. Generation prevents reuse after rebind/qualification changes.
+    """
+
+    previous_voltages: np.ndarray
+    valid: np.ndarray
+    generation: int
+
+
 def _array(array, shape, dtype, *, writable=False):
     if (
         not isinstance(array, np.ndarray)
@@ -121,7 +160,7 @@ class BoundBatch:
         self.rebind(voltages)
 
     def rebind(self, voltages):
-        """Allocate/register new outputs and advance the binding generation."""
+        """Allocate/register new outputs; invalidate every previous cache."""
         with self._lock:
             if self.handle.handle_id == 0:
                 raise ValueError("Handle is freed")
@@ -190,21 +229,79 @@ class BoundBatch:
                 raise ValueError("Cannot qualify binding (freed or ABI-state model)")
             self.generation = _generation(self._id)
 
-    def evaluate(self, *, residual_only=False, check_finite=False):
-        """Evaluate every lane exactly into the registered output arrays."""
+    def new_cache(self):
         with self._lock:
-            status = _eval(
-                self._id,
+            return BypassCache(
+                np.zeros_like(self.voltages),
+                np.zeros(self.voltages.shape[0], np.uint8),
                 self.generation,
-                residual_only,
-                check_finite,
             )
+
+    def evaluate(self, *, residual_only=False, check_finite=False):
+        """Evaluate every lane exactly and return its evaluation count."""
+        with self._lock:
+            n = self.voltages.shape[0]
+            status = _eval(self._id, self.generation, residual_only, check_finite)
             errors = {-1: "Stale or unbound buffers", -4: "Nonfinite model outputs"}
             if status:
                 raise ValueError(
                     errors.get(status, f"Native evaluation failed ({status})")
                 )
-            return {"evaluated": self.voltages.shape[0]}
+            return {"evaluated": n}
+
+    def evaluate_bypass(
+        self,
+        *,
+        cache,
+        residual_only=False,
+        check_finite=False,
+        reltol=1e-3,
+        vntol=1e-6,
+        dry_run=False,
+    ):
+        """Use caller-owned bypass state and return stats plus a skipped-lane mask.
+
+        Dry-run evaluates every lane exactly while reporting eligibility; it is
+        available without provider qualification. Outputs remain in this binding.
+        """
+        with self._lock:
+            n = self.voltages.shape[0]
+            mask = np.zeros(n, np.uint8)
+            previous = _array(
+                cache.previous_voltages, self.voltages.shape, np.dtype("float64")
+            )
+            valid = _array(cache.valid, (n,), np.dtype("uint8"))
+            options = _Bypass(
+                previous.ctypes.data,
+                previous.size,
+                valid.ctypes.data,
+                valid.size,
+                mask.ctypes.data,
+                mask.size,
+                cache.generation,
+                reltol,
+                vntol,
+                dry_run,
+            )
+            stats_out = _Stats()
+            status = _eval_bypass(
+                self._id,
+                self.generation,
+                residual_only,
+                check_finite,
+                ct.byref(options),
+                ct.byref(stats_out),
+            )
+            errors = {
+                -1: "Stale or unbound buffers/cache",
+                -2: "Invalid cache, tolerance, or aliasing",
+                -3: "Bypass requires a qualified pure provider",
+                -4: "Nonfinite model outputs",
+            }
+            if status:
+                raise ValueError(errors[status])
+            stats = {k: getattr(stats_out, k) for k, _ in _Stats._fields_}
+            return stats, mask
 
     def close(self):
         with self._lock:
