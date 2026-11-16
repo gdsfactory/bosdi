@@ -19,6 +19,7 @@ use std::sync::RwLock;
 // PSP103 B=100 raw 822/820/819; B=10000 raw 1342/198/172 (scalar 1402).
 // Heavy small groups can override the policy per handle. See
 // docs/handle-runtime.md for the full table, budget and remaining target gap.
+mod checked_runtime;
 mod handle_runtime;
 use handle_runtime::{configuration, minimum_chunk, use_parallel};
 
@@ -208,18 +209,12 @@ struct OsdiParamOpvar {
 // OSDI simulator callbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// No-op osdi_log callback installed into models that export the `osdi_log`
-/// symbol.  Some compiled OpenVAF models (e.g. the diode) call this slot when
-/// a simulator parameter like `gmin` is not found in `OsdiSimParas.names`.
-/// They fall back to 0.0 for the missing value — which is acceptable — but they
-/// crash if the function pointer is null (its BSS-initialized default).
-///
-/// Signature (from OSDI 0.4 calling convention in disassembly):
-///   void osdi_log(void* handle, const char* message, uint32_t level)
-/// The message string is heap-allocated by the model; we deliberately do not
-/// free it here to keep this callback simple and stateless.  The leak is
-/// at most one allocation per eval() call and only when gmin is requested.
-unsafe extern "C" fn noop_osdi_log(_handle: *mut c_void, _msg: *const c_char, _level: u32) {}
+/// Silent by default; checked calls collect provider diagnostics in a scoped,
+/// per-lane record and optionally forward borrowed messages to the caller.
+/// Message allocation ownership remains with the provider, as in the legacy ABI.
+unsafe extern "C" fn noop_osdi_log(_handle: *mut c_void, msg: *const c_char, level: u32) {
+    checked_runtime::log(msg, level);
+}
 
 // OSDI 0.4 parameter flags (from osdi_0_4.h)
 const PARA_TY_MASK:    u32 = 3;
@@ -592,6 +587,7 @@ pub extern "C" fn load_osdi_library_with_simparams(
     let num_states     = unsafe { read_u32(desc, layout.desc_num_states) };
     let instance_size  = unsafe { read_u32(desc, layout.desc_instance_size) } as usize;
     let model_size     = unsafe { read_u32(desc, layout.desc_model_size) } as usize;
+    let model_size = model_size.max(1);
     let num_resist_jac = unsafe { read_u32(desc, layout.desc_num_resist_jac) };
     let num_react_jac  = unsafe { read_u32(desc, layout.desc_num_react_jac) };
 
@@ -1104,10 +1100,13 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
         names_str: std::ptr::null_mut(),
         vals_str: std::ptr::null_mut(),
     };
+    checked_runtime::phase(-5);
     let mut init1 = OsdiInitInfo::default();
     unsafe {
         (m.setup_model)(std::ptr::null_mut(), model_ptr, &mut sim_paras, &mut init1);
     }
+
+    if checked_runtime::setup_failed(&init1) { return; }
 
     // Pass 2: instance params (after setup_model, before setup_instance)
     for (i, &val) in param.iter().enumerate() {
@@ -1124,6 +1123,7 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
             m.temperature, m.num_terminals, &mut sim_paras, &mut init2,
         );
     }
+    if checked_runtime::setup_failed(&init2) { return; }
     let active_pairs: Vec<_> = m.collapsible_pairs.iter().enumerate()
         .filter_map(|(i, &pair)| {
             let collapsed = inst_data[m.collapsed_off + i] != 0;
@@ -1141,18 +1141,19 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
 }
 
 fn evaluation_flags(m: &LoadedOsdi, residual_only: bool) -> u32 {
-    let mut flags = match m.analysis {
+    let (analysis, options, _) = checked_runtime::context(m.analysis);
+    let mut flags = match analysis {
         0 => 2048 | 32768, // ANALYSIS_DC | ANALYSIS_STATIC
         1 => 4096 | 32768, // ANALYSIS_AC | ANALYSIS_STATIC
         _ => 8192,         // ANALYSIS_TRAN
     };
-    if m.num_resist_jac > 0 {
+    if m.num_resist_jac > 0 || options & 2 != 0 {
         flags |= m.layout.flag_calc_resist_residual;
         if !residual_only {
             flags |= m.layout.flag_calc_resist_jacobian;
         }
     }
-    if m.num_react_jac > 0 && m.analysis != 0 {
+    if (m.num_react_jac > 0 && analysis != 0) || options & 1 != 0 {
         flags |= m.layout.flag_calc_react_residual;
         // OpenVAF uses this flag to select idt's integration equation. Keep
         // it set for residual-only calls too, or line searches see a different
@@ -1196,6 +1197,7 @@ fn eval_device_from_setup(
     };
 
     let flags = evaluation_flags(m, residual_only);
+    let (analysis, options, abstime) = checked_runtime::context(m.analysis);
 
     // Qualified providers read prev_solve without modifying it. With no
     // private-ground references, raw input storage is already slot-indexed.
@@ -1242,24 +1244,26 @@ fn eval_device_from_setup(
 
     let mut sim_info = OsdiSimInfo {
         paras: sim_paras,
-        abstime: 0.0,
+        abstime,
         prev_solve: voltage_ptr,
         prev_state: prev_state_ptr,
         next_state: next_state_ptr,
         flags,
         _pad: 0,
     };
-    unsafe {
+    checked_runtime::phase(-6);
+    let eval_status = unsafe {
         (m.eval)(
             std::ptr::null_mut(),
             inst_ptr,
             model_ptr,
             &mut sim_info as *mut _ as *mut c_void,
-        );
-    }
+        )
+    };
+    if checked_runtime::eval_failed(eval_status) { return; }
 
     // Resistive extraction
-    if m.num_resist_jac > 0 {
+    if m.num_resist_jac > 0 || options & 2 != 0 {
         if cur.len() == num_slots {
             unsafe {
                 (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr());
@@ -1314,7 +1318,7 @@ fn eval_device_from_setup(
     }
 
     // Reactive extraction
-    if m.num_react_jac > 0 && m.analysis != 0 {
+    if (m.num_react_jac > 0 && analysis != 0) || options & 1 != 0 {
         if let Some(lr) = m.load_residual_react {
             if chg.len() == num_slots {
                 unsafe {
@@ -1687,30 +1691,27 @@ pub extern "C" fn osdi_setup_batch_ffi(
         }
     };
 
-    let params = unsafe { std::slice::from_raw_parts(params_ptr, num_devices * num_params) };
+    let params = if num_devices * num_params == 0 { &[] } else {
+        unsafe { std::slice::from_raw_parts(params_ptr, num_devices * num_params) }
+    };
 
     let mut model_data_flat = vec![0u8; num_devices * m.model_size];
     let mut inst_data_flat = vec![0u8; num_devices * m.instance_size];
 
     let config = configuration();
     config.pool.install(|| {
+        let work = |(lane, (model_data, inst_data)): (usize, (&mut [u8], &mut [u8]))| {
+            let param = &params[lane * num_params..(lane + 1) * num_params];
+            setup_device(m, param, model_data, inst_data);
+        };
         if config.parallel(num_devices) {
-            model_data_flat
-                .par_chunks_exact_mut(m.model_size)
+            model_data_flat.par_chunks_exact_mut(m.model_size)
                 .zip(inst_data_flat.par_chunks_exact_mut(m.instance_size))
-                .zip(params.par_chunks_exact(num_params))
-                .with_min_len(config.min_chunk)
-                .for_each(|((model_data, inst_data), param)| {
-                    setup_device(m, param, model_data, inst_data);
-                });
+                .enumerate().with_min_len(config.min_chunk).for_each(work);
         } else {
-            model_data_flat
-                .chunks_exact_mut(m.model_size)
+            model_data_flat.chunks_exact_mut(m.model_size)
                 .zip(inst_data_flat.chunks_exact_mut(m.instance_size))
-                .zip(params.chunks_exact(num_params))
-                .for_each(|((model_data, inst_data), param)| {
-                    setup_device(m, param, model_data, inst_data);
-                });
+                .enumerate().for_each(work);
         }
     });
 
@@ -1719,6 +1720,9 @@ pub extern "C" fn osdi_setup_batch_ffi(
         .map(|instance| handle_runtime::LanePlan::new(m, instance))
         .collect();
     drop(registry);
+    let mut handles = HANDLES.write().unwrap();
+    // An unload may have won the gap between setup and publication.
+    if !OSDI_REGISTRY.read().unwrap().contains_key(&model_id) { return 0; }
 
     let handle_id = {
         let mut id = NEXT_HANDLE_ID.write().unwrap();
@@ -1727,7 +1731,7 @@ pub extern "C" fn osdi_setup_batch_ffi(
         cur
     };
 
-    HANDLES.write().unwrap().insert(
+    handles.insert(
         handle_id,
         OsdiBatchHandle {
             model_id,

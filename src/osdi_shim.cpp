@@ -16,15 +16,7 @@ namespace ffi = xla::ffi;
 // 1. DATA STRUCTURES (Must match Rust #[repr(C)])
 // ---------------------------------------------------------
 
-struct ModelMetadata {
-    uint32_t model_id;
-    size_t   num_pins;
-    size_t   num_nodes;
-    size_t   num_params;
-    size_t   num_states;
-    uint32_t osdi_version;
-    bool     success;
-};
+using ModelMetadata = BosdiModelMetadata;
 
 extern "C" {
     // Phase 1: The loader — version selects the ABI layout in Rust
@@ -451,6 +443,12 @@ NB_MODULE(osdi_shim_nb, m) {
     // the GIL; Python owns and retains every registered array.
     m.def("runtime_addresses", []() {
         return std::map<std::string, uintptr_t>{
+            {"bosdi_runtime_abi_version", reinterpret_cast<uintptr_t>(&bosdi_runtime_abi_version)},
+            {"bosdi_free_model", reinterpret_cast<uintptr_t>(&bosdi_free_model)},
+            {"bosdi_handle_node_maps", reinterpret_cast<uintptr_t>(&bosdi_handle_node_maps)},
+            {"bosdi_setup_batch_checked", reinterpret_cast<uintptr_t>(&bosdi_setup_batch_checked)},
+            {"bosdi_eval_handle_checked", reinterpret_cast<uintptr_t>(&bosdi_eval_handle_checked)},
+            {"bosdi_eval_bound_checked", reinterpret_cast<uintptr_t>(&bosdi_eval_bound_checked)},
             {"set_num_threads", reinterpret_cast<uintptr_t>(&bosdi_set_num_threads)},
             {"num_threads", reinterpret_cast<uintptr_t>(&bosdi_num_threads)},
             {"set_parallel_policy", reinterpret_cast<uintptr_t>(&bosdi_set_parallel_policy)},

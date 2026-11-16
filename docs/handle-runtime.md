@@ -172,3 +172,45 @@ Actual c6288 per-linearization idle fractions and evaluation/assembly timing rem
 local archived voltage traces contain only selected circuit outputs, not every per-device internal unknown/Newton
 iterate, so they cannot supply that evidence. Neither issue should be considered fully qualified for c6288 from these
 provider-only measurements.
+
+## Embedder ABI v1
+
+`include/bosdi_runtime.h` documents the additive native interface for issue #44. Check
+`bosdi_runtime_abi_version() == 1` before resolving the checked entry points. Existing JAX, handle and bound functions
+retain their analysis mode, time zero, DC charge suppression and qualification/bypass behavior.
+
+`bosdi_setup_batch_checked` returns a status and publishes a handle only when every lane passes both setup stages. It
+checks initialization flags, error counts and error/fatal provider logs. `bosdi_eval_handle_checked` and
+`bosdi_eval_bound_checked` report eval failures, error/fatal logs and optionally non-finite outputs. The informational
+OSDI limiting return bit alone is accepted; fatal, finish, stop and unknown return bits fail the call. A
+`BosdiCallError` contains the lowest failing lane and the first diagnostic for that lane, truncated to 255 bytes.
+Argument/stale-handle errors and success use `SIZE_MAX` as the lane. Discard all outputs on failure; they may have been
+partially written.
+
+Pass a `BosdiEvalContext` on each evaluation. Its `analysis` is 0 (DC/static), 1 (AC/static), or 2 (transient), with
+finite, non-negative `abstime` in seconds. `BOSDI_REACTIVE_AT_DC` requests reactive flags and Q/C extraction even at DC.
+`BOSDI_RESIST_ALWAYS` requests resistive flags and F extraction even with no G entries, for constant sources. Options
+default to zero and unknown bits fail validation. The context never changes the model registry or another call. Checked
+evaluation restores setup snapshots even for qualified providers and supports full or residual-only raw-entry output;
+residual-only leaves G/C alone. It uses the same buffer lengths and rules for disjoint arrays as binding. Checked bound
+calls validate the generation and hold the binding lock for the whole evaluation. No checked call consumes bypass
+caches. Hosts must invalidate cached outputs when changing context or options before using the legacy bypass entry
+point.
+
+The optional logging callback receives borrowed text, lane and provider severity. It runs synchronously on the executing
+lane's thread, so it must be thread-safe and must not reenter BOSDI. There is no implicit stderr logging or global
+failure counter. Error records, context and callback user storage must remain valid for the complete call and must not
+alias mutable evaluation buffers.
+
+`bosdi_handle_node_maps` exports the actual setup-selected maps in device-major order, with `-1` for ground. The node
+and lane counts must match exactly. This uses the same stored topology as `osdi_handle_topology_ffi`. `bosdi_free_model`
+releases the registry entry and its library reference after handles are freed. Unbind buffers first. It returns false
+for unknown models, live handles or concurrent registry activity; retry after quiescing the host. Retire the model ID
+from any host-side caches before unloading. Zero-byte model structs receive one byte of internal storage, including on
+the legacy path.
+
+`tests/test_embedder_runtime.py` uses synthetic OSDI 0.5 providers to exercise setup status/log failures, eval
+status/log failures, non-finite output, DC Q/C, constant F without G, time, zero-byte model structs, actual per-lane
+collapse, concurrent contexts and optional callbacks. `tests/test_osdi_runtime.py` retains the legacy
+dense/sparse/residual and bound bitwise parity suite; set `BOSDI_BASELINE_LIBRARY` to a pre-change native library for an
+independent audit.
