@@ -9,7 +9,8 @@
       "scalar": 7.68,
       "dense_snapshot": 30.9,
       "dense_qualified": 24.66,
-      "bound_raw": 12.03
+      "bound_raw": 12.03,
+      "bound_idle": 5.12
     },
     {
       "model": "resistor_va.osdi",
@@ -18,7 +19,8 @@
       "scalar": 7.6,
       "dense_snapshot": 30.86,
       "dense_qualified": 24.82,
-      "bound_raw": 12.11
+      "bound_raw": 12.11,
+      "bound_idle": 5.51
     },
     {
       "model": "resistor_va.osdi",
@@ -27,7 +29,8 @@
       "scalar": 7.87,
       "dense_snapshot": 30.86,
       "dense_qualified": 24.79,
-      "bound_raw": 12.04
+      "bound_raw": 12.04,
+      "bound_idle": 5.08
     },
     {
       "model": "resistor_va.osdi",
@@ -36,7 +39,8 @@
       "scalar": 7.55,
       "dense_snapshot": 29.79,
       "dense_qualified": 23.09,
-      "bound_raw": 11.06
+      "bound_raw": 11.06,
+      "bound_idle": 3.67
     },
     {
       "model": "resistor_va.osdi",
@@ -45,7 +49,8 @@
       "scalar": 7.34,
       "dense_snapshot": 29.66,
       "dense_qualified": 23.06,
-      "bound_raw": 11.0
+      "bound_raw": 11.0,
+      "bound_idle": 3.64
     },
     {
       "model": "resistor_va.osdi",
@@ -54,7 +59,8 @@
       "scalar": 7.33,
       "dense_snapshot": 29.7,
       "dense_qualified": 22.97,
-      "bound_raw": 11.04
+      "bound_raw": 11.04,
+      "bound_idle": 3.66
     },
     {
       "model": "resistor_va.osdi",
@@ -63,7 +69,8 @@
       "scalar": 8.18,
       "dense_snapshot": 30.3,
       "dense_qualified": 23.91,
-      "bound_raw": 11.41
+      "bound_raw": 11.41,
+      "bound_idle": 3.51
     },
     {
       "model": "resistor_va.osdi",
@@ -72,7 +79,8 @@
       "scalar": 7.71,
       "dense_snapshot": 7.07,
       "dense_qualified": 5.04,
-      "bound_raw": 2.97
+      "bound_raw": 2.97,
+      "bound_idle": 1.55
     },
     {
       "model": "resistor_va.osdi",
@@ -81,7 +89,8 @@
       "scalar": 8.29,
       "dense_snapshot": 7.81,
       "dense_qualified": 5.89,
-      "bound_raw": 3.52
+      "bound_raw": 3.52,
+      "bound_idle": 2.05
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -90,7 +99,8 @@
       "scalar": 816.75,
       "dense_snapshot": 1127.13,
       "dense_qualified": 946.95,
-      "bound_raw": 822.34
+      "bound_raw": 822.34,
+      "bound_idle": 15.04
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -99,7 +109,8 @@
       "scalar": 817.96,
       "dense_snapshot": 1120.79,
       "dense_qualified": 952.0,
-      "bound_raw": 819.94
+      "bound_raw": 819.94,
+      "bound_idle": 15.03
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -108,7 +119,8 @@
       "scalar": 816.24,
       "dense_snapshot": 1116.13,
       "dense_qualified": 944.39,
-      "bound_raw": 819.1
+      "bound_raw": 819.1,
+      "bound_idle": 15.05
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -117,7 +129,8 @@
       "scalar": 875.02,
       "dense_snapshot": 1573.82,
       "dense_qualified": 1067.27,
-      "bound_raw": 864.44
+      "bound_raw": 864.44,
+      "bound_idle": 13.65
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -126,7 +139,8 @@
       "scalar": 888.59,
       "dense_snapshot": 1616.79,
       "dense_qualified": 1086.52,
-      "bound_raw": 868.91
+      "bound_raw": 868.91,
+      "bound_idle": 13.64
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -135,7 +149,8 @@
       "scalar": 877.86,
       "dense_snapshot": 1573.51,
       "dense_qualified": 1067.66,
-      "bound_raw": 865.61
+      "bound_raw": 865.61,
+      "bound_idle": 13.75
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -144,7 +159,8 @@
       "scalar": 1402.08,
       "dense_snapshot": 1644.62,
       "dense_qualified": 1573.21,
-      "bound_raw": 1341.65
+      "bound_raw": 1341.65,
+      "bound_idle": 13.54
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -153,7 +169,8 @@
       "scalar": 1378.35,
       "dense_snapshot": 296.02,
       "dense_qualified": 267.42,
-      "bound_raw": 197.59
+      "bound_raw": 197.59,
+      "bound_idle": 3.16
     },
     {
       "model": "psp103v4_psp103.osdi",
@@ -162,7 +179,8 @@
       "scalar": 1420.8,
       "dense_snapshot": 313.5,
       "dense_qualified": 240.47,
-      "bound_raw": 171.88
+      "bound_raw": 171.88,
+      "bound_idle": 4.3
     }
   ],
   "platform": "Linux-7.1.5-76070105-generic-x86_64-with-glibc2.39",
