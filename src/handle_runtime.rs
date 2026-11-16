@@ -145,14 +145,14 @@ pub(super) struct Buffers {
 // Safety: callers supply distinct, properly sized arrays. Each lane below gets
 // exactly one disjoint subrange, including zero-width Jacobians. No reference to
 // a complete output array is created while lane references are alive.
-unsafe fn lane_mut<'a>(addr: usize, lane: usize, width: usize) -> &'a mut [f64] {
+pub(super) unsafe fn lane_mut<'a>(addr: usize, lane: usize, width: usize) -> &'a mut [f64] {
     if width == 0 {
         &mut []
     } else {
         std::slice::from_raw_parts_mut((addr as *mut f64).add(lane * width), width)
     }
 }
-unsafe fn lane_input<'a>(addr: usize, lane: usize, width: usize) -> &'a [f64] {
+pub(super) unsafe fn lane_input<'a>(addr: usize, lane: usize, width: usize) -> &'a [f64] {
     if width == 0 {
         &[]
     } else {
@@ -411,7 +411,7 @@ pub struct BosdiBufferBinding {
     pub capacitances_len: usize,
 }
 impl BosdiBufferBinding {
-    fn buffers(self) -> Buffers {
+    pub(super) fn buffers(self) -> Buffers {
         Buffers {
             voltages: self.voltages as usize,
             currents: self.currents as usize,
@@ -429,7 +429,7 @@ impl BosdiBufferBinding {
             (self.capacitances as usize, self.capacitances_len),
         ]
     }
-    fn valid(self, h: &OsdiBatchHandle, m: &LoadedOsdi) -> bool {
+    pub(super) fn valid(self, h: &OsdiBatchHandle, m: &LoadedOsdi) -> bool {
         let widths = [
             m.num_all_nodes,
             m.num_slots,
@@ -1020,4 +1020,66 @@ mod tests {
         assert!(!idle(&[1e-6], &[0.0], 0.0, 1e-6));
         assert!(!idle(&[0.0], &[0.0], 0.0, 0.0));
     }
+}
+
+/// Checked bound calls retain the binding's exclusivity and generation checks.
+#[no_mangle]
+pub unsafe extern "C" fn bosdi_eval_bound_checked(
+    id: u64,
+    generation: u64,
+    context: *const checked_runtime::BosdiEvalContext,
+    residual: bool,
+    check_finite: bool,
+    error: *mut checked_runtime::BosdiCallError,
+    callback: checked_runtime::LogCallback,
+    user: *mut c_void,
+) -> i32 {
+    use checked_runtime::{finish, BosdiCallError};
+    let bad = |status| BosdiCallError {
+        status,
+        ..Default::default()
+    };
+    if context.is_null() {
+        return finish(bad(-2), error);
+    }
+    let Some(b) = binding(id) else {
+        return finish(bad(-1), error);
+    };
+    let b = b.lock().unwrap();
+    if !b.active || generation != b.generation {
+        return finish(bad(-1), error);
+    }
+    let handles = HANDLES.read().unwrap();
+    let Some(h) = handles.get(&b.handle_id) else {
+        return finish(bad(-1), error);
+    };
+    let registry = OSDI_REGISTRY.read().unwrap();
+    let Some(m) = registry.get(&h.model_id) else {
+        return finish(bad(-1), error);
+    };
+    let buffers = BosdiBufferBinding {
+        voltages: b.buffers.voltages as *const f64,
+        voltages_len: h.num_devices * m.num_all_nodes,
+        currents: b.buffers.currents as *mut f64,
+        currents_len: h.num_devices * m.num_slots,
+        conductances: b.buffers.conductances as *mut f64,
+        conductances_len: h.num_devices * m.num_resist_jac as usize,
+        charges: b.buffers.charges as *mut f64,
+        charges_len: h.num_devices * m.num_slots,
+        capacitances: b.buffers.capacitances as *mut f64,
+        capacitances_len: h.num_devices * m.num_react_jac as usize,
+    };
+    finish(
+        checked_runtime::evaluate(
+            h,
+            m,
+            buffers,
+            *context,
+            residual,
+            check_finite,
+            callback,
+            user as usize,
+        ),
+        error,
+    )
 }
