@@ -66,7 +66,8 @@ class Native:
         )
 
     def function(self, name, result, *args):
-        address = self.addresses.get(name) if self.addresses is not None else None
+        addresses = getattr(self, "addresses", None)
+        address = addresses.get(name) if addresses is not None else None
         fn = (
             ct.CFUNCTYPE(result, *args)(address) if address else getattr(self.lib, name)
         )
