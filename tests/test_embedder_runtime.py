@@ -332,3 +332,24 @@ def test_standalone_c_embedder(provider, tmp_path):
         capture_output=True,
     )
     subprocess.run([str(exe), str(provider[0])], check=True, capture_output=True)
+
+
+def test_embedder_without_dynamic_symbol_exports(provider, monkeypatch):
+    """Windows resolves all calls through the extension's address table."""
+    native = Native()
+
+    class HiddenSymbols:
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected DLL symbol lookup: {name}")
+
+    native.lib = HiddenSymbols()
+    monkeypatch.setattr("test_embedder_runtime.Native", lambda: native)
+    bridge = Bridge(provider)
+    try:
+        status, handle, _ = bridge.create()
+        assert status == 0
+        arrays, buffers = bridge.buffers(handle)
+        assert bridge.evaluate(handle, buffers, Context(2, 3, 2.5), bound=True)[0] == 0
+        np.testing.assert_array_equal(arrays[1][:, 0], 2.501)
+    finally:
+        bridge.close()

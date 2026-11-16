@@ -67,7 +67,12 @@ class Native:
 
     def function(self, name, result, *args):
         addresses = getattr(self, "addresses", None)
-        address = addresses.get(name) if addresses is not None else None
+        # The Python extension hides C exports on Windows. Existing runtime
+        # entries use short names (bind_buffers), while newer entries use their
+        # full ABI names (bosdi_eval_handle_checked).
+        address = None
+        if addresses is not None:
+            address = addresses.get(name) or addresses.get(name.removeprefix("bosdi_"))
         fn = (
             ct.CFUNCTYPE(result, *args)(address) if address else getattr(self.lib, name)
         )
