@@ -8,3 +8,4 @@ prune tests/pdks
 
 # Generated model libraries and compiler intermediates are not source inputs.
 prune tests/compiled_osdi
+recursive-include include *.h

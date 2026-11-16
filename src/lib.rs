@@ -10,33 +10,17 @@ use std::sync::RwLock;
 // 0. RAYON DISPATCH POLICY
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Rayon's task-stealing scheduler has a fixed per-task overhead (∼5–20 µs on
-// typical x86_64 desktops) that dominates when the per-item work is small.
-// For PSP103 N=9 ring (18 devices) on 8 cores, ``par_chunks_exact_mut`` is
-// 25 % SLOWER than sequential — the scheduling cost exceeds the work being
-// distributed.  Empirical measurements (2026-04-27, PSP103 ring, OSDI handle
-// path):
-//
-//     N=9   (18 devices)   1-thr 219, 2-thr 193, 4-thr 211, 8-thr 241 µs/step
-//     N=27  (54 devices)   1-thr 514, 2-thr 366, 4-thr 329, 8-thr 357 µs/step
-//
-// Below ~32 devices, sequential beats any parallelism.  Above that, parallelism
-// wins but defaults still over-schedule for moderate sizes.  Switch
-// ``par_chunks_exact_mut`` for ``chunks_exact_mut`` when ``num_devices`` is
-// below ``RAYON_DEVICE_THRESHOLD``.  Override at runtime via the
-// ``BOSDI_RAYON_THRESHOLD`` env var (handy for benchmarking).
-const RAYON_DEVICE_THRESHOLD_DEFAULT: usize = 32;
-
-fn rayon_threshold() -> usize {
-    std::env::var("BOSDI_RAYON_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(RAYON_DEVICE_THRESHOLD_DEFAULT)
-}
-
-fn use_parallel(num_devices: usize) -> bool {
-    num_devices >= rayon_threshold()
-}
+// Cheap-model diagnostics in #39 found 297–315 ns/lane at 100 lanes with
+// 24 workers versus 102–124 ns/lane with one. Default to at least 1024 lanes
+// and 256 lanes per task. Environment defaults are read once. The owned pool
+// and policy can be replaced explicitly; each call retains its configuration.
+// Native 2026-11-16 diagnostic (ns/lane, 1/12/24 workers, default policy):
+// resistor B=100 bound raw 12/12/12, scalar 7.7; B=10000 raw 11/3.0/3.5.
+// PSP103 B=100 raw 822/820/819; B=10000 raw 1342/198/172 (scalar 1402).
+// Heavy small groups can override the policy per handle. See
+// docs/handle-runtime.md for the full table, budget and remaining target gap.
+mod handle_runtime;
+use handle_runtime::{configuration, minimum_chunk, use_parallel};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. OSDI VERSION ABSTRACTION
@@ -1036,6 +1020,8 @@ struct EvalScratch {
 
 #[derive(Default)]
 struct SmallScratch {
+    /// Reused post-setup map; no allocation after worker warmup.
+    node_map: Vec<i32>,
     /// num_slots f64s — voltages indexed by post-collapse slot.
     vol_buf: Vec<f64>,
     /// num_slots f64s — written by load_residual / load_residual_react.
@@ -1154,6 +1140,29 @@ fn setup_device(m: &LoadedOsdi, param: &[f64], model_data: &mut [u8], inst_data:
     }
 }
 
+fn evaluation_flags(m: &LoadedOsdi, residual_only: bool) -> u32 {
+    let mut flags = match m.analysis {
+        0 => 2048 | 32768, // ANALYSIS_DC | ANALYSIS_STATIC
+        1 => 4096 | 32768, // ANALYSIS_AC | ANALYSIS_STATIC
+        _ => 8192,         // ANALYSIS_TRAN
+    };
+    if m.num_resist_jac > 0 {
+        flags |= m.layout.flag_calc_resist_residual;
+        if !residual_only {
+            flags |= m.layout.flag_calc_resist_jacobian;
+        }
+    }
+    if m.num_react_jac > 0 && m.analysis != 0 {
+        flags |= m.layout.flag_calc_react_residual;
+        // OpenVAF uses this flag to select idt's integration equation. Keep
+        // it set for residual-only calls too, or line searches see a different
+        // equation from the full Newton stamp. Skip array extraction below.
+        flags |= m.layout.flag_calc_react_jacobian;
+    }
+
+    flags
+}
+
 /// Phase 2: given an already-set-up (model_data, inst_data), set voltages,
 /// call eval(), and extract outputs. May mutate inst_data (OSDI models write
 /// op-vars during eval) — callers that reuse setup state across iterations
@@ -1171,42 +1180,41 @@ fn eval_device_from_setup(
     residual_only: bool,
     sparse: bool,
     scratch: &mut SmallScratch,
+    plan: Option<&handle_runtime::LanePlan>,
+    direct_input: bool,
 ) {
     let num_slots = m.num_slots;
     let num_all_nodes = m.num_all_nodes;
-    let node_map: Vec<i32> = (0..num_all_nodes).map(|i| unsafe {
-        (inst_data.as_ptr().add(m.node_map_off + i * 4) as *const i32).read_unaligned()
-    }).collect();
-
-    let mut flags = match m.analysis {
-        0 => 2048 | 32768, // ANALYSIS_DC | ANALYSIS_STATIC
-        1 => 4096 | 32768, // ANALYSIS_AC | ANALYSIS_STATIC
-        _ => 8192,        // ANALYSIS_TRAN
+    let node_map = if let Some(plan) = plan {
+        &plan.node_map
+    } else {
+        scratch.node_map.clear();
+        scratch.node_map.extend((0..num_all_nodes).map(|i| unsafe {
+            (inst_data.as_ptr().add(m.node_map_off + i * 4) as *const i32).read_unaligned()
+        }));
+        &scratch.node_map
     };
-    if m.num_resist_jac > 0 {
-        flags |= m.layout.flag_calc_resist_residual;
-        if !residual_only { flags |= m.layout.flag_calc_resist_jacobian; }
-    }
-    if m.num_react_jac > 0 && m.analysis != 0 {
-        flags |= m.layout.flag_calc_react_residual;
-        // OpenVAF uses this flag to select idt's integration equation. Keep
-        // it set for residual-only calls too, or line searches see a different
-        // equation from the full Newton stamp. Skip array extraction below.
-        flags |= m.layout.flag_calc_react_jacobian;
-    }
 
-    // Voltages indexed by slot (many-to-one collapse preserves terminal values).
-    scratch.vol_buf.clear();
-    scratch.vol_buf.resize(num_slots, 0.0);
-    for slot in 0..num_slots {
-        let out_idx = m.slot_to_out[slot];
-        if out_idx >= 0 && (out_idx as usize) < vol.len() {
-            scratch.vol_buf[slot] = vol[out_idx as usize];
+    let flags = evaluation_flags(m, residual_only);
+
+    // Qualified providers read prev_solve without modifying it. With no
+    // private-ground references, raw input storage is already slot-indexed.
+    let voltage_ptr = if direct_input && plan.is_some_and(|p| p.direct_voltage) {
+        vol.as_ptr() as *mut f64
+    } else {
+        scratch.vol_buf.clear();
+        scratch.vol_buf.resize(num_slots, 0.0);
+        for slot in 0..num_slots {
+            let out_idx = m.slot_to_out[slot];
+            if out_idx >= 0 && (out_idx as usize) < vol.len() {
+                scratch.vol_buf[slot] = vol[out_idx as usize];
+            }
         }
-    }
+        scratch.vol_buf.as_mut_ptr()
+    };
 
     let model_ptr = model_data.as_mut_ptr() as *mut c_void;
-    let inst_ptr  = inst_data.as_mut_ptr() as *mut c_void;
+    let inst_ptr = inst_data.as_mut_ptr() as *mut c_void;
 
     let sim_paras = OsdiSimParas {
         names: m.simparam_name_ptrs.as_ptr() as *mut *mut i8,
@@ -1224,54 +1232,80 @@ fn eval_device_from_setup(
         scratch.state_buf.clear();
         scratch.state_buf.resize(2 * m.num_states as usize, 0.0);
         let mid = m.num_states as usize;
-        (scratch.state_buf[..mid].as_mut_ptr(), scratch.state_buf[mid..].as_mut_ptr())
+        (
+            scratch.state_buf[..mid].as_mut_ptr(),
+            scratch.state_buf[mid..].as_mut_ptr(),
+        )
     } else {
         (std::ptr::null_mut(), std::ptr::null_mut())
     };
 
     let mut sim_info = OsdiSimInfo {
-        paras:      sim_paras,
-        abstime:    0.0,
-        prev_solve: scratch.vol_buf.as_mut_ptr(),
+        paras: sim_paras,
+        abstime: 0.0,
+        prev_solve: voltage_ptr,
         prev_state: prev_state_ptr,
         next_state: next_state_ptr,
         flags,
-        _pad:       0,
+        _pad: 0,
     };
     unsafe {
         (m.eval)(
-            std::ptr::null_mut(), inst_ptr, model_ptr,
+            std::ptr::null_mut(),
+            inst_ptr,
+            model_ptr,
             &mut sim_info as *mut _ as *mut c_void,
         );
     }
 
     // Resistive extraction
     if m.num_resist_jac > 0 {
-        scratch.node_buf.clear();
-        scratch.node_buf.resize(num_slots, 0.0);
-        unsafe { (m.load_residual)(inst_ptr, model_ptr, scratch.node_buf.as_mut_ptr()); }
-        for slot in 0..num_slots {
-            let out = m.slot_to_out[slot];
-            if out >= 0 {
-                cur[out as usize] = scratch.node_buf[slot];
+        if cur.len() == num_slots {
+            unsafe {
+                (m.load_residual)(inst_ptr, model_ptr, cur.as_mut_ptr());
+            }
+        } else {
+            scratch.node_buf.clear();
+            scratch.node_buf.resize(num_slots, 0.0);
+            unsafe {
+                (m.load_residual)(inst_ptr, model_ptr, scratch.node_buf.as_mut_ptr());
+            }
+            for slot in 0..num_slots {
+                let out = m.slot_to_out[slot];
+                if out >= 0 {
+                    cur[out as usize] = scratch.node_buf[slot];
+                }
             }
         }
 
         if !residual_only {
             if sparse {
-                unsafe { (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr()); }
+                unsafe {
+                    (m.write_jacobian)(inst_ptr, model_ptr, cond.as_mut_ptr());
+                }
             } else {
                 scratch.jac_buf.clear();
                 scratch.jac_buf.resize(m.num_resist_jac as usize, 0.0);
-                unsafe { (m.write_jacobian)(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
-                for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
-                    let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
-                    let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
-                    if s1 >= 0 && s2 >= 0 {
-                        let o1 = m.slot_to_out[s1 as usize];
-                        let o2 = m.slot_to_out[s2 as usize];
-                        if o1 >= 0 && o2 >= 0 {
-                            cond[o1 as usize * num_all_nodes + o2 as usize] += scratch.jac_buf[idx];
+                unsafe {
+                    (m.write_jacobian)(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr());
+                }
+                if let Some(plan) = plan {
+                    for (idx, target) in plan.resist_targets.iter().enumerate() {
+                        if let Some(target) = target {
+                            cond[*target] += scratch.jac_buf[idx];
+                        }
+                    }
+                } else {
+                    for (idx, &(n1, n2)) in m.resist_jac_pairs.iter().enumerate() {
+                        let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                        let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
+                        if s1 >= 0 && s2 >= 0 {
+                            let o1 = m.slot_to_out[s1 as usize];
+                            let o2 = m.slot_to_out[s2 as usize];
+                            if o1 >= 0 && o2 >= 0 {
+                                cond[o1 as usize * num_all_nodes + o2 as usize] +=
+                                    scratch.jac_buf[idx];
+                            }
                         }
                     }
                 }
@@ -1282,32 +1316,53 @@ fn eval_device_from_setup(
     // Reactive extraction
     if m.num_react_jac > 0 && m.analysis != 0 {
         if let Some(lr) = m.load_residual_react {
-            scratch.node_buf.clear();
-            scratch.node_buf.resize(num_slots, 0.0);
-            unsafe { lr(inst_ptr, model_ptr, scratch.node_buf.as_mut_ptr()); }
-            for slot in 0..num_slots {
-                let out = m.slot_to_out[slot];
-                if out >= 0 {
-                    chg[out as usize] = scratch.node_buf[slot];
+            if chg.len() == num_slots {
+                unsafe {
+                    lr(inst_ptr, model_ptr, chg.as_mut_ptr());
+                }
+            } else {
+                scratch.node_buf.clear();
+                scratch.node_buf.resize(num_slots, 0.0);
+                unsafe {
+                    lr(inst_ptr, model_ptr, scratch.node_buf.as_mut_ptr());
+                }
+                for slot in 0..num_slots {
+                    let out = m.slot_to_out[slot];
+                    if out >= 0 {
+                        chg[out as usize] = scratch.node_buf[slot];
+                    }
                 }
             }
         }
         if !residual_only {
             if let Some(wj) = m.write_jacobian_react {
                 if sparse {
-                    unsafe { wj(inst_ptr, model_ptr, cap.as_mut_ptr()); }
+                    unsafe {
+                        wj(inst_ptr, model_ptr, cap.as_mut_ptr());
+                    }
                 } else {
                     scratch.jac_buf.clear();
                     scratch.jac_buf.resize(m.num_react_jac as usize, 0.0);
-                    unsafe { wj(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr()); }
-                    for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
-                        let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
-                        let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
-                        if s1 >= 0 && s2 >= 0 {
-                            let o1 = m.slot_to_out[s1 as usize];
-                            let o2 = m.slot_to_out[s2 as usize];
-                            if o1 >= 0 && o2 >= 0 {
-                                cap[o1 as usize * num_all_nodes + o2 as usize] += scratch.jac_buf[idx];
+                    unsafe {
+                        wj(inst_ptr, model_ptr, scratch.jac_buf.as_mut_ptr());
+                    }
+                    if let Some(plan) = plan {
+                        for (idx, target) in plan.react_targets.iter().enumerate() {
+                            if let Some(target) = target {
+                                cap[*target] += scratch.jac_buf[idx];
+                            }
+                        }
+                    } else {
+                        for (idx, &(n1, n2)) in m.react_jac_pairs.iter().enumerate() {
+                            let s1 = node_map.get(n1 as usize).copied().unwrap_or(-1);
+                            let s2 = node_map.get(n2 as usize).copied().unwrap_or(-1);
+                            if s1 >= 0 && s2 >= 0 {
+                                let o1 = m.slot_to_out[s1 as usize];
+                                let o2 = m.slot_to_out[s2 as usize];
+                                if o1 >= 0 && o2 >= 0 {
+                                    cap[o1 as usize * num_all_nodes + o2 as usize] +=
+                                        scratch.jac_buf[idx];
+                                }
                             }
                         }
                     }
@@ -1335,7 +1390,6 @@ fn eval_device_from_setup(
             }
         }
     }
-
 }
 
 /// Stateless eval: re-run setup every call using thread-local scratch.
@@ -1362,7 +1416,7 @@ fn eval_one_device(
         let EvalScratch { model_data, inst_data, small } = &mut *scratch;
         setup_device(m, param, model_data, inst_data);
         eval_device_from_setup(
-            m, model_data, inst_data, vol, cur, cond, chg, cap, residual_only, false, small,
+            m, model_data, inst_data, vol, cur, cond, chg, cap, residual_only, false, small, None, false,
         );
     });
 }
@@ -1405,7 +1459,7 @@ pub extern "C" fn batched_osdi_eval_ffi(
     if num_states == 0 {
         // Adaptive parallelism: small ``num_devices`` runs sequentially to
         // avoid Rayon's per-task scheduling overhead — see the
-        // ``RAYON_DEVICE_THRESHOLD_DEFAULT`` comment for measurements.
+        // dispatch-policy comment for measurements.
         if use_parallel(num_devices) {
             currents.par_chunks_exact_mut(num_pins)
                 .zip(conductances.par_chunks_exact_mut(jac_size))
@@ -1413,6 +1467,7 @@ pub extern "C" fn batched_osdi_eval_ffi(
                 .zip(capacitances.par_chunks_exact_mut(jac_size))
                 .zip(voltages.par_chunks_exact(num_pins))
                 .zip(params.par_chunks_exact(num_params))
+                .with_min_len(minimum_chunk())
                 .for_each(|(((((cur, cond), chg), cap), vol), param)| {
                     cur.fill(0.0);
                     cond.fill(0.0);
@@ -1450,6 +1505,7 @@ pub extern "C" fn batched_osdi_eval_ffi(
                 .zip(capacitances.par_chunks_exact_mut(jac_size))
                 .zip(voltages.par_chunks_exact(num_pins))
                 .zip(params.par_chunks_exact(num_params))
+                .with_min_len(minimum_chunk())
                 .for_each(|(((((cur, cond), chg), cap), vol), param)| {
                     cur.fill(0.0);
                     cond.fill(0.0);
@@ -1514,6 +1570,7 @@ pub extern "C" fn batched_osdi_residual_eval_ffi(
                 .zip(charges.par_chunks_exact_mut(num_pins))
                 .zip(voltages.par_chunks_exact(num_pins))
                 .zip(params.par_chunks_exact(num_params))
+                .with_min_len(minimum_chunk())
                 .for_each(|(((cur, chg), vol), param)| {
                     cur.fill(0.0);
                     chg.fill(0.0);
@@ -1547,6 +1604,7 @@ pub extern "C" fn batched_osdi_residual_eval_ffi(
                 .zip(charges.par_chunks_exact_mut(num_pins))
                 .zip(voltages.par_chunks_exact(num_pins))
                 .zip(params.par_chunks_exact(num_params))
+                .with_min_len(minimum_chunk())
                 .for_each(|(((cur, chg), vol), param)| {
                     cur.fill(0.0);
                     chg.fill(0.0);
@@ -1586,17 +1644,22 @@ pub extern "C" fn batched_osdi_residual_eval_ffi(
 //   2. `batched_osdi_eval_handle_ffi(handle_id, voltages, ...)` copies the
 //      snapshot into thread-local scratch per device and runs eval — no
 //      setup_instance, no access() pointer-walks, just the eval + extract.
+//      Qualified non-tiled handles use exclusive mutable workspaces instead;
+//      generic and tiled handles retain immutable snapshot restoration.
 //   3. `batched_osdi_residual_eval_handle_ffi` is the same but residual-only.
 //   4. `osdi_free_handle_ffi(handle_id)` drops the entry. Callers (Python
 //      `OsdiBatchHandle.__del__`) are responsible for lifetime.
 
 struct OsdiBatchHandle {
-    model_id:        u32,
-    num_devices:     usize,
+    model_id: u32,
+    num_devices: usize,
     /// Flat: num_devices * m.model_size bytes (one model snapshot per device).
     model_data_flat: Vec<u8>,
     /// Flat: num_devices * m.instance_size bytes (one inst snapshot per device).
-    inst_data_flat:  Vec<u8>,
+    inst_data_flat: Vec<u8>,
+    parallel_policy: RwLock<Option<(usize, usize)>>,
+    qualified_work: std::sync::Mutex<Option<Vec<handle_runtime::Lane>>>,
+    plans: Vec<handle_runtime::LanePlan>,
 }
 
 lazy_static::lazy_static! {
@@ -1610,38 +1673,51 @@ lazy_static::lazy_static! {
 /// registry. Returns the new handle id, or 0 if the model id is unknown.
 #[no_mangle]
 pub extern "C" fn osdi_setup_batch_ffi(
-    model_id:    u32,
+    model_id: u32,
     num_devices: usize,
-    num_params:  usize,
-    params_ptr:  *const f64,
+    num_params: usize,
+    params_ptr: *const f64,
 ) -> u64 {
     let registry = OSDI_REGISTRY.read().unwrap();
     let m = match registry.get(&model_id) {
         Some(m) => m,
-        None => { eprintln!("osdi_setup_batch: unknown model_id={model_id}"); return 0; }
+        None => {
+            eprintln!("osdi_setup_batch: unknown model_id={model_id}");
+            return 0;
+        }
     };
 
     let params = unsafe { std::slice::from_raw_parts(params_ptr, num_devices * num_params) };
 
     let mut model_data_flat = vec![0u8; num_devices * m.model_size];
-    let mut inst_data_flat  = vec![0u8; num_devices * m.instance_size];
+    let mut inst_data_flat = vec![0u8; num_devices * m.instance_size];
 
-    if use_parallel(num_devices) {
-        model_data_flat.par_chunks_exact_mut(m.model_size)
-            .zip(inst_data_flat.par_chunks_exact_mut(m.instance_size))
-            .zip(params.par_chunks_exact(num_params))
-            .for_each(|((model_data, inst_data), param)| {
-                setup_device(m, param, model_data, inst_data);
-            });
-    } else {
-        model_data_flat.chunks_exact_mut(m.model_size)
-            .zip(inst_data_flat.chunks_exact_mut(m.instance_size))
-            .zip(params.chunks_exact(num_params))
-            .for_each(|((model_data, inst_data), param)| {
-                setup_device(m, param, model_data, inst_data);
-            });
-    }
+    let config = configuration();
+    config.pool.install(|| {
+        if config.parallel(num_devices) {
+            model_data_flat
+                .par_chunks_exact_mut(m.model_size)
+                .zip(inst_data_flat.par_chunks_exact_mut(m.instance_size))
+                .zip(params.par_chunks_exact(num_params))
+                .with_min_len(config.min_chunk)
+                .for_each(|((model_data, inst_data), param)| {
+                    setup_device(m, param, model_data, inst_data);
+                });
+        } else {
+            model_data_flat
+                .chunks_exact_mut(m.model_size)
+                .zip(inst_data_flat.chunks_exact_mut(m.instance_size))
+                .zip(params.chunks_exact(num_params))
+                .for_each(|((model_data, inst_data), param)| {
+                    setup_device(m, param, model_data, inst_data);
+                });
+        }
+    });
 
+    let plans = inst_data_flat
+        .chunks_exact(m.instance_size)
+        .map(|instance| handle_runtime::LanePlan::new(m, instance))
+        .collect();
     drop(registry);
 
     let handle_id = {
@@ -1651,12 +1727,18 @@ pub extern "C" fn osdi_setup_batch_ffi(
         cur
     };
 
-    HANDLES.write().unwrap().insert(handle_id, OsdiBatchHandle {
-        model_id,
-        num_devices,
-        model_data_flat,
-        inst_data_flat,
-    });
+    HANDLES.write().unwrap().insert(
+        handle_id,
+        OsdiBatchHandle {
+            model_id,
+            num_devices,
+            model_data_flat,
+            inst_data_flat,
+            parallel_policy: RwLock::new(None),
+            qualified_work: std::sync::Mutex::new(None),
+            plans,
+        },
+    );
 
     handle_id
 }
@@ -1833,233 +1915,85 @@ pub extern "C" fn batched_osdi_residual_eval_handle_ffi(
 /// `eval_device_from_setup` as empty slices that it never writes.
 #[allow(clippy::too_many_arguments)]
 fn run_handle_eval(
-    handle_id:        u64,
-    num_devices:      usize,   // caller-requested device count (≥ h.num_devices)
-    num_pins:         usize,
-    num_states:       usize,
-    voltages_ptr:     *const f64,
-    currents_ptr:     *mut f64,
+    handle_id: u64,
+    num_devices: usize, // caller-requested device count (≥ h.num_devices)
+    num_pins: usize,
+    num_states: usize,
+    voltages_ptr: *const f64,
+    currents_ptr: *mut f64,
     conductances_ptr: Option<*mut f64>,
-    charges_ptr:      *mut f64,
+    charges_ptr: *mut f64,
     capacitances_ptr: Option<*mut f64>,
-    new_state_ptr:    *mut f64,
-    residual_only:    bool,
-    sparse:           bool,
+    new_state_ptr: *mut f64,
+    residual_only: bool,
+    sparse: bool,
 ) {
+    let buffers = handle_runtime::Buffers {
+        voltages: voltages_ptr as usize,
+        currents: currents_ptr as usize,
+        conductances: conductances_ptr.map_or(0, |p| p as usize),
+        charges: charges_ptr as usize,
+        capacitances: capacitances_ptr.map_or(0, |p| p as usize),
+    };
     let handles = HANDLES.read().unwrap();
-    let h = match handles.get(&handle_id) {
-        Some(h) => h,
-        None => { eprintln!("osdi handle-eval: unknown handle_id={handle_id}"); return; }
+    let Some(h) = handles.get(&handle_id) else {
+        return;
     };
     let registry = OSDI_REGISTRY.read().unwrap();
-    let m = match registry.get(&h.model_id) {
-        Some(m) => m,
-        None => { eprintln!("osdi handle-eval: model {} gone", h.model_id); return; }
+    let Some(m) = registry.get(&h.model_id) else {
+        return;
     };
-
-    if sparse && num_pins != m.num_all_nodes {
-        eprintln!("osdi sparse handle-eval: voltage width must equal model.num_nodes");
+    if num_pins != m.num_all_nodes || h.num_devices == 0 || num_devices % h.num_devices != 0 {
         return;
     }
-
-    let jac_size        = num_pins * num_pins;
-    let model_size      = m.model_size;
-    let inst_size       = m.instance_size;
-    let handle_n_devs   = h.num_devices;
-
-    if handle_n_devs == 0 || num_devices % handle_n_devs != 0 {
-        eprintln!(
-            "osdi handle-eval: num_devices={} must be a positive multiple of \
-             handle.num_devices={}",
-            num_devices, handle_n_devs
-        );
-        return;
-    }
-
-    let voltages = unsafe { std::slice::from_raw_parts(voltages_ptr, num_devices * num_pins) };
-    let currents = unsafe { std::slice::from_raw_parts_mut(currents_ptr, num_devices * num_pins) };
-    let charges  = unsafe { std::slice::from_raw_parts_mut(charges_ptr,  num_devices * num_pins) };
-
-    // Stateful models: states initialised to zero, continue with normal eval.
-    if num_states != 0 {
-        let new_state = unsafe {
-            std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states)
+    let config = handle_runtime::configuration_for_handle(h, &configuration());
+    // Acquire exclusivity on the host thread, before installing work in Rayon.
+    // Blocking a pool worker on a shared handle can starve its owner's tasks.
+    let mut workspace = if num_devices == h.num_devices {
+        Some(h.qualified_work.lock().unwrap())
+    } else {
+        None
+    };
+    if let Some(lanes) = workspace.as_mut().and_then(|w| w.as_mut()) {
+        let mut work = || {
+            handle_runtime::evaluate_qualified(
+                lanes,
+                &h.plans,
+                m,
+                num_devices,
+                buffers,
+                residual_only,
+                sparse,
+                &config,
+            )
         };
-        new_state.fill(0.0);
-    }
-
-    // Per-device snapshot indexing (inlined below): device k uses snapshot
-    // (k % handle_n_devs). When num_devices == handle_n_devs the modulo is a
-    // no-op; when vmap has flattened B replicas on top, this broadcasts the
-    // handle's snapshots across the replica axis.
-
-    // Per-device work bodies are inlined into each branch (sequential vs
-    // parallel) — extracting them into a closure measurably hurt parallel
-    // throughput at N=54 (rayon's task-stealing scheduler doesn't always
-    // inline closures cleanly, leaving an indirect call per work item).
-    if sparse {
-        let resist_n = m.num_resist_jac as usize;
-        let react_n = m.num_react_jac as usize;
-        // Each work item owns disjoint device-major output regions. Keep the
-        // addresses as integers so zero-width Jacobians need no dummy buffers
-        // and no zero-sized chunk iterators (which would panic).
-        let resist_addr = conductances_ptr.unwrap() as usize;
-        let react_addr = capacitances_ptr.unwrap() as usize;
-        let work = |(device_idx, ((cur, chg), vol)): (usize, ((&mut [f64], &mut [f64]), &[f64]))| {
-            let cond = if resist_n == 0 { &mut [] } else { unsafe {
-                std::slice::from_raw_parts_mut((resist_addr as *mut f64).add(device_idx * resist_n), resist_n)
-            }};
-            let cap = if react_n == 0 { &mut [] } else { unsafe {
-                std::slice::from_raw_parts_mut((react_addr as *mut f64).add(device_idx * react_n), react_n)
-            }};
-            cur.fill(0.0);
-            chg.fill(0.0);
-            // DC and missing reactive callbacks must still produce defined zeros.
-            cond.fill(0.0);
-            cap.fill(0.0);
-            let snap_idx = device_idx % handle_n_devs;
-            SCRATCH.with(|s| {
-                let mut scratch = s.borrow_mut();
-                scratch.model_data.clear();
-                scratch.model_data.extend_from_slice(&h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size]);
-                scratch.inst_data.clear();
-                scratch.inst_data.extend_from_slice(&h.inst_data_flat[snap_idx * inst_size .. (snap_idx + 1) * inst_size]);
-                let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                eval_device_from_setup(m, model_data, inst_data, vol, cur, cond, chg, cap, false, true, small);
-            });
-        };
-        if use_parallel(num_devices) {
-            currents.par_chunks_exact_mut(num_pins)
-                .zip(charges.par_chunks_exact_mut(num_pins))
-                .zip(voltages.par_chunks_exact(num_pins)).enumerate().for_each(work);
+        if config.parallel(num_devices) {
+            config.pool.install(work);
         } else {
-            currents.chunks_exact_mut(num_pins)
-                .zip(charges.chunks_exact_mut(num_pins))
-                .zip(voltages.chunks_exact(num_pins)).enumerate().for_each(work);
-        }
-    } else if residual_only {
-        if use_parallel(num_devices) {
-            currents.par_chunks_exact_mut(num_pins)
-                .zip(charges.par_chunks_exact_mut(num_pins))
-                .zip(voltages.par_chunks_exact(num_pins))
-                .enumerate()
-                .for_each(|(device_idx, ((cur, chg), vol))| {
-                    cur.fill(0.0);
-                    chg.fill(0.0);
-                    let snap_idx = device_idx % handle_n_devs;
-                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
-                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
-                    SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.model_data.clear();
-                        scratch.model_data.extend_from_slice(model_snap);
-                        scratch.inst_data.clear();
-                        scratch.inst_data.extend_from_slice(inst_snap);
-                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                        let mut cond_ignored: [f64; 0] = [];
-                        let mut cap_ignored:  [f64; 0] = [];
-                        eval_device_from_setup(
-                            m, model_data, inst_data, vol,
-                            cur, &mut cond_ignored, chg, &mut cap_ignored,
-                            true, false, small,
-                        );
-                    });
-                });
-        } else {
-            currents.chunks_exact_mut(num_pins)
-                .zip(charges.chunks_exact_mut(num_pins))
-                .zip(voltages.chunks_exact(num_pins))
-                .enumerate()
-                .for_each(|(device_idx, ((cur, chg), vol))| {
-                    cur.fill(0.0);
-                    chg.fill(0.0);
-                    let snap_idx = device_idx % handle_n_devs;
-                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
-                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
-                    SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.model_data.clear();
-                        scratch.model_data.extend_from_slice(model_snap);
-                        scratch.inst_data.clear();
-                        scratch.inst_data.extend_from_slice(inst_snap);
-                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                        let mut cond_ignored: [f64; 0] = [];
-                        let mut cap_ignored:  [f64; 0] = [];
-                        eval_device_from_setup(
-                            m, model_data, inst_data, vol,
-                            cur, &mut cond_ignored, chg, &mut cap_ignored,
-                            true, false, small,
-                        );
-                    });
-                });
+            work();
         }
     } else {
-        let conductances = unsafe {
-            std::slice::from_raw_parts_mut(conductances_ptr.unwrap(), num_devices * jac_size)
+        drop(workspace);
+        let work = || {
+            handle_runtime::evaluate_snapshots(
+                h,
+                m,
+                num_devices,
+                buffers,
+                residual_only,
+                sparse,
+                &config,
+            )
         };
-        let capacitances = unsafe {
-            std::slice::from_raw_parts_mut(capacitances_ptr.unwrap(), num_devices * jac_size)
-        };
-
-        if use_parallel(num_devices) {
-            currents.par_chunks_exact_mut(num_pins)
-                .zip(conductances.par_chunks_exact_mut(jac_size))
-                .zip(charges.par_chunks_exact_mut(num_pins))
-                .zip(capacitances.par_chunks_exact_mut(jac_size))
-                .zip(voltages.par_chunks_exact(num_pins))
-                .enumerate()
-                .for_each(|(device_idx, ((((cur, cond), chg), cap), vol))| {
-                    cur.fill(0.0);
-                    cond.fill(0.0);
-                    chg.fill(0.0);
-                    cap.fill(0.0);
-                    let snap_idx = device_idx % handle_n_devs;
-                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
-                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
-                    SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.model_data.clear();
-                        scratch.model_data.extend_from_slice(model_snap);
-                        scratch.inst_data.clear();
-                        scratch.inst_data.extend_from_slice(inst_snap);
-                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                        eval_device_from_setup(
-                            m, model_data, inst_data, vol,
-                            cur, cond, chg, cap,
-                            false, false, small,
-                        );
-                    });
-                });
+        if config.parallel(num_devices) {
+            config.pool.install(work);
         } else {
-            currents.chunks_exact_mut(num_pins)
-                .zip(conductances.chunks_exact_mut(jac_size))
-                .zip(charges.chunks_exact_mut(num_pins))
-                .zip(capacitances.chunks_exact_mut(jac_size))
-                .zip(voltages.chunks_exact(num_pins))
-                .enumerate()
-                .for_each(|(device_idx, ((((cur, cond), chg), cap), vol))| {
-                    cur.fill(0.0);
-                    cond.fill(0.0);
-                    chg.fill(0.0);
-                    cap.fill(0.0);
-                    let snap_idx = device_idx % handle_n_devs;
-                    let model_snap = &h.model_data_flat[snap_idx * model_size .. (snap_idx + 1) * model_size];
-                    let inst_snap  = &h.inst_data_flat [snap_idx * inst_size  .. (snap_idx + 1) * inst_size ];
-                    SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.model_data.clear();
-                        scratch.model_data.extend_from_slice(model_snap);
-                        scratch.inst_data.clear();
-                        scratch.inst_data.extend_from_slice(inst_snap);
-                        let EvalScratch { model_data, inst_data, small } = &mut *scratch;
-                        eval_device_from_setup(
-                            m, model_data, inst_data, vol,
-                            cur, cond, chg, cap,
-                            false, false, small,
-                        );
-                    });
-                });
+            work();
         }
+    }
+    if num_states != 0 {
+        unsafe { std::slice::from_raw_parts_mut(new_state_ptr, num_devices * num_states) }
+            .fill(0.0);
     }
 }
 
