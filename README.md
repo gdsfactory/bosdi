@@ -14,7 +14,7 @@
 Evaluate [OSDI](https://github.com/OpenVAF/OpenVAF) device models (Verilog-A compiled to `.osdi` binaries) in batched
 parallel via JAX.
 
-Native handle users can configure BOSDI's worker pool and bind caller-owned buffers with exact evaluation. See
+Native handle users can configure BOSDI's worker pool and bind caller-owned buffers with optional evaluation bypass. See
 [the native handle runtime](docs/handle-runtime.md) for the qualification contract, exact-evaluation defaults and
 benchmark results.
 

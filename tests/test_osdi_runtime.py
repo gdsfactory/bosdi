@@ -1,4 +1,4 @@
-"""Exact handle parity, buffer lifetime, and caller-owned output bindings."""
+"""Exact handle parity, buffer lifetime and caller-owned bypass semantics."""
 
 import ctypes as ct
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +14,7 @@ from osdi_jax import OsdiBatchHandle, osdi_setup_batch
 from osdi_loader import load_osdi_model
 from osdi_runtime import (
     BoundBatch,
+    BypassCache,
     num_threads,
     qualify_handle,
     set_num_threads,
@@ -168,6 +169,7 @@ def test_bound_collapse_and_rebind(threads, series_rc, analysis):
             bound.voltages = np.zeros_like(voltage)
         with pytest.raises(AttributeError):
             bound.currents = np.zeros_like(voltage)
+        cache = bound.new_cache()
         bound.conductances.fill(123.0)
         saved = bound.conductances.tobytes()
         bound.evaluate(residual_only=True)
@@ -176,8 +178,86 @@ def test_bound_collapse_and_rebind(threads, series_rc, analysis):
         bound.rebind(np.zeros_like(voltage))
         assert bound.generation > old_generation
         assert _eval(old_id, old_generation, False, False) == -1
+        with pytest.raises(ValueError, match="Stale"):
+            bound.evaluate_bypass(cache=cache)
         bound.evaluate(check_finite=True)
     assert _eval(old_id, bound.generation, False, False) == -1
+
+
+def test_bypass_validity_and_exactness(threads):
+    model, params = model_params("resistor_va.osdi", 1000)
+    handle = osdi_setup_batch(model.id, params)
+    set_parallel_policy(1, 16, handle=handle)
+    voltage = np.ones((1000, model.num_nodes))
+    voltage[:, 1] = 0.0
+    with BoundBatch(handle, voltage) as bound:
+        assert bound.evaluate() == {"evaluated": 1000}
+        cache = bound.new_cache()
+        cache.previous_voltages[:] = voltage
+        cache.valid[:] = 3
+        stats, mask = bound.evaluate_bypass(cache=cache, dry_run=True)
+        assert stats == {"evaluated": 1000, "bypassed": 0, "eligible": 1000}
+        assert not mask.any()
+        with pytest.raises(ValueError, match="qualified"):
+            bound.evaluate_bypass(cache=cache)
+        bound.qualify_pure_eval()
+        cache.generation = bound.generation
+        # Exactly half the lanes are idle; invalid/full-vs-residual distinctions
+        # further exclude lanes independently of their voltages.
+        voltage[::2, 0] += 0.1
+        cache.valid[1] = 0
+        cache.valid[3] = 1
+        before = [a.copy() for a in bound._arrays[1:]]
+        stats, mask = bound.evaluate_bypass(cache=cache, check_finite=True)
+        assert stats == {"evaluated": 502, "bypassed": 498, "eligible": 498}
+        assert not mask[0::2].any()
+        for actual, old in zip(bound._arrays[1:], before):
+            assert (
+                actual[mask.astype(bool)].tobytes() == old[mask.astype(bool)].tobytes()
+            )
+        assert np.array_equal(cache.previous_voltages[:, 0], np.ones(1000))
+        # A residual-only cache covers residual requests; Jacobians stay intact.
+        g = bound.conductances.copy()
+        stats, _ = bound.evaluate_bypass(cache=cache, residual_only=True)
+        assert stats["bypassed"] == 499
+        assert bound.conductances.tobytes() == g.tobytes()
+        # Exact calls ignore the cache and recompute every lane.
+        voltage[5, 0] += 1e-7
+        f5 = bound.currents[5].copy()
+        stats, _ = bound.evaluate_bypass(cache=cache)
+        assert np.array_equal(bound.currents[5], f5)
+        assert bound.evaluate()["evaluated"] == 1000
+        assert not np.array_equal(bound.currents[5], f5)
+        cache.valid[:] = 0
+        assert bound.evaluate_bypass(cache=cache)[0]["bypassed"] == 0
+        for reltol, vntol in [(-1.0, 1e-6), (np.inf, 1e-6), (1e-3, np.nan)]:
+            with pytest.raises(ValueError, match="Invalid cache"):
+                bound.evaluate_bypass(cache=cache, reltol=reltol, vntol=vntol)
+        invalid = BypassCache(bound.voltages, cache.valid, bound.generation)
+        with pytest.raises(ValueError, match="aliasing"):
+            bound.evaluate_bypass(cache=invalid)
+        bound.currents[1] = np.nan
+        cache.valid[1] = 3
+        with pytest.raises(ValueError, match="Nonfinite"):
+            bound.evaluate_bypass(cache=cache, check_finite=True)
+
+
+def test_psp_qualification_and_dry_run(threads):
+    model, params = model_params("psp103v4_psp103.osdi", 100)
+    handle = osdi_setup_batch(model.id, params)
+    with BoundBatch(handle, np.zeros((100, model.num_nodes))) as bound:
+        bound.evaluate(check_finite=True)
+        cache = bound.new_cache()
+        cache.valid[:] = 3
+        assert bound.evaluate_bypass(cache=cache, dry_run=True)[0]["eligible"] == 100
+        # This compiled PSP103 artifact exposes no active ABI state slots.
+        assert model.num_states == 0
+        bound.qualify_pure_eval()
+        cache.generation = bound.generation
+        assert bound.evaluate_bypass(cache=cache)[0]["bypassed"] == 100
+        # Internal unknowns participate in the tolerance test too.
+        bound.voltages[0, -1] += 0.1
+        assert bound.evaluate_bypass(cache=cache)[0]["evaluated"] == 1
 
 
 def test_native_binding_rejects_bad_buffers():
@@ -246,13 +326,20 @@ def test_thread_reconfiguration_and_host_concurrency():
         set_num_threads(0)
 
 
-def test_binding_qualification_refuses_abi_state_provider(limiting_binary):
+def test_limiting_provider_refuses_bypass(limiting_binary):
     model = load_osdi_model(str(limiting_binary))
     handle = osdi_setup_batch(model.id, np.full((1, model.num_params), np.nan))
     with BoundBatch(handle, np.zeros((1, model.num_nodes))) as bound:
         with pytest.raises(ValueError, match="ABI-state"):
             bound.qualify_pure_eval()
-        assert bound.evaluate()["evaluated"] == 1
+        with pytest.raises(ValueError, match="ABI-state"):
+            qualify_handle(handle)
+        assert bound.evaluate() == {"evaluated": 1}
+        cache = bound.new_cache()
+        cache.valid[:] = 3
+        assert bound.evaluate_bypass(cache=cache, dry_run=True)[0]["eligible"] == 1
+        with pytest.raises(ValueError, match="qualified"):
+            bound.evaluate_bypass(cache=cache)
 
 
 def test_grounded_bound_outputs(threads, conditional_branch, abi):

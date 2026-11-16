@@ -21,6 +21,7 @@ from osdi_runtime import (
     BoundBatch,
     qualify_handle,
     set_num_threads,
+    _Bypass,
     _addresses,
 )
 
@@ -55,6 +56,7 @@ def main():
         )
         helper = Native.__new__(Native)
         helper.lib = ct.CDLL(str(library))
+        helper.addresses = None
         create = helper.function(
             "scalar_create",
             ct.c_void_p,
@@ -90,12 +92,22 @@ def main():
             ct.c_size_t,
             ct.c_double,
         )
+        bypass_time = helper.function(
+            "time_bound_bypass",
+            ct.c_double,
+            ct.c_void_p,
+            ct.c_uint64,
+            ct.c_uint64,
+            ct.c_size_t,
+            ct.POINTER(_Bypass),
+            ct.c_double,
+        )
         native = Native()
         baseline = Native(args.baseline) if args.baseline else None
         rows = []
-        # Scalar, snapshot, qualified, and bound paths plus an optional old
-        # dense path. Each cell gets three short trials.
-        cell_budget = args.seconds / (2 * 3 * len(THREADS) * (5 if baseline else 4) * 3)
+        # scalar + dense snapshots + qualified dense + bound raw + idle bound,
+        # plus an optional old dense path. Each cell gets three short trials.
+        cell_budget = args.seconds / (2 * 3 * len(THREADS) * (6 if baseline else 5) * 3)
         for name in ("resistor_va.osdi", "psp103v4_psp103.osdi"):
             for count in (100, 1000, 10000):
                 model, params = model_params(name, count, "tran")
@@ -145,6 +157,22 @@ def main():
                             output(scalar, index), shape=(actual.size,)
                         ).reshape(actual.shape)
                         assert actual.tobytes() == expected.tobytes(), (name, index)
+                    cache = bound.new_cache()
+                    cache.previous_voltages[:] = voltage
+                    cache.valid[:] = 3
+                    mask = np.zeros(count, np.uint8)
+                    options = _Bypass(
+                        cache.previous_voltages.ctypes.data,
+                        voltage.size,
+                        cache.valid.ctypes.data,
+                        count,
+                        mask.ctypes.data,
+                        count,
+                        bound.generation,
+                        1e-3,
+                        1e-6,
+                        False,
+                    )
                     for threads in THREADS:
                         set_num_threads(threads)
 
@@ -171,6 +199,7 @@ def main():
                                 "dense_snapshot",
                                 "dense_qualified",
                                 "bound_raw",
+                                "bound_idle",
                             )
                         }
                         if baseline:
@@ -193,6 +222,16 @@ def main():
                                     bound._id,
                                     bound.generation,
                                     count,
+                                    cell_budget,
+                                )
+                            )
+                            samples["bound_idle"].append(
+                                bypass_time(
+                                    _addresses["eval_bound_bypass"],
+                                    bound._id,
+                                    bound.generation,
+                                    count,
+                                    ct.byref(options),
                                     cell_budget,
                                 )
                             )

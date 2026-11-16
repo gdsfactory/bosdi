@@ -124,3 +124,10 @@ double time_bound(BoundEval eval,uint64_t binding,uint64_t generation,size_t cou
     do { if(eval(binding,generation,false,false)) return -1.; ++repeats;end=now(); } while(end-start<seconds);
     return (end-start)*1e9/repeats/count;
 }
+typedef int32_t (*BypassEval)(uint64_t,uint64_t,bool,bool,const BosdiBypass*,BosdiEvalStats*);
+double time_bound_bypass(BypassEval eval,uint64_t binding,uint64_t generation,size_t count,
+    const BosdiBypass *bypass,double seconds) {
+    size_t repeats=0;double start=now(),end;
+    do { if(eval(binding,generation,false,false,bypass,NULL)) return -1.; ++repeats;end=now(); } while(end-start<seconds);
+    return (end-start)*1e9/repeats/count;
+}

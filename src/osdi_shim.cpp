@@ -462,6 +462,7 @@ NB_MODULE(osdi_shim_nb, m) {
             {"binding_generation", reinterpret_cast<uintptr_t>(&bosdi_binding_generation)},
             {"qualify_binding", reinterpret_cast<uintptr_t>(&bosdi_qualify_binding)},
             {"eval_bound", reinterpret_cast<uintptr_t>(&bosdi_eval_bound)},
+            {"eval_bound_bypass", reinterpret_cast<uintptr_t>(&bosdi_eval_bound_bypass)},
             {"load_osdi_library_with_analysis", reinterpret_cast<uintptr_t>(&load_osdi_library_with_analysis)},
             {"osdi_setup_batch_ffi", reinterpret_cast<uintptr_t>(&osdi_setup_batch_ffi)},
             {"osdi_free_handle_ffi", reinterpret_cast<uintptr_t>(&osdi_free_handle_ffi)},

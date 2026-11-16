@@ -1,8 +1,9 @@
-# Native handle runtime
+# Native handle runtime and caller-owned bypass
 
 The exact JAX/C handle entry points share a configurable BOSDI-owned Rayon pool. `osdi_runtime` additionally offers
 mutable native buffer bindings for simulator loops outside JAX transformations. Binding is the foundation from issue
-#39: handle-scoped execution policy, reusable buffers, and exact bound evaluation. No consumer matrix is accessed.
+#39; issue #38's optional bypass uses the same buffers and generation contract. The intended landing order is #39, then
+#38. No consumer matrix is accessed.
 
 ## Threads and dispatch
 
@@ -90,6 +91,50 @@ Python arrays but no longer receive writes. A stale generation or freed handle f
 preserves the existing binding. Native unbind waits for in-flight work before the caller can release storage. Exact
 residual-only calls preserve both Jacobian arrays.
 
+## Caller-owned bypass and measurement
+
+Exact evaluation is the default; JAX entry points never bypass. Enable bypass only for intermediate linearizations after
+qualifying the compiled provider. `qualify_pure_eval()` makes the same provider assertion described above for one
+binding, independently of the handle's JAX/C workspace qualification.
+
+```python
+with BoundBatch(handle, voltages) as batch:
+    batch.qualify_pure_eval()  # only after provider qualification
+    batch.evaluate()  # exact full F/Q/G/C
+    cache = batch.new_cache()
+    cache.previous_voltages[:] = batch.voltages
+    cache.valid[:] = 3
+
+    # Caller changes batch.voltages for the next intermediate linearization.
+    stats, bypassed = batch.evaluate_bypass(cache=cache, reltol=1e-3, vntol=1e-6)
+    # Only if the caller accepts these evaluated outputs as its new cache:
+    evaluated = ~bypassed.astype(bool)
+    cache.previous_voltages[evaluated] = batch.voltages[evaluated]
+    cache.valid[evaluated] = 3
+
+    batch.evaluate()  # exact final residual/history audit
+```
+
+For a lane to bypass, every raw input must be finite and move strictly less than
+`reltol * max(abs(v), abs(previous)) + vntol`. This includes internal and collapsed unknowns. NaN/Inf inputs never
+bypass; invalid tolerances are rejected. Validity bit 1 covers F/Q and bit 2 covers G/C; full evaluation requires both.
+BOSDI never updates previous inputs or validity. On a skip it leaves every output bit untouched, including the private
+sink. No whole-batch zeroing occurs. The returned mask identifies skipped lanes; statistics count evaluated, bypassed
+and eligible lanes. Optional finiteness checks also check skipped cached outputs. First-order extrapolation is not
+implemented.
+
+Never move the cached input of a skipped lane to its latest input: doing so would hide accumulated drift from the
+original evaluation. After exact residual-only evaluation at a new bias, mark validity 1, since the retained Jacobian
+was not recomputed there. Clear validity after any change in parameters, bindings, temperature, analysis or other
+context. Registration context is immutable; parameter/context changes normally require a new handle. Rebind and
+qualification changes advance a unique generation and reject earlier caches, even across different bindings.
+
+For issue #38's measurement-first workflow, use `batch.evaluate_bypass(cache=cache, dry_run=True)` **without qualifying
+the provider**. It counts eligible lanes but evaluates all lanes exactly and sets no bypass-mask bits. Capture those
+statistics at every c6288 intermediate linearization, time provider evaluation and consumer assembly separately, and
+update previous inputs only to the exact evaluation represented by the caller's outputs. Ordinary calls with no cache
+have no bypass diagnostics. There is no automatic activation.
+
 ## Short diagnostic benchmark
 
 Run after building and compiling the test artifacts:
@@ -120,7 +165,8 @@ workers. Rounded ns/lane:
 The resistor remains around 1.5× the scalar raw-entry cost on one thread; #39's approximately 1.2× target is **not
 achieved** on this particularly simple artifact. Small batches avoid the earlier scheduling penalty. The conservative
 policy deliberately keeps 100/1,000-lane groups serial; expensive PSP103 groups can use a measured per-handle policy to
-regain parallelism at smaller sizes.
+regain parallelism at smaller sizes. An all-idle synthetic bypass measures the skip path only; it does not establish the
+fraction of idle lanes or speedup in a running c6288 circuit.
 
 Actual c6288 per-linearization idle fractions and evaluation/assembly timing remain consumer-side work. The available
 local archived voltage traces contain only selected circuit outputs, not every per-device internal unknown/Newton

@@ -553,8 +553,8 @@ fn binding(id: u64) -> Option<Arc<Mutex<Binding>>> {
     BINDINGS.read().unwrap().get(&id).cloned()
 }
 
-/// Successful rebinding advances the generation, even if an address is unchanged.
-/// Failed rebind preserves the binding.
+/// Successful rebinding advances the generation. Every prior cached output is
+/// invalid even if an address is unchanged. Failed rebind preserves the binding.
 #[no_mangle]
 pub unsafe extern "C" fn bosdi_rebind_buffers(id: u64, desc: *const BosdiBufferBinding) -> u64 {
     if desc.is_null() {
@@ -610,7 +610,7 @@ pub extern "C" fn bosdi_qualify_binding(id: u64, pure_recomputing_eval: bool) ->
         return false;
     }
     b.qualified = pure_recomputing_eval;
-    // A qualification change invalidates prior evaluation assumptions.
+    // A change in qualification cannot reuse cached output validity.
     b.generation = next_generation();
     true
 }
@@ -619,14 +619,79 @@ pub extern "C" fn bosdi_binding_generation(id: u64) -> u64 {
     binding(id).map_or(0, |b| b.lock().unwrap().generation)
 }
 
-/// Exact bound evaluation with optional output finiteness checks.
-/// Returns 0 on success, -1 for stale/unbound handles, and -4 for nonfinite outputs.
+/// Caller-owned cache for zero-order bypass. Validity bits: 1=F/Q, 2=G/C;
+/// full calls require both. All local raw unknowns (including internal nodes)
+/// are compared. Cache arrays are never modified by BOSDI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BosdiBypass {
+    pub previous_voltages: *const f64,
+    pub previous_voltages_len: usize,
+    pub valid: *const u8,
+    pub valid_len: usize,
+    pub bypassed: *mut u8,
+    pub bypassed_len: usize,
+    pub generation: u64,
+    pub reltol: f64,
+    pub vntol: f64,
+    /// Dry-run reports eligibility while still evaluating every lane exactly.
+    pub dry_run: bool,
+}
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct BosdiEvalStats {
+    pub evaluated: usize,
+    pub bypassed: usize,
+    pub eligible: usize,
+}
+
+fn idle(voltage: &[f64], previous: &[f64], reltol: f64, vntol: f64) -> bool {
+    voltage.iter().zip(previous).all(|(&v, &old)| {
+        v.is_finite()
+            && old.is_finite()
+            && (v - old).abs() < reltol * v.abs().max(old.abs()) + vntol
+    })
+}
+
+/// Exact evaluation entry point; its four-argument ABI remains stable.
 #[no_mangle]
 pub unsafe extern "C" fn bosdi_eval_bound(
     id: u64,
     generation: u64,
     residual_only: bool,
     check_finite: bool,
+) -> i32 {
+    eval_bound_impl(
+        id,
+        generation,
+        residual_only,
+        check_finite,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+    )
+}
+
+/// Optional caller-owned zero-order bypass entry point.
+#[no_mangle]
+pub unsafe extern "C" fn bosdi_eval_bound_bypass(
+    id: u64,
+    generation: u64,
+    residual_only: bool,
+    check_finite: bool,
+    bypass: *const BosdiBypass,
+    stats: *mut BosdiEvalStats,
+) -> i32 {
+    eval_bound_impl(id, generation, residual_only, check_finite, bypass, stats)
+}
+
+/// Shared implementation for exact and optional bypass calls.
+unsafe fn eval_bound_impl(
+    id: u64,
+    generation: u64,
+    residual_only: bool,
+    check_finite: bool,
+    bypass: *const BosdiBypass,
+    stats: *mut BosdiEvalStats,
 ) -> i32 {
     let Some(b) = binding(id) else {
         return -1;
@@ -643,16 +708,71 @@ pub unsafe extern "C" fn bosdi_eval_bound(
     let Some(m) = registry.get(&h.model_id) else {
         return -1;
     };
+    let cache = if bypass.is_null() {
+        None
+    } else {
+        Some(*bypass)
+    };
+    if let Some(cache) = cache {
+        if cache.generation != generation {
+            return -1;
+        }
+        if !cache.reltol.is_finite()
+            || !cache.vntol.is_finite()
+            || cache.reltol < 0.0
+            || cache.vntol < 0.0
+            || cache.previous_voltages_len != h.num_devices * m.num_all_nodes
+            || cache.valid_len != h.num_devices
+            || cache.bypassed_len != h.num_devices
+        {
+            return -2;
+        }
+        // Cache must not alias writable bound arrays or the returned mask. Byte
+        // regions are used here so u8 validity/masks need no f64 alignment.
+        let (g, c) = widths(m, false, true);
+        let mut regions = vec![
+            (b.buffers.voltages, h.num_devices * m.num_all_nodes * 8),
+            (b.buffers.currents, h.num_devices * m.num_slots * 8),
+            (b.buffers.charges, h.num_devices * m.num_slots * 8),
+            (b.buffers.conductances, h.num_devices * g * 8),
+            (b.buffers.capacitances, h.num_devices * c * 8),
+            (
+                cache.previous_voltages as usize,
+                cache.previous_voltages_len * 8,
+            ),
+            (cache.valid as usize, cache.valid_len),
+            (cache.bypassed as usize, cache.bypassed_len),
+        ];
+        if !disjoint_regions(&regions, 1) || (cache.previous_voltages as usize) % 8 != 0 {
+            return -2;
+        }
+        regions.clear();
+        if !cache.dry_run && !b.qualified {
+            return -3;
+        }
+    }
     let config = configuration_for_handle(h, &configuration());
     let buffers = b.buffers;
     let restore = !b.qualified || m.num_states != 0;
     let b_qualified = b.qualified;
+    // Convert cache pointers to addresses before entering Rayon. The caller
+    // guarantees immutable inputs/cache; masks are one disjoint byte per lane.
+    let cache_data = cache.map(|c| {
+        (
+            c.previous_voltages as usize,
+            c.valid as usize,
+            c.bypassed as usize,
+            c.reltol,
+            c.vntol,
+            c.dry_run,
+        )
+    });
     let chunk = if config.parallel(h.num_devices) {
         config.min_chunk
     } else {
         h.num_devices.max(1)
     };
-    let work = |(task, lanes): (usize, &mut [Lane])| -> bool {
+    let work = |(task, lanes): (usize, &mut [Lane])| -> (BosdiEvalStats, bool) {
         SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             let mut direct_info = OsdiSimInfo {
@@ -669,10 +789,36 @@ pub unsafe extern "C" fn bosdi_eval_bound(
                 flags: evaluation_flags(m, residual_only),
                 _pad: 0,
             };
+            let mut stats = BosdiEvalStats::default();
             let mut finite = true;
             for (offset, lane) in lanes.iter_mut().enumerate() {
                 let index = task * chunk + offset;
                 let vol = lane_input(buffers.voltages, index, m.num_all_nodes);
+                let mut skip = false;
+                if let Some((prev, valid, mask, reltol, vntol, dry)) = cache_data {
+                    let required = if residual_only { 1 } else { 3 };
+                    let eligible = *(valid as *const u8).add(index) & required == required
+                        && idle(vol, lane_input(prev, index, m.num_all_nodes), reltol, vntol);
+                    stats.eligible += usize::from(eligible);
+                    skip = eligible && !dry;
+                    *(mask as *mut u8).add(index) = u8::from(skip);
+                }
+                if skip {
+                    if check_finite {
+                        let (g, c) = widths(m, residual_only, true);
+                        finite &= lane_input(buffers.currents, index, m.num_slots)
+                            [..m.num_all_nodes]
+                            .iter()
+                            .chain(
+                                &lane_input(buffers.charges, index, m.num_slots)[..m.num_all_nodes],
+                            )
+                            .chain(lane_input(buffers.conductances, index, g))
+                            .chain(lane_input(buffers.capacitances, index, c))
+                            .all(|x| x.is_finite());
+                    }
+                    stats.bypassed += 1;
+                    continue;
+                }
                 if restore {
                     lane.model.bytes(m.model_size).copy_from_slice(
                         &h.model_data_flat[index * m.model_size..(index + 1) * m.model_size],
@@ -742,8 +888,9 @@ pub unsafe extern "C" fn bosdi_eval_bound(
                         .chain(cap.iter())
                         .all(|x| x.is_finite());
                 }
+                stats.evaluated += 1;
             }
-            finite
+            (stats, finite)
         })
     };
     let lanes = &mut b.lanes[..];
@@ -753,20 +900,23 @@ pub unsafe extern "C" fn bosdi_eval_bound(
                 .par_chunks_mut(chunk)
                 .enumerate()
                 .map(work)
-                .reduce(|| true, combine)
+                .reduce(|| (BosdiEvalStats::default(), true), combine)
         } else {
             lanes
                 .chunks_mut(chunk)
                 .enumerate()
                 .map(work)
-                .fold(true, combine)
+                .fold((BosdiEvalStats::default(), true), combine)
         }
     };
-    let finite = if config.parallel(h.num_devices) {
+    let (result, finite) = if config.parallel(h.num_devices) {
         config.pool.install(execute)
     } else {
         execute()
     };
+    if !stats.is_null() {
+        *stats = result;
+    }
     if finite {
         0
     } else {
@@ -824,8 +974,18 @@ fn eval_bound_direct(
     }
 }
 
-fn combine(a: bool, b: bool) -> bool {
-    a && b
+fn combine(
+    (a, fa): (BosdiEvalStats, bool),
+    (b, fb): (BosdiEvalStats, bool),
+) -> (BosdiEvalStats, bool) {
+    (
+        BosdiEvalStats {
+            evaluated: a.evaluated + b.evaluated,
+            bypassed: a.bypassed + b.bypassed,
+            eligible: a.eligible + b.eligible,
+        },
+        fa && fb,
+    )
 }
 
 #[cfg(test)]
@@ -854,5 +1014,10 @@ mod tests {
             .build_global()
             .is_ok());
         assert_eq!(rayon::current_num_threads(), 1);
+        assert!(idle(&[1.0, -2.0], &[1.0, -2.0], 1e-3, 1e-6));
+        assert!(!idle(&[f64::NAN], &[0.0], 1e-3, 1e-6));
+        assert!(!idle(&[0.0], &[f64::INFINITY], 1e-3, 1e-6));
+        assert!(!idle(&[1e-6], &[0.0], 0.0, 1e-6));
+        assert!(!idle(&[0.0], &[0.0], 0.0, 0.0));
     }
 }
