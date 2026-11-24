@@ -10,16 +10,14 @@ use std::sync::RwLock;
 // 0. RAYON DISPATCH POLICY
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Cheap-model diagnostics in #39 found 297–315 ns/lane at 100 lanes with
-// 24 workers versus 102–124 ns/lane with one. Default to at least 1024 lanes
-// and 256 lanes per task. Environment defaults are read once. The owned pool
-// and policy can be replaced explicitly; each call retains its configuration.
-// Native 2026-11-16 diagnostic (ns/lane, 1/12/24 workers, default policy):
-// resistor B=100 bound raw 12/12/12, scalar 7.7; B=10000 raw 11/3.0/3.5.
-// PSP103 B=100 raw 822/820/819; B=10000 raw 1342/198/172 (scalar 1402).
-// Heavy small groups can override the policy per handle. See
-// docs/handle-runtime.md for the full table, budget and remaining target gap.
+// The default 128/32 dispatch policy is measured on checked optical waveguides,
+// resistors and PSP103. Per-handle overrides remain available. Environment
+// defaults are read once and never mutated. See docs/handle-runtime.md.
 mod checked_runtime;
+mod delay_runtime;
+mod staged_runtime;
+#[cfg(test)]
+static RUNTIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod handle_runtime;
 use handle_runtime::{configuration, minimum_chunk, use_parallel};
 
@@ -337,6 +335,8 @@ unsafe fn read_fn<T: Copy>(base: *const u8, offset: usize) -> Option<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedOsdi {
+    delays: Vec<delay_runtime::Delay>,
+    delay_error: Option<String>,
     _simparam_names:          Vec<CString>,
     simparam_name_ptrs:       Vec<*mut i8>,
     simparam_values:          Vec<f64>,
@@ -588,6 +588,10 @@ pub extern "C" fn load_osdi_library_with_simparams(
     let instance_size  = unsafe { read_u32(desc, layout.desc_instance_size) } as usize;
     let model_size     = unsafe { read_u32(desc, layout.desc_model_size) } as usize;
     let model_size = model_size.max(1);
+    let (delays, delay_error) = if ver == OsdiVersion::V05 {
+        unsafe { delay_runtime::read_metadata(desc, num_nodes, num_terminals, instance_size) }
+    } else { (Vec::new(), None) };
+
     let num_resist_jac = unsafe { read_u32(desc, layout.desc_num_resist_jac) };
     let num_react_jac  = unsafe { read_u32(desc, layout.desc_num_react_jac) };
 
@@ -773,6 +777,8 @@ pub extern "C" fn load_osdi_library_with_simparams(
     };
 
     OSDI_REGISTRY.write().unwrap().insert(model_id, LoadedOsdi {
+        delays,
+        delay_error,
         _simparam_names: simparam_names,
         simparam_name_ptrs,
         simparam_values,
@@ -1656,6 +1662,8 @@ pub extern "C" fn batched_osdi_residual_eval_ffi(
 
 struct OsdiBatchHandle {
     model_id: u32,
+    observed_workers: std::sync::atomic::AtomicUsize,
+    revision: u64,
     num_devices: usize,
     /// Flat: num_devices * m.model_size bytes (one model snapshot per device).
     model_data_flat: Vec<u8>,
@@ -1736,6 +1744,8 @@ pub extern "C" fn osdi_setup_batch_ffi(
         OsdiBatchHandle {
             model_id,
             num_devices,
+            observed_workers: std::sync::atomic::AtomicUsize::new(0),
+            revision: 0,
             model_data_flat,
             inst_data_flat,
             parallel_policy: RwLock::new(None),
@@ -1751,7 +1761,9 @@ pub extern "C" fn osdi_setup_batch_ffi(
 /// an unknown id (silent no-op). Python's OsdiBatchHandle.__del__ invokes this.
 #[no_mangle]
 pub extern "C" fn osdi_free_handle_ffi(handle_id: u64) {
-    HANDLES.write().unwrap().remove(&handle_id);
+    let mut handles = HANDLES.write().unwrap();
+    handles.remove(&handle_id);
+    staged_runtime::invalidate_stages(handle_id);
 }
 
 /// Returns the num_devices stored in the handle, or 0 if unknown. Used by

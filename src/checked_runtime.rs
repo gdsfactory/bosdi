@@ -36,7 +36,7 @@ struct Call {
     user: usize,
 }
 thread_local! { static CALL: RefCell<Option<Call>> = const { RefCell::new(None) }; }
-fn scoped(
+pub(super) fn scoped(
     context: Option<BosdiEvalContext>,
     lane: usize,
     callback: LogCallback,
@@ -89,7 +89,7 @@ pub(super) fn phase(phase: i32) {
         }
     });
 }
-fn fail(message: &[u8]) {
+pub(super) fn fail(message: &[u8]) {
     CALL.with(|c| {
         if let Some(c) = c.borrow_mut().as_mut() {
             if c.error.status == 0 {
@@ -101,7 +101,7 @@ fn fail(message: &[u8]) {
         }
     });
 }
-fn failed() -> bool {
+pub(super) fn failed() -> bool {
     CALL.with(|c| c.borrow().as_ref().is_some_and(|c| c.error.status != 0))
 }
 pub(super) unsafe fn log(msg: *const c_char, level: u32) {
@@ -229,6 +229,9 @@ pub unsafe extern "C" fn bosdi_setup_batch_checked(
     {
         return finish(invalid(), error);
     }
+    if let Some(message) = &m.delay_error {
+        return finish(diagnostic(-7, message.as_bytes()), error);
+    }
     let params = if num_params == 0 {
         &[]
     } else {
@@ -269,10 +272,22 @@ pub unsafe extern "C" fn bosdi_setup_batch_checked(
     if let Some(e) = errors.into_iter().find(|e| e.status != 0) {
         return finish(e, error);
     }
-    let plans = instances
+    let plans: Vec<_> = instances
         .chunks(m.instance_size)
         .map(|i| handle_runtime::LanePlan::new(m, i))
         .collect();
+    for (lane, plan) in plans.iter().enumerate() {
+        if !delay_runtime::nodes_preserved(m, plan) {
+            return finish(
+                BosdiCallError {
+                    status: -7,
+                    lane,
+                    ..Default::default()
+                },
+                error,
+            );
+        }
+    }
     drop(registry);
     let mut handles = HANDLES.write().unwrap();
     if !OSDI_REGISTRY.read().unwrap().contains_key(&model_id) {
@@ -292,6 +307,8 @@ pub unsafe extern "C" fn bosdi_setup_batch_checked(
         OsdiBatchHandle {
             model_id,
             num_devices: count,
+            observed_workers: std::sync::atomic::AtomicUsize::new(0),
+            revision: 0,
             model_data_flat: models,
             inst_data_flat: instances,
             parallel_policy: RwLock::new(None),
@@ -315,6 +332,36 @@ pub(super) unsafe fn evaluate(
     callback: LogCallback,
     user: usize,
 ) -> BosdiCallError {
+    evaluate_delays(
+        h,
+        m,
+        buffers,
+        context,
+        residual,
+        check_finite,
+        callback,
+        user,
+        0,
+    )
+}
+
+pub(super) unsafe fn evaluate_delays(
+    h: &OsdiBatchHandle,
+    m: &LoadedOsdi,
+    buffers: BosdiBufferBinding,
+    context: BosdiEvalContext,
+    residual: bool,
+    check_finite: bool,
+    callback: LogCallback,
+    user: usize,
+    delays: usize,
+) -> BosdiCallError {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // One cache line per participating worker avoids observer false sharing.
+    #[repr(align(64))]
+    struct Seen(AtomicBool);
+    thread_local! { static WORKERS: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) }; }
+    h.observed_workers.store(0, Ordering::Relaxed);
     if context.analysis > 2
         || context.options & !3 != 0
         || !context.abstime.is_finite()
@@ -323,87 +370,128 @@ pub(super) unsafe fn evaluate(
     {
         return invalid();
     }
+    if let Some(message) = &m.delay_error {
+        return diagnostic(-7, message.as_bytes());
+    }
     let b: Buffers = buffers.buffers();
     let config = handle_runtime::configuration_for_handle(h, &configuration());
-    let work = |lane: usize| {
-        scoped(Some(context), lane, callback, user, || {
+    WORKERS.with(|workers| {
+        let mut workers = workers.borrow_mut();
+        workers.resize_with(config.pool.current_num_threads(), || {
+            Seen(AtomicBool::new(false))
+        });
+        for w in workers.iter() {
+            w.0.store(false, Ordering::Relaxed);
+        }
+        let workers = workers.as_slice();
+        let parallel = config.parallel(h.num_devices);
+        let work = |range: std::ops::Range<usize>| {
+            workers[if parallel {
+                rayon::current_thread_index().unwrap()
+            } else {
+                0
+            }]
+            .0
+            .store(true, Ordering::Relaxed);
             SCRATCH.with(|cell| {
                 let mut scratch = cell.borrow_mut();
-                scratch.model_data.clear();
-                scratch.model_data.extend_from_slice(
-                    &h.model_data_flat[lane * m.model_size..(lane + 1) * m.model_size],
-                );
-                scratch.inst_data.clear();
-                scratch.inst_data.extend_from_slice(
-                    &h.inst_data_flat[lane * m.instance_size..(lane + 1) * m.instance_size],
-                );
-                let EvalScratch {
-                    model_data,
-                    inst_data,
-                    small,
-                } = &mut *scratch;
-                let cur = handle_runtime::lane_mut(b.currents, lane, m.num_slots);
-                let chg = handle_runtime::lane_mut(b.charges, lane, m.num_slots);
-                let g = if residual {
-                    0
-                } else {
-                    m.num_resist_jac as usize
-                };
-                let c = if residual {
-                    0
-                } else {
-                    m.num_react_jac as usize
-                };
-                let cond = handle_runtime::lane_mut(b.conductances, lane, g);
-                let cap = handle_runtime::lane_mut(b.capacitances, lane, c);
-                cur.fill(0.0);
-                chg.fill(0.0);
-                cond.fill(0.0);
-                cap.fill(0.0);
-                eval_device_from_setup(
-                    m,
-                    model_data,
-                    inst_data,
-                    handle_runtime::lane_input(b.voltages, lane, m.num_all_nodes),
-                    cur,
-                    cond,
-                    chg,
-                    cap,
-                    residual,
-                    true,
-                    small,
-                    Some(&h.plans[lane]),
-                    false,
-                );
-                if check_finite
-                    && !cur
-                        .iter()
-                        .chain(chg.iter())
-                        .chain(cond.iter())
-                        .chain(cap.iter())
-                        .all(|x| x.is_finite())
-                {
-                    phase(-4);
-                    fail(b"non-finite OSDI output");
+                let mut result = BosdiCallError::default();
+                for lane in range {
+                    let error = scoped(Some(context), lane, callback, user, || {
+                        scratch.model_data.clear();
+                        scratch.model_data.extend_from_slice(
+                            &h.model_data_flat[lane * m.model_size..(lane + 1) * m.model_size],
+                        );
+                        scratch.inst_data.clear();
+                        scratch.inst_data.extend_from_slice(
+                            &h.inst_data_flat[lane * m.instance_size..(lane + 1) * m.instance_size],
+                        );
+                        let EvalScratch {
+                            model_data,
+                            inst_data,
+                            small,
+                        } = &mut *scratch;
+                        let cur = handle_runtime::lane_mut(b.currents, lane, m.num_slots);
+                        let chg = handle_runtime::lane_mut(b.charges, lane, m.num_slots);
+                        let g = if residual {
+                            0
+                        } else {
+                            m.num_resist_jac as usize
+                        };
+                        let c = if residual {
+                            0
+                        } else {
+                            m.num_react_jac as usize
+                        };
+                        let cond = handle_runtime::lane_mut(b.conductances, lane, g);
+                        let cap = handle_runtime::lane_mut(b.capacitances, lane, c);
+                        cur.fill(0.0);
+                        chg.fill(0.0);
+                        cond.fill(0.0);
+                        cap.fill(0.0);
+                        eval_device_from_setup(
+                            m,
+                            model_data,
+                            inst_data,
+                            handle_runtime::lane_input(b.voltages, lane, m.num_all_nodes),
+                            cur,
+                            cond,
+                            chg,
+                            cap,
+                            residual,
+                            true,
+                            small,
+                            Some(&h.plans[lane]),
+                            false,
+                        );
+                        if delays != 0 {
+                            for (index, delay) in m.delays.iter().enumerate() {
+                                *(delays as *mut f64).add(lane * m.delays.len() + index) =
+                                    delay.duration(inst_data);
+                            }
+                        }
+                        if check_finite
+                            && !cur
+                                .iter()
+                                .chain(chg.iter())
+                                .chain(cond.iter())
+                                .chain(cap.iter())
+                                .all(|x| x.is_finite())
+                        {
+                            phase(-4);
+                            fail(b"non-finite OSDI output");
+                        }
+                    });
+                    // Successful lanes need not copy a full error record.
+                    if error.status != 0 {
+                        result = lowest(result, error);
+                    }
                 }
-            });
-        })
-    };
-    let errors: Vec<_> = if config.parallel(h.num_devices) {
-        config.pool.install(|| {
-            (0..h.num_devices)
-                .into_par_iter()
-                .with_min_len(config.min_chunk)
-                .map(work)
-                .collect()
-        })
-    } else {
-        (0..h.num_devices).map(work).collect()
-    };
-    errors
-        .into_iter()
-        .find(|e| e.status != 0)
-        .unwrap_or_default()
+                result
+            })
+        };
+        let chunk = config.min_chunk;
+        let result = if parallel {
+            config.pool.install(|| {
+                (0..h.num_devices.div_ceil(chunk))
+                    .into_par_iter()
+                    .map(|task| work(task * chunk..((task + 1) * chunk).min(h.num_devices)))
+                    .reduce(BosdiCallError::default, lowest)
+            })
+        } else {
+            work(0..h.num_devices)
+        };
+        if result.status == 0 {
+            h.observed_workers.store(
+                workers
+                    .iter()
+                    .filter(|w| w.0.load(Ordering::Relaxed))
+                    .count(),
+                Ordering::Relaxed,
+            );
+        }
+        result
+    })
 }
 #[no_mangle]
 pub unsafe extern "C" fn bosdi_eval_handle_checked(
@@ -417,6 +505,10 @@ pub unsafe extern "C" fn bosdi_eval_handle_checked(
     user: *mut c_void,
 ) -> i32 {
     if buffers.is_null() || context.is_null() {
+        if let Some(h) = HANDLES.read().unwrap().get(&handle) {
+            h.observed_workers
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         return finish(invalid(), error);
     }
     let handles = HANDLES.read().unwrap();
@@ -446,4 +538,23 @@ pub unsafe extern "C" fn bosdi_eval_handle_checked(
         ),
         error,
     )
+}
+
+pub(super) fn lowest(a: BosdiCallError, b: BosdiCallError) -> BosdiCallError {
+    if a.status == 0 || (b.status != 0 && b.lane < a.lane) {
+        b
+    } else {
+        a
+    }
+}
+
+pub(super) fn diagnostic(status: i32, message: &[u8]) -> BosdiCallError {
+    let mut error = BosdiCallError {
+        status,
+        ..Default::default()
+    };
+    for (dst, &src) in error.message.iter_mut().take(255).zip(message) {
+        *dst = src as c_char;
+    }
+    error
 }

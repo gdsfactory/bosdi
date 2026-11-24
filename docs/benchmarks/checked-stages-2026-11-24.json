@@ -1,0 +1,403 @@
+{
+  "setup": [
+    {
+      "lanes": 32,
+      "workers": 1,
+      "fresh_ns_lane": 481.6068203285644,
+      "fresh_trials": [
+        493.5943912493729, 481.6068203285644, 475.21006457602624
+      ],
+      "stage_discard_ns_lane": 358.28475383336473,
+      "stage_discard_trials": [
+        358.28475383336473, 360.0405493734001, 356.33418969945404
+      ]
+    },
+    {
+      "lanes": 32,
+      "workers": 2,
+      "fresh_ns_lane": 506.15183707432226,
+      "fresh_trials": [
+        506.15183707432226, 498.37676923075406, 509.06756032950204
+      ],
+      "stage_discard_ns_lane": 362.07470911727205,
+      "stage_discard_trials": [
+        362.8024690604931, 362.07470911727205, 360.60525331000963
+      ]
+    },
+    {
+      "lanes": 32,
+      "workers": 4,
+      "fresh_ns_lane": 502.82021805105325,
+      "fresh_trials": [
+        501.60167923572607, 502.82021805105325, 516.0559159639347
+      ],
+      "stage_discard_ns_lane": 359.1534742728566,
+      "stage_discard_trials": [
+        360.9990617866014, 359.1534742728566, 358.95013521578295
+      ]
+    },
+    {
+      "lanes": 128,
+      "workers": 1,
+      "fresh_ns_lane": 420.4836182511939,
+      "fresh_trials": [
+        427.59388256167836, 415.42124385003035, 420.4836182511939
+      ],
+      "stage_discard_ns_lane": 340.6697258108071,
+      "stage_discard_trials": [
+        338.69823491320705, 344.33431570295454, 340.6697258108071
+      ]
+    },
+    {
+      "lanes": 128,
+      "workers": 2,
+      "fresh_ns_lane": 365.92730898295576,
+      "fresh_trials": [
+        365.92730898295576, 365.4184581857707, 366.2957394716321
+      ],
+      "stage_discard_ns_lane": 268.6724527856885,
+      "stage_discard_trials": [
+        261.3486828695964, 277.845858808479, 268.6724527856885
+      ]
+    },
+    {
+      "lanes": 128,
+      "workers": 4,
+      "fresh_ns_lane": 291.086796154635,
+      "fresh_trials": [291.086796154635, 282.59075791671853, 292.1488407779502],
+      "stage_discard_ns_lane": 173.08614341606392,
+      "stage_discard_trials": [
+        174.0592959966264, 173.08614341606392, 166.95243210471324
+      ]
+    },
+    {
+      "lanes": 512,
+      "workers": 1,
+      "fresh_ns_lane": 399.07632313139516,
+      "fresh_trials": [
+        405.61571685924326, 394.9904589947005, 399.07632313139516
+      ],
+      "stage_discard_ns_lane": 388.68581899331843,
+      "stage_discard_trials": [
+        388.68581899331843, 390.606786452567, 387.6949094882591
+      ]
+    },
+    {
+      "lanes": 512,
+      "workers": 2,
+      "fresh_ns_lane": 304.34472063464557,
+      "fresh_trials": [
+        305.1642850525167, 304.34472063464557, 300.39178313794827
+      ],
+      "stage_discard_ns_lane": 249.11603290162415,
+      "stage_discard_trials": [
+        242.42687656170565, 266.2297236121205, 249.11603290162415
+      ]
+    },
+    {
+      "lanes": 512,
+      "workers": 4,
+      "fresh_ns_lane": 233.71143052527128,
+      "fresh_trials": [
+        233.71143052527128, 247.41656937904634, 232.28457778992004
+      ],
+      "stage_discard_ns_lane": 146.5447929726596,
+      "stage_discard_trials": [
+        146.20497289754073, 147.87085273466434, 146.5447929726596
+      ]
+    },
+    {
+      "lanes": 2048,
+      "workers": 1,
+      "fresh_ns_lane": 619.3884054989178,
+      "fresh_trials": [628.6891774811337, 619.3884054989178, 595.477015339406],
+      "stage_discard_ns_lane": 379.12542791306714,
+      "stage_discard_trials": [
+        379.63160886379615, 372.85635204268027, 379.12542791306714
+      ]
+    },
+    {
+      "lanes": 2048,
+      "workers": 2,
+      "fresh_ns_lane": 269.60932666872475,
+      "fresh_trials": [
+        270.82998897675384, 269.60932666872475, 268.2510778897983
+      ],
+      "stage_discard_ns_lane": 223.89533839308254,
+      "stage_discard_trials": [
+        223.89533839308254, 219.5624233536364, 226.03729609605907
+      ]
+    },
+    {
+      "lanes": 2048,
+      "workers": 4,
+      "fresh_ns_lane": 207.0851927151202,
+      "fresh_trials": [
+        207.84281709796792, 207.0851927151202, 206.59135406418608
+      ],
+      "stage_discard_ns_lane": 140.1429251818314,
+      "stage_discard_trials": [
+        140.1429251818314, 141.7233611523377, 137.8129100039971
+      ]
+    }
+  ],
+  "evaluation": [
+    {
+      "lanes": 32,
+      "workers": 1,
+      "residual_only": true,
+      "explicit_ns_call": 2456.1457365623437,
+      "explicit_trials": [
+        2454.295489074224, 2456.1457365623437, 2528.831516768821
+      ],
+      "bound_ns_call": 2423.427529975808,
+      "bound_trials": [
+        2423.427529975808, 2429.3074514309974, 2421.4757157638487
+      ],
+      "bound_minus_explicit_ns_call": -32.71820658653587
+    },
+    {
+      "lanes": 32,
+      "workers": 1,
+      "residual_only": false,
+      "explicit_ns_call": 2646.7573886742143,
+      "explicit_trials": [
+        2636.3112908591957, 2646.7573886742143, 2665.1442563656638
+      ],
+      "bound_ns_call": 2631.3358523059155,
+      "bound_trials": [
+        2653.2765774337936, 2623.4008368172963, 2631.3358523059155
+      ],
+      "bound_minus_explicit_ns_call": -15.421536368298803
+    },
+    {
+      "lanes": 32,
+      "workers": 2,
+      "residual_only": true,
+      "explicit_ns_call": 2490.568631537147,
+      "explicit_trials": [
+        2486.4817859729746, 2490.925994720217, 2490.568631537147
+      ],
+      "bound_ns_call": 2449.1285820990292,
+      "bound_trials": [
+        2449.1285820990292, 2482.924315727156, 2429.300387394479
+      ],
+      "bound_minus_explicit_ns_call": -41.44004943811797
+    },
+    {
+      "lanes": 32,
+      "workers": 2,
+      "residual_only": false,
+      "explicit_ns_call": 2645.788992700911,
+      "explicit_trials": [
+        2658.3839522857484, 2644.354220120959, 2645.788992700911
+      ],
+      "bound_ns_call": 2615.08086124829,
+      "bound_trials": [2618.790183616168, 2610.49338405428, 2615.08086124829],
+      "bound_minus_explicit_ns_call": -30.70813145262082
+    },
+    {
+      "lanes": 32,
+      "workers": 4,
+      "residual_only": true,
+      "explicit_ns_call": 2473.968124293067,
+      "explicit_trials": [
+        2473.968124293067, 2470.7999747292497, 2475.838095645909
+      ],
+      "bound_ns_call": 2435.5440644134933,
+      "bound_trials": [
+        2442.554732580192, 2434.2782219867345, 2435.5440644134933
+      ],
+      "bound_minus_explicit_ns_call": -38.42405987957363
+    },
+    {
+      "lanes": 32,
+      "workers": 4,
+      "residual_only": false,
+      "explicit_ns_call": 2652.7201060195816,
+      "explicit_trials": [
+        2701.514958456721, 2652.7201060195816, 2648.253120092685
+      ],
+      "bound_ns_call": 2636.339236663556,
+      "bound_trials": [
+        2665.804547971075, 2620.6945036221005, 2636.339236663556
+      ],
+      "bound_minus_explicit_ns_call": -16.380869356025414
+    },
+    {
+      "lanes": 128,
+      "workers": 1,
+      "residual_only": true,
+      "explicit_ns_call": 9658.453659190294,
+      "explicit_trials": [
+        9679.411920772578, 9658.453659190294, 9642.390102201785
+      ],
+      "bound_ns_call": 9485.983019606825,
+      "bound_trials": [9489.963215529779, 9438.441791747398, 9485.983019606825],
+      "bound_minus_explicit_ns_call": -172.47063958346916
+    },
+    {
+      "lanes": 128,
+      "workers": 1,
+      "residual_only": false,
+      "explicit_ns_call": 10451.99750175622,
+      "explicit_trials": [
+        10430.152603172852, 10451.99750175622, 11087.31308204869
+      ],
+      "bound_ns_call": 10282.123266548222,
+      "bound_trials": [
+        10267.895817452547, 10329.299479166104, 10282.123266548222
+      ],
+      "bound_minus_explicit_ns_call": -169.87423520799712
+    },
+    {
+      "lanes": 128,
+      "workers": 2,
+      "residual_only": true,
+      "explicit_ns_call": 7417.972518683032,
+      "explicit_trials": [
+        7450.573336057089, 7417.972518683032, 7383.651545216494
+      ],
+      "bound_ns_call": 7441.008748072717,
+      "bound_trials": [7596.061667286311, 7441.008748072717, 7431.235035053558],
+      "bound_minus_explicit_ns_call": 23.036229389685104
+    },
+    {
+      "lanes": 128,
+      "workers": 2,
+      "residual_only": false,
+      "explicit_ns_call": 7722.3963140008545,
+      "explicit_trials": [
+        7948.649128795498, 7722.3963140008545, 7687.810451176217
+      ],
+      "bound_ns_call": 7909.23668848952,
+      "bound_trials": [7909.23668848952, 8012.25352101028, 7697.027534819566],
+      "bound_minus_explicit_ns_call": 186.84037448866547
+    },
+    {
+      "lanes": 128,
+      "workers": 4,
+      "residual_only": true,
+      "explicit_ns_call": 5547.027129330029,
+      "explicit_trials": [
+        5804.8985551267515, 5524.881487292657, 5547.027129330029
+      ],
+      "bound_ns_call": 5613.336646565179,
+      "bound_trials": [5616.840897336103, 5613.336646565179, 5612.186424163633],
+      "bound_minus_explicit_ns_call": 66.30951723514954
+    },
+    {
+      "lanes": 128,
+      "workers": 4,
+      "residual_only": false,
+      "explicit_ns_call": 5893.932354143437,
+      "explicit_trials": [
+        5807.498782184082, 5893.932354143437, 5907.765178776839
+      ],
+      "bound_ns_call": 5807.662658619484,
+      "bound_trials": [5901.706884341205, 5805.31722634514, 5807.662658619484],
+      "bound_minus_explicit_ns_call": -86.26969552395258
+    },
+    {
+      "lanes": 512,
+      "workers": 1,
+      "residual_only": true,
+      "explicit_ns_call": 39598.098463522125,
+      "explicit_trials": [
+        39832.16924377932, 39437.33038165821, 39598.098463522125
+      ],
+      "bound_ns_call": 38654.503072253785,
+      "bound_trials": [
+        38896.83150471403, 38654.503072253785, 38311.53407830883
+      ],
+      "bound_minus_explicit_ns_call": -943.5953912683399
+    },
+    {
+      "lanes": 512,
+      "workers": 1,
+      "residual_only": false,
+      "explicit_ns_call": 42302.6820741749,
+      "explicit_trials": [
+        42302.6820741749, 42448.62459017895, 42134.38500300981
+      ],
+      "bound_ns_call": 41149.99882876873,
+      "bound_trials": [
+        41085.358802229166, 41603.80042158067, 41149.99882876873
+      ],
+      "bound_minus_explicit_ns_call": -1152.6832454061732
+    },
+    {
+      "lanes": 512,
+      "workers": 2,
+      "residual_only": true,
+      "explicit_ns_call": 22700.402445884214,
+      "explicit_trials": [
+        22561.817559310133, 22700.402445884214, 22930.037732955745
+      ],
+      "bound_ns_call": 22596.06824049519,
+      "bound_trials": [
+        22596.06824049519, 22565.31534819967, 23108.932020312004
+      ],
+      "bound_minus_explicit_ns_call": -104.33420538902283
+    },
+    {
+      "lanes": 512,
+      "workers": 2,
+      "residual_only": false,
+      "explicit_ns_call": 24256.146889889525,
+      "explicit_trials": [
+        24256.146889889525, 24099.934768552583, 24276.126891241543
+      ],
+      "bound_ns_call": 24300.88260942804,
+      "bound_trials": [
+        24300.88260942804, 24252.638104371727, 24627.789502917993
+      ],
+      "bound_minus_explicit_ns_call": 44.735719538515696
+    },
+    {
+      "lanes": 512,
+      "workers": 4,
+      "residual_only": true,
+      "explicit_ns_call": 13694.081477493652,
+      "explicit_trials": [
+        13630.798643429738, 13694.081477493652, 13750.136163315341
+      ],
+      "bound_ns_call": 14091.444375570602,
+      "bound_trials": [
+        13920.442644222123, 14091.444375570602, 14114.783663617472
+      ],
+      "bound_minus_explicit_ns_call": 397.36289807694993
+    },
+    {
+      "lanes": 512,
+      "workers": 4,
+      "residual_only": false,
+      "explicit_ns_call": 14784.797642599135,
+      "explicit_trials": [
+        14784.797642599135, 14937.116413502328, 14719.028087497196
+      ],
+      "bound_ns_call": 15005.09821795928,
+      "bound_trials": [
+        15005.09821795928, 15068.994939271639, 14789.515133837567
+      ],
+      "bound_minus_explicit_ns_call": 220.30057536014465
+    }
+  ],
+  "environment": {
+    "platform": "Linux-7.1.5-76070105-generic-x86_64-with-glibc2.39",
+    "cpu": "AMD Ryzen AI 9 HX 370",
+    "affinity": "0-3",
+    "abi": 1,
+    "capabilities": 31,
+    "registry_candidate": "CG2",
+    "source_sha256": {
+      "src/staged_runtime.rs": "4940128c244bc016d80677c13857367005a3b32a44a11a409f3f5b0e29fc0fbd",
+      "src/delay_runtime.rs": "9fc3b33f97fd74df7a295b05850999ed93e25e9ca624dba1c3249a60aa8ce49a",
+      "src/lib.rs": "32090b08d13896ad3295a340a5d999cd35d25afcbb0945520520851bc37c266e",
+      "include/bosdi_runtime.h": "dcd63a76a273a20c1068c25b338546045ed237cd40c36a8bc843fc6a8906f80a",
+      "scripts/benchmark_checked_groups.c": "3b2aad17ec195d8bb170e5db44d6313cfd9c6457b138132294735f42e4f7fc3b",
+      "scripts/benchmark_staged_groups.py": "5680fc76644432f6ea583786e4a26aaf0283b35ffa6ba5c10e6755dc42c0ed4d"
+    },
+    "optical_sha256": "b1b221342f46df0e6a85648cf5aff1e4ae5930f2af0f5026dbd0e6c804b37cce"
+  }
+}

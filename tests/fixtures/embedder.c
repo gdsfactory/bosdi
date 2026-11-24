@@ -3,7 +3,12 @@
 #include <stddef.h>
 
 typedef struct { double c; } Model;
-typedef struct { uint32_t map[3]; double r, current, charge; uint8_t collapsed; } Instance;
+#ifdef DELAY_FIXTURE
+#define NODE_COUNT 4
+#else
+#define NODE_COUNT 3
+#endif
+typedef struct { uint32_t map[NODE_COUNT]; double r, current, charge, td; uint8_t collapsed; } Instance;
 
 void (*osdi_log)(void *, const char *, uint32_t);
 #ifdef ZERO_MODEL
@@ -41,6 +46,7 @@ static void setup_instance(void *h, void *i, void *m, double t, uint32_t n,
     if (inst->r == -6) { res->num_errors = 1; return; }
     if (inst->r == 0) inst->r = 1000;
     inst->collapsed = inst->r == 42;
+    inst->td=2*inst->r;
 }
 static uint32_t eval(void *h, void *i, void *m, OsdiSimInfo *info) {
     (void)h;
@@ -49,6 +55,11 @@ static uint32_t eval(void *h, void *i, void *m, OsdiSimInfo *info) {
     if (inst->r == -4) { osdi_log(h, "eval error", LOG_LVL_FATAL | LOG_FMT_ERR); return 0; }
     if (inst->r == -7) return EVAL_RET_FLAG_LIM;
     if (inst->r == -8) return EVAL_RET_FLAG_STOP;
+#ifdef MUTATING_FIXTURE
+    CAP(m) += 1e-9;
+    inst->r += 1;
+#endif
+    inst->td = info->abstime == 7 ? 0.0/0.0 : inst->r + info->abstime;
     double v = info->prev_solve[inst->map[0]] - info->prev_solve[inst->map[1]];
     inst->current = info->flags & CALC_RESIST_RESIDUAL ? (v / inst->r + info->abstime) : 0;
     if (inst->r == -5) inst->current = 0.0 / 0.0;
@@ -97,8 +108,20 @@ static OsdiJacobianEntry entries[] = {
     {{1,1}, 0, ENTRY_FLAGS},
 };
 static OsdiNodePair collapsible[] = {{0, 2}};
+#ifdef DELAY_FIXTURE
+#ifndef DELAY_Y
+#define DELAY_Y 2
+#endif
+#ifndef DELAY_Z
+#define DELAY_Z 3
+#endif
+#ifndef DELAY_TD
+#define DELAY_TD offsetof(Instance,td)
+#endif
+static OsdiAbsDelay delays[]={{DELAY_Y,DELAY_Z,DELAY_TD,UINT32_MAX}};
+#endif
 OsdiDescriptor OSDI_DESCRIPTORS[] = {{
-    .name="header_rc", .num_nodes=3, .num_terminals=2,
+    .name="header_rc", .num_nodes=NODE_COUNT, .num_terminals=2,
     .num_collapsible=1, .collapsible=collapsible, .collapsed_offset=offsetof(Instance, collapsed),
     .num_jacobian_entries=4, .jacobian_entries=entries,
     .num_params=2, .num_instance_params=1, .param_opvar=params,
@@ -119,5 +142,10 @@ OsdiDescriptor OSDI_DESCRIPTORS[] = {{
 #endif
     .num_reactive_jacobian_entries=4,
     .write_jacobian_array_resist=jacobian, .write_jacobian_array_react=reactive_jacobian,
-    .module_flags=0, .absdelay_count=0, .absdelays=NULL,
+    .module_flags=0,
+#ifdef DELAY_FIXTURE
+    .absdelay_count=1,.absdelays=delays,
+#else
+    .absdelay_count=0, .absdelays=NULL,
+#endif
 }};

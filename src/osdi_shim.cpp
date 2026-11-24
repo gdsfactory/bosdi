@@ -443,6 +443,18 @@ NB_MODULE(osdi_shim_nb, m) {
     // the GIL; Python owns and retains every registered array.
     m.def("runtime_addresses", []() {
         return std::map<std::string, uintptr_t>{
+            {"bosdi_setup_batch_delays_checked", reinterpret_cast<uintptr_t>(&bosdi_setup_batch_delays_checked)},
+            {"bosdi_stage_lanes_checked", reinterpret_cast<uintptr_t>(&bosdi_stage_lanes_checked)},
+            {"bosdi_stage_prepared_delays", reinterpret_cast<uintptr_t>(&bosdi_stage_prepared_delays)},
+            {"bosdi_commit_stage", reinterpret_cast<uintptr_t>(&bosdi_commit_stage)},
+            {"bosdi_discard_stage", reinterpret_cast<uintptr_t>(&bosdi_discard_stage)},
+            {"bosdi_update_lanes_defaults_checked", reinterpret_cast<uintptr_t>(&bosdi_update_lanes_defaults_checked)},
+            {"bosdi_runtime_capabilities", reinterpret_cast<uintptr_t>(&bosdi_runtime_capabilities)},
+            {"bosdi_model_delays", reinterpret_cast<uintptr_t>(&bosdi_model_delays)},
+            {"bosdi_handle_prepared_delays", reinterpret_cast<uintptr_t>(&bosdi_handle_prepared_delays)},
+            {"bosdi_eval_handle_delays_checked", reinterpret_cast<uintptr_t>(&bosdi_eval_handle_delays_checked)},
+            {"bosdi_handle_observed_workers", reinterpret_cast<uintptr_t>(&bosdi_handle_observed_workers)},
+            {"bosdi_update_lanes_checked", reinterpret_cast<uintptr_t>(&bosdi_update_lanes_checked)},
             {"bosdi_runtime_abi_version", reinterpret_cast<uintptr_t>(&bosdi_runtime_abi_version)},
             {"bosdi_free_model", reinterpret_cast<uintptr_t>(&bosdi_free_model)},
             {"bosdi_handle_node_maps", reinterpret_cast<uintptr_t>(&bosdi_handle_node_maps)},
