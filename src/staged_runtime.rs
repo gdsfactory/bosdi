@@ -61,7 +61,9 @@ unsafe fn prepare(
         || voltages.is_null()
         || (num_params > 0 && params.is_null())
         || (*context).analysis > 2
-        || (*context).options & !3 != 0
+        || (*context).options & !(3 | checked_runtime::AC_WITHOUT_STATIC) != 0
+        || ((*context).options & checked_runtime::AC_WITHOUT_STATIC != 0
+            && (*context).analysis != 1)
         || !(*context).abstime.is_finite()
         || (*context).abstime < 0.0
     {

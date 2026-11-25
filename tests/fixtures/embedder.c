@@ -62,6 +62,9 @@ static uint32_t eval(void *h, void *i, void *m, OsdiSimInfo *info) {
     inst->td = info->abstime == 7 ? 0.0/0.0 : inst->r + info->abstime;
     double v = info->prev_solve[inst->map[0]] - info->prev_solve[inst->map[1]];
     inst->current = info->flags & CALC_RESIST_RESIDUAL ? (v / inst->r + info->abstime) : 0;
+#ifdef CONTEXT_FLAGS_FIXTURE
+    if ((info->flags & ANALYSIS_AC) && (info->flags & ANALYSIS_STATIC)) inst->current += 42;
+#endif
     if (inst->r == -5) inst->current = 0.0 / 0.0;
     inst->charge = info->flags & CALC_REACT_RESIDUAL ? v * CAP(m) : 0;
     return 0;

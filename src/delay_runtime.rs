@@ -6,7 +6,7 @@ use handle_runtime::BosdiBufferBinding;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct Delay {
-    y_node: u32,
+    pub(super) y_node: u32,
     z_node: u32,
     pub(super) td_offset: u32,
     maxdelay_offset: u32,
@@ -71,10 +71,10 @@ pub struct BosdiDelayMetadata {
     z_node: u32,
     has_maxdelay: u32,
 }
-/// Enabled registry-v1 feature bits (CG2). Bit 32 is reserved, not advertised.
+/// Enabled registry-v1 feature bits (CG3). Bit 32 is reserved, not advertised.
 #[no_mangle]
 pub extern "C" fn bosdi_runtime_capabilities() -> u64 {
-    1 | 2 | 4 | 8 | 16
+    1 | 2 | 4 | 8 | 16 | 64
 }
 
 /// Query count with NULL/0, then copy exactly count metadata records.

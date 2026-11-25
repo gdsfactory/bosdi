@@ -94,9 +94,23 @@ int32_t bosdi_eval_bound_bypass(uint64_t binding, uint64_t generation,
 uint32_t bosdi_runtime_abi_version(void);
 #define BOSDI_REACTIVE_AT_DC 1u
 #define BOSDI_RESIST_ALWAYS 2u
+/* Capability 64 + bosdi_runtime_context_options() gate these opt-in bits.
+ * Legacy options 0..3 retain AC|STATIC. AC_WITHOUT_STATIC is valid only for AC.
+ * DELAY_INPUT_SCOPE is valid only for full delay-observing eval/setup with
+ * nonempty delay metadata and duration output. With check_finite, only input
+ * y-row F/Q and raw Jacobians are checked; unrelated physical rows may be
+ * nonfinite until the host gathers hidden coordinates. Status/diagnostics still
+ * fail the whole call. Raw durations still require host validation. The host
+ * must perform a subsequent ordinary full-output checked/validated evaluation
+ * before publishing physical outputs. Staging rejects DELAY_INPUT_SCOPE: it
+ * always validates complete F/Q/G/C at caller-supplied gathered coordinates.
+ */
+#define BOSDI_AC_WITHOUT_STATIC 4u
+#define BOSDI_DELAY_INPUT_SCOPE 8u
+uint32_t bosdi_runtime_context_options(void);
 typedef struct BosdiEvalContext {
     uint32_t analysis; /* 0 DC/static, 1 AC/static, 2 transient */
-    uint32_t options;  /* only the two bits above are accepted */
+    uint32_t options;  /* opt-in bits require their capability and query symbol */
     double abstime;   /* finite, non-negative seconds */
 } BosdiEvalContext;
 /* Status: 0 success, -1 unknown/stale, -2 invalid argument, -4 nonfinite,
@@ -149,6 +163,7 @@ bool bosdi_free_model(uint32_t model);
  * 16    BOSDI_CAP_NAN_DEFAULT_SETUP           stage_lanes_checked NaN defaults,     CG2
  *                                           update_lanes_defaults_checked
  * 32    BOSDI_RESERVED_CHECKED_BOUND_RETAINED       NONE: reserved, NOT advertised         CG2
+ * 64    BOSDI_CAP_EXPLICIT_CONTEXT           runtime_context_options              CG3
  * All function names above have the bosdi_ prefix. CG1 is the first local
  * checked-groups candidate (mask 7); CG2 is its Circulox review follow-up (31).
  * No assigned/reserved registry bit may be reused for another feature.
@@ -165,6 +180,7 @@ bool bosdi_free_model(uint32_t model);
 #define BOSDI_CAP_STAGED_SETUP 8ull
 #define BOSDI_CAP_NAN_DEFAULT_SETUP 16ull
 #define BOSDI_RESERVED_CHECKED_BOUND_RETAINED 32ull
+#define BOSDI_CAP_EXPLICIT_CONTEXT 64ull
 uint64_t bosdi_runtime_capabilities(void);
 typedef struct BosdiDelayMetadata {
     uint32_t y_node, z_node; /* raw hidden nodes; never terminals or collapsed */

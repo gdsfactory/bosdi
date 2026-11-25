@@ -369,3 +369,19 @@ load libm explicitly, matching the math-symbol environment supplied by Python/na
 [CG2 measurements](benchmarks/checked-stages-2026-11-24.md) report stage/discard versus fresh validated setup and
 explicit versus bound checked evaluation. No bound delay-observation variant or parallel-policy change was added in this
 follow-up.
+
+### Explicit context follow-up (CG3)
+
+Capability 64 (`BOSDI_CAP_EXPLICIT_CONTEXT`) and the additive `bosdi_runtime_context_options()` query advertise optional
+context bits. The mask is 15; existing bits 1/2 and all legacy calls retain their behavior. Bit 4
+(`BOSDI_AC_WITHOUT_STATIC`) requests AC alone, matching scalar OSDI hosts; it is invalid outside AC. Default AC remains
+AC|STATIC. No purity or model-name inference selects this flag.
+
+Bit 8 (`BOSDI_DELAY_INPUT_SCOPE`) requests checked input-only finite validation for full delay-observing
+evaluation/setup. Diagnostics and evaluation status remain checked. Only independent hidden input rows F/Q and their raw
+Jacobians must be finite; physical rows may be nonfinite until the host gathers y/z. Raw durations are still reported
+for host validation. This permits zero-X preparation of reciprocal-delay laws without replacing their physics or
+inventing another preparation point. The host must validate the subsequent complete physical pass before publication.
+No-delay, residual-only or no-duration-output use rejects. Staged updates reject this option and keep complete
+finite-output validation; hosts supply gathered hidden coordinates to stage. ABI version remains 1, feature mask becomes
+95, and bit 32 remains reserved and unadvertised.

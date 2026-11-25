@@ -3,6 +3,35 @@
 use super::*;
 use handle_runtime::{BosdiBufferBinding, Buffers};
 
+pub(super) const AC_WITHOUT_STATIC: u32 = 4;
+pub(super) const DELAY_INPUT_SCOPE: u32 = 8;
+/// Optional explicit context flags; capability 64 and this symbol gate them.
+#[no_mangle]
+pub extern "C" fn bosdi_runtime_context_options() -> u32 {
+    3 | AC_WITHOUT_STATIC | DELAY_INPUT_SCOPE
+}
+
+fn finite_delay_inputs(
+    m: &LoadedOsdi,
+    plan: &handle_runtime::LanePlan,
+    f: &[f64],
+    q: &[f64],
+    g: &[f64],
+    c: &[f64],
+) -> bool {
+    let input_row = |row: usize| m.delays.iter().any(|d| d.y_node as usize == row);
+    m.delays
+        .iter()
+        .all(|d| f[d.y_node as usize].is_finite() && q[d.y_node as usize].is_finite())
+        && [(g, &plan.resist_targets), (c, &plan.react_targets)]
+            .into_iter()
+            .all(|(values, targets)| {
+                values.iter().zip(targets).all(|(v, t)| {
+                    t.is_none_or(|t| !input_row(t / m.num_all_nodes) || v.is_finite())
+                })
+            })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BosdiEvalContext {
@@ -363,7 +392,10 @@ pub(super) unsafe fn evaluate_delays(
     thread_local! { static WORKERS: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) }; }
     h.observed_workers.store(0, Ordering::Relaxed);
     if context.analysis > 2
-        || context.options & !3 != 0
+        || context.options & !bosdi_runtime_context_options() != 0
+        || (context.options & AC_WITHOUT_STATIC != 0 && context.analysis != 1)
+        || (context.options & DELAY_INPUT_SCOPE != 0
+            && (m.delays.is_empty() || residual || delays == 0))
         || !context.abstime.is_finite()
         || context.abstime < 0.0
         || !buffers.valid(h, m)
@@ -450,16 +482,20 @@ pub(super) unsafe fn evaluate_delays(
                                     delay.duration(inst_data);
                             }
                         }
-                        if check_finite
-                            && !cur
-                                .iter()
-                                .chain(chg.iter())
-                                .chain(cond.iter())
-                                .chain(cap.iter())
-                                .all(|x| x.is_finite())
-                        {
-                            phase(-4);
-                            fail(b"non-finite OSDI output");
+                        if check_finite {
+                            let finite = if context.options & DELAY_INPUT_SCOPE != 0 {
+                                finite_delay_inputs(m, &h.plans[lane], cur, chg, cond, cap)
+                            } else {
+                                cur.iter()
+                                    .chain(chg.iter())
+                                    .chain(cond.iter())
+                                    .chain(cap.iter())
+                                    .all(|x| x.is_finite())
+                            };
+                            if !finite {
+                                phase(-4);
+                                fail(b"non-finite OSDI output");
+                            }
                         }
                     });
                     // Successful lanes need not copy a full error record.

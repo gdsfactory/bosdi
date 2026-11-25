@@ -1150,7 +1150,7 @@ fn evaluation_flags(m: &LoadedOsdi, residual_only: bool) -> u32 {
     let (analysis, options, _) = checked_runtime::context(m.analysis);
     let mut flags = match analysis {
         0 => 2048 | 32768, // ANALYSIS_DC | ANALYSIS_STATIC
-        1 => 4096 | 32768, // ANALYSIS_AC | ANALYSIS_STATIC
+        1 => 4096 | if options & checked_runtime::AC_WITHOUT_STATIC == 0 { 32768 } else { 0 }, // opt-in exact AC flags
         _ => 8192,         // ANALYSIS_TRAN
     };
     if m.num_resist_jac > 0 || options & 2 != 0 {
