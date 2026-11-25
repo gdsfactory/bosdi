@@ -362,12 +362,13 @@ def test_registry_equals_documented_enabled_bits():
         "BOSDI_CAP_TRANSACTIONAL_SETUP": 4,
         "BOSDI_CAP_STAGED_SETUP": 8,
         "BOSDI_CAP_NAN_DEFAULT_SETUP": 16,
+        "BOSDI_CAP_EXPLICIT_CONTEXT": 64,
     }
     native = Native()
     mask = 0
     for value in assigned.values():
         mask |= value
-    assert native.function("bosdi_runtime_capabilities", ct.c_uint64)() == mask == 31
+    assert native.function("bosdi_runtime_capabilities", ct.c_uint64)() == mask == 95
     for symbol in [
         "bosdi_stage_lanes_checked",
         "bosdi_stage_prepared_delays",

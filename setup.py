@@ -77,6 +77,7 @@ class BuildExt(build_ext):
                     "userenv.lib",
                     "bcrypt.lib",
                     "ntdll.lib",
+                    "synchronization.lib",
                 ]
             else:
                 ext.extra_link_args = list(ext.extra_link_args or []) + [

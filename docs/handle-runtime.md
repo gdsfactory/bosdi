@@ -217,9 +217,10 @@ independent audit.
 
 ## Checked compatible groups: delay observation and lane replacement
 
-The additive capability query `bosdi_runtime_capabilities()` now returns **31**. `bosdi_runtime_abi_version()` remains
-**1**. The capability registry preserves all CG1 assignments (first checked-groups candidate, mask 7); CG2 is the
-Circulox integration-review follow-up, mask 31, both dated 2026-11-24.
+The CG2 capability query `bosdi_runtime_capabilities()` returned **31**; the explicit-context extension below raises the
+current mask to **95**. `bosdi_runtime_abi_version()` remains **1**. The capability registry preserves all CG1
+assignments (first checked-groups candidate, mask 7); CG2 is the Circulox integration-review follow-up, mask 31, both
+dated 2026-11-24.
 
 | Value | Symbol                                  | Governed entry points / contract                                                                                             | Introduced |
 | ----: | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------- |
