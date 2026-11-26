@@ -480,6 +480,7 @@ NB_MODULE(osdi_shim_nb, m) {
             {"batched_osdi_eval_handle_sparse_ffi", reinterpret_cast<uintptr_t>(&batched_osdi_eval_handle_sparse_ffi)},
             {"batched_osdi_residual_eval_handle_ffi", reinterpret_cast<uintptr_t>(&batched_osdi_residual_eval_handle_ffi)},
             {"osdi_handle_jac_count_ffi", reinterpret_cast<uintptr_t>(&osdi_handle_jac_count_ffi)},
+            {"osdi_handle_jac_pairs_ffi", reinterpret_cast<uintptr_t>(&osdi_handle_jac_pairs_ffi)},
             {"bosdi_qualify_handle", reinterpret_cast<uintptr_t>(&bosdi_qualify_handle)}
         };
     });

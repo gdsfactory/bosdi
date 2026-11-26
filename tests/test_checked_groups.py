@@ -23,6 +23,15 @@ class Delay(ct.Structure):
     _fields_ = [("y", ct.c_uint32), ("z", ct.c_uint32), ("maxdelay", ct.c_uint32)]
 
 
+def test_jacobian_pairs_available_without_exported_symbols():
+    native = Native()
+    assert native.addresses["osdi_handle_jac_pairs_ffi"]
+    pairs = native.function(
+        "osdi_handle_jac_pairs_ffi", ct.c_int, U64, ct.c_bool, PTR, SIZE
+    )
+    assert pairs(0, False, None, 0) == -1
+
+
 class Group:
     def __init__(self, path, params=None, count=32, version=5, analysis=0):
         self.n = Native()
