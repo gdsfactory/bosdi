@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: Apache-2.0
+// Scalar-port waveguide fixture. See README.md.
+`include "disciplines.vams"
+`include "photonic_disciplines.vams"
+
+module cl_waveguide(p0_re, p0_im, p1_re, p1_im);
+    inout p0_re, p0_im, p1_re, p1_im;
+    cl_optical p0_re, p0_im, p1_re, p1_im;
+    cl_optical_amplitude inc0, inc1, inc2, inc3;
+    (* type="instance" *) parameter real r0=1;
+    (* type="instance" *) parameter real length_um=100;
+    (* type="instance" *) parameter real neff=2.3100000000000001;
+    (* type="instance" *) parameter real n_group=4.3399999999999999;
+    (* type="instance" *) parameter real loss_dB_cm=2;
+    (* type="instance" *) parameter real wavelength_nm=1550;
+    real b0,b1,b2,b3;
+    real out_now0,out_now1,out_now2,out_now3;
+    real phi,g,tr,ti,ne,alpha;
+    analog begin
+        ne=neff;
+        alpha=23.0258509299404568*loss_dB_cm;
+        phi=-6.283185307179586*(length_um*1e-6)*ne/(wavelength_nm*1e-9);
+        g=exp(-alpha*(length_um*1e-6)/2); tr=g*cos(phi); ti=g*sin(phi);
+        out_now0=(tr*OpticalAmplitude(inc2)-ti*OpticalAmplitude(inc3));
+        out_now1=(ti*OpticalAmplitude(inc2)+tr*OpticalAmplitude(inc3));
+        out_now2=(tr*OpticalAmplitude(inc0)-ti*OpticalAmplitude(inc1));
+        out_now3=(ti*OpticalAmplitude(inc0)+tr*OpticalAmplitude(inc1));
+        b0=absdelay(out_now0, (length_um*1e-6)*n_group/299792458.0);
+        b1=absdelay(out_now1, (length_um*1e-6)*n_group/299792458.0);
+        b2=absdelay(out_now2, (length_um*1e-6)*n_group/299792458.0);
+        b3=absdelay(out_now3, (length_um*1e-6)*n_group/299792458.0);
+        OpticalFlow(p0_re) <+ (OpticalAmplitude(inc0)-b0)/sqrt(r0);
+        OpticalResidual(inc0) <+ OpticalAmplitude(inc0)+b0-OpticalPotential(p0_re)/sqrt(r0);
+        OpticalFlow(p0_im) <+ (OpticalAmplitude(inc1)-b1)/sqrt(r0);
+        OpticalResidual(inc1) <+ OpticalAmplitude(inc1)+b1-OpticalPotential(p0_im)/sqrt(r0);
+        OpticalFlow(p1_re) <+ (OpticalAmplitude(inc2)-b2)/sqrt(r0);
+        OpticalResidual(inc2) <+ OpticalAmplitude(inc2)+b2-OpticalPotential(p1_re)/sqrt(r0);
+        OpticalFlow(p1_im) <+ (OpticalAmplitude(inc3)-b3)/sqrt(r0);
+        OpticalResidual(inc3) <+ OpticalAmplitude(inc3)+b3-OpticalPotential(p1_im)/sqrt(r0);
+    end
+endmodule

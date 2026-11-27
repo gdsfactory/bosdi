@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: Apache-2.0
+// Optical coordinates retain the common-real-r0 power-wave normalization.
+`ifndef BOSDI_TEST_PHOTONIC_DISCIPLINES
+`define BOSDI_TEST_PHOTONIC_DISCIPLINES
+nature cl_optical_potential;
+    units = "sqrt(W*Ohm)";
+    access = OpticalPotential;
+    abstol = 1e-12;
+endnature
+nature cl_optical_flow;
+    units = "sqrt(W/Ohm)";
+    access = OpticalFlow;
+    abstol = 1e-13;
+endnature
+discipline cl_optical;
+    potential cl_optical_potential;
+    flow cl_optical_flow;
+enddiscipline
+nature cl_wave_amplitude;
+    units = "sqrt(W)";
+    access = OpticalAmplitude;
+    abstol = 1e-12;
+endnature
+// Equivalent unit spellings keep this OpenVAF version from resolving a
+// potential accessor as flow when both nature unit strings are identical.
+nature cl_wave_residual;
+    units = "W^0.5";
+    access = OpticalResidual;
+    abstol = 1e-12;
+endnature
+discipline cl_optical_amplitude;
+    potential cl_wave_amplitude;
+    flow cl_wave_residual;
+enddiscipline
+// Detector state is a current-valued physical unknown, not a voltage.
+nature cl_current_value;
+    units = "A";
+    access = StateCurrent;
+    abstol = 1e-13;
+endnature
+nature cl_current_residual;
+    units = "ampere";
+    access = CurrentResidual;
+    abstol = 1e-13;
+endnature
+discipline cl_current_state;
+    potential cl_current_value;
+    flow cl_current_residual;
+enddiscipline
+`endif

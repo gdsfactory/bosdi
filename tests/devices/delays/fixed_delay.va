@@ -1,0 +1,7 @@
+`include "disciplines.vams"
+module fixed_delay(p, out);
+    inout p, out;
+    electrical p, out;
+    (* type="instance" *) parameter real tau=1;
+    analog I(out) <+ absdelay(V(p)*V(p), tau)+0.5*V(out);
+endmodule

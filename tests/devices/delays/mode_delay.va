@@ -1,0 +1,8 @@
+`include "disciplines.vams"
+module mode_delay(p, out);
+    inout p, out;
+    electrical p, out;
+    (* type="instance" *) parameter real tau=1;
+    analog I(out) <+ absdelay(V(p)+(analysis("tran") ? 1 : 0), tau)
+                     +2*absdelay(V(p), 2*tau);
+endmodule

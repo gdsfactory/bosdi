@@ -177,3 +177,12 @@ evaluation. The registration LRU includes the settings in its key, so different 
 handles. Analysis variants preserve them, and normal device parameter updates retain them. Re-register to change
 simulator settings. This configures model queries only, not the host solver's tolerances, leakage or numerical
 algorithms.
+
+### Checked OSDI 0.5 delay observation
+
+Native embedders can query raw delay `(y, z)` metadata and prepared/evaluated duration arrays through the additive
+checked runtime capabilities. Duration arrays use `[lane][delay_index]` order. Compilers which write td only in eval
+require the explicit checked preparation call at initial X/context. y/z stay in the full raw unknown vector; the
+compiled fixtures provide a y equation and a zero z residual row. Host history treatment remains necessary. See the
+[checked compatible-group contract](handle-runtime.md#checked-compatible-groups-delay-observation-and-lane-replacement)
+for ownership, validation, atomic parameter changes and binding invalidation.

@@ -94,9 +94,23 @@ int32_t bosdi_eval_bound_bypass(uint64_t binding, uint64_t generation,
 uint32_t bosdi_runtime_abi_version(void);
 #define BOSDI_REACTIVE_AT_DC 1u
 #define BOSDI_RESIST_ALWAYS 2u
+/* Capability 64 + bosdi_runtime_context_options() gate these opt-in bits.
+ * Legacy options 0..3 retain AC|STATIC. AC_WITHOUT_STATIC is valid only for AC.
+ * DELAY_INPUT_SCOPE is valid only for full delay-observing eval/setup with
+ * nonempty delay metadata and duration output. With check_finite, only input
+ * y-row F/Q and raw Jacobians are checked; unrelated physical rows may be
+ * nonfinite until the host gathers hidden coordinates. Status/diagnostics still
+ * fail the whole call. Raw durations still require host validation. The host
+ * must perform a subsequent ordinary full-output checked/validated evaluation
+ * before publishing physical outputs. Staging rejects DELAY_INPUT_SCOPE: it
+ * always validates complete F/Q/G/C at caller-supplied gathered coordinates.
+ */
+#define BOSDI_AC_WITHOUT_STATIC 4u
+#define BOSDI_DELAY_INPUT_SCOPE 8u
+uint32_t bosdi_runtime_context_options(void);
 typedef struct BosdiEvalContext {
     uint32_t analysis; /* 0 DC/static, 1 AC/static, 2 transient */
-    uint32_t options;  /* only the two bits above are accepted */
+    uint32_t options;  /* opt-in bits require their capability and query symbol */
     double abstime;   /* finite, non-negative seconds */
 } BosdiEvalContext;
 /* Status: 0 success, -1 unknown/stale, -2 invalid argument, -4 nonfinite,
@@ -136,6 +150,135 @@ int32_t bosdi_handle_node_maps(uint64_t handle, size_t count, size_t num_nodes, 
  * after quiescing the host. Free handles and unbind buffers before unloading.
  */
 bool bosdi_free_model(uint32_t model);
+/* Capability registry v1 (ABI v1), introduced 2026-11-24.
+ * Value Symbol                              Entry points governed                 Introduced
+ * 1     BOSDI_CAP_DELAY_OBSERVATION           model_delays, handle_prepared_delays, CG1
+ *                                           setup_batch_delays_checked,
+ *                                           eval_handle_delays_checked
+ * 2     BOSDI_CAP_OBSERVED_WORKERS            handle_observed_workers               CG1
+ * 4     BOSDI_CAP_TRANSACTIONAL_SETUP         update_lanes_checked                  CG1
+ * 8     BOSDI_CAP_STAGED_SETUP                stage_lanes_checked,                  CG2
+ *                                           stage_prepared_delays,
+ *                                           commit_stage, discard_stage
+ * 16    BOSDI_CAP_NAN_DEFAULT_SETUP           stage_lanes_checked NaN defaults,     CG2
+ *                                           update_lanes_defaults_checked
+ * 32    BOSDI_RESERVED_CHECKED_BOUND_RETAINED       NONE: reserved, NOT advertised         CG2
+ * 64    BOSDI_CAP_EXPLICIT_CONTEXT           runtime_context_options              CG3
+ * All function names above have the bosdi_ prefix. CG1 is the first local
+ * checked-groups candidate (mask 7); CG2 is its integration review follow-up (31).
+ * No assigned/reserved registry bit may be reused for another feature.
+ * Unknown bits confer no guarantees. Gate features on BOTH bit and symbol
+ * presence. Legacy local candidate 98626261 used bit 1 for the unregistered
+ * BOSDI_CHECKED_BOUND_RETAINED contract: that contract/name is retired. It must
+ * NEVER be inferred from this registry's bit 1. If retained storage is ever
+ * shipped, its feature is permanently reassigned bit 32 with new symbols;
+ * this runtime does not implement or advertise it. Checked calls restore snapshots.
+ */
+#define BOSDI_CAP_DELAY_OBSERVATION 1ull
+#define BOSDI_CAP_OBSERVED_WORKERS 2ull
+#define BOSDI_CAP_TRANSACTIONAL_SETUP 4ull
+#define BOSDI_CAP_STAGED_SETUP 8ull
+#define BOSDI_CAP_NAN_DEFAULT_SETUP 16ull
+#define BOSDI_RESERVED_CHECKED_BOUND_RETAINED 32ull
+#define BOSDI_CAP_EXPLICIT_CONTEXT 64ull
+uint64_t bosdi_runtime_capabilities(void);
+typedef struct BosdiDelayMetadata {
+    uint32_t y_node, z_node; /* raw hidden nodes; never terminals or collapsed */
+    uint32_t has_maxdelay;  /* 0 or 1; duration observation supports either */
+} BosdiDelayMetadata;
+/* NULL/0 queries count, otherwise len must equal count. Returns 0/-1/-2;
+ * -7 reports unsupported delay metadata (bad nodes/offsets). No truncation.
+ * All outputs are caller-owned. 0.4 models have zero delays. */
+int32_t bosdi_model_delays(uint32_t model, BosdiDelayMetadata *out,
+    size_t len, size_t *count);
+/* Opt-in setup runs full checked eval on restored scratch at the supplied
+ * X/context, and copies only evaluated td slots into prepared instance storage.
+ * Needed for OpenVAF builds which initialize td only in eval. Other model and
+ * instance bytes retain setup values. No handle is returned on failure. Raw td
+ * may be nonfinite: the host must validate it. Existing v1 setup is unchanged.
+ */
+int32_t bosdi_setup_batch_delays_checked(uint32_t model, size_t count,
+    size_t num_params, const double *params, const double *voltages,
+    size_t voltages_len, const BosdiEvalContext *context, uint64_t *handle,
+    BosdiCallError *error, BosdiLogCallback callback, void *user);
+/* Device-major raw durations, len = lane count * delay count. No finite/sign
+ * validation: host owns delay acceptance/history. Zero length permits NULL. */
+int32_t bosdi_handle_prepared_delays(uint64_t handle, double *out, size_t len);
+/* Same checked contract as v1; optional NULL/0 disables delay observation.
+ * Otherwise len must be lane count * delay count. delays must be aligned and
+ * disjoint from all buffers. Read from evaluated scratch, including nonfinite
+ * values. On any failure discard all outputs. Context applies to every lane. */
+int32_t bosdi_eval_handle_delays_checked(uint64_t handle,
+    const BosdiBufferBinding *buffers, const BosdiEvalContext *context,
+    bool residual_only, bool check_finite, double *delays, size_t len,
+    BosdiCallError *error, BosdiLogCallback callback, void *user);
+/* Distinct threads executing lanes in the most recent checked call. Reset at
+ * evaluation pass start; zero on failed pass/update/unknown handle. Serialize checked calls
+ * on a handle if querying this value; independent handles may run concurrently. */
+size_t bosdi_handle_observed_workers(uint64_t handle);
+/* Atomically replace selected lanes using fresh model+instance setup. Rows of
+ * params and validation voltages follow the supplied lane list, not lane order.
+ * Lanes must be unique. All params/voltages must be finite (no NaN defaults).
+ * Context is required; full outputs at supplied voltages and prepared/evaluated
+ * durations must be finite. Node maps AND collapse flags must remain identical.
+ * Both setup callbacks run. No library reload. No accepted state changes on
+ * failure. -7 structural/unsupported layout; -8 busy (retry after quiescence).
+ * Lowest failing raw lane wins. All pointer ownership ends when call returns.
+ * Takes a nonblocking global handle write lock: no publication during eval.
+ * Success invalidates every existing binding: old generations fail until rebind,
+ * which refreshes lane workspaces and returns a new generation. Unbound handle
+ * calls immediately use the new snapshots. Prepared durations can be queried.
+ */
+int32_t bosdi_update_lanes_checked(uint64_t handle, size_t count,
+    const size_t *lanes, size_t num_params, const double *params,
+    const double *voltages, size_t voltages_len, const BosdiEvalContext *context,
+    BosdiCallError *error, BosdiLogCallback callback, void *user);
+/* Staged candidates (cap 8, NaN parameter-default semantics additionally cap 16).
+ * Stage runs the same fresh setup, full finite F/Q/G/C and td validation, node-map
+ * and collapse checks as immediate update. Rows follow the unique lane list.
+ * NaN means provider default exactly as v1 setup; all other parameters and all X
+ * values must be finite. Explicit -0.0 is a value, never a default.
+ * Inputs/context/callback storage are borrowed only until stage returns. On
+ * failure *stage=0; error uses the lowest raw lane. Success returns one owned
+ * token, which the caller must commit or discard, including after staleness.
+ * Stage takes a nonblocking global handle READ lock during preparation; -8 if
+ * unavailable. It may run concurrently with evaluation of the SAME handle.
+ * It changes no accepted bytes, bindings, generations, workspaces or worker stats.
+ * Several stages per handle may coexist. No lock is held between calls.
+ * Durations have supplied-lane-list order, with len=count*num_delays. -2 for
+ * wrong length/alignment, -1 unknown/consumed, -9 stale. NULL allowed for len=0.
+ * Query takes handle read + stage-table locks for its duration.
+ * Commit takes a nonblocking global handle WRITE lock then the stage-table lock;
+ * no publication overlaps evaluation or stage creation on any handle. -8 busy
+ * leaves token intact and retryable; -9 stale leaves an uncommittable tombstone;
+ * -1 unknown/consumed. No setup, eval, validation or allocation occurs at commit.
+ * Success atomically publishes this handle, consumes token, clears qualified
+ * workspace/stats and invalidates bindings exactly as immediate update does.
+ * Any successful update/commit, or handle free, makes other stages stale and
+ * immediately releases their payloads; their tombstones live until discard.
+ * Discard is thread-safe and idempotent (including 0/unknown/freed/stale tokens).
+ * It takes only the stage-table lock and releases all token storage. Calls on
+ * different tokens may be concurrent; discard racing commit is ordered by that
+ * lock. A stale token can NEVER publish. Library loading is never repeated.
+ * Cross-handle publication is NOT a BOSDI atomic operation: the host must quiesce
+ * evaluations, retain exclusive ownership of handles, and serialize all writes
+ * across its stage/commit sequence. Busy commits are retryable; cancellation
+ * should be honored before the first commit in that sequence.
+ */
+int32_t bosdi_stage_lanes_checked(uint64_t handle, size_t count,
+    const size_t *lanes, size_t num_params, const double *params,
+    const double *voltages, size_t voltages_len, const BosdiEvalContext *context,
+    uint64_t *stage, BosdiCallError *error, BosdiLogCallback callback, void *user);
+int32_t bosdi_stage_prepared_delays(uint64_t stage, double *out, size_t len);
+int32_t bosdi_commit_stage(uint64_t stage);
+void bosdi_discard_stage(uint64_t stage);
+/* Immediate defaults-aware counterpart (cap 16). Same validation/publication
+ * as stage+commit with one exclusive write-lock interval. Existing
+ * bosdi_update_lanes_checked retains its finite-parameters-only contract. */
+int32_t bosdi_update_lanes_defaults_checked(uint64_t handle, size_t count,
+    const size_t *lanes, size_t num_params, const double *params,
+    const double *voltages, size_t voltages_len, const BosdiEvalContext *context,
+    BosdiCallError *error, BosdiLogCallback callback, void *user);
 #ifdef __cplusplus
 }
 #endif

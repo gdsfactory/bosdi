@@ -9,16 +9,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Explicit checked runtime context options, advertised by capability bit 64, with a current capability mask of 95.
+  Legacy context behavior is preserved; callers opt into AC-without-STATIC and delay-input-scope evaluation.
+
+- Owned checked lane-stage tokens with prepared-duration queries, atomic commit, idempotent discard, revision-based
+  staleness, immediate payload release after invalidation, and staging concurrent with accepted evaluation.
+
+- NaN provider defaults in staged setup and the new `bosdi_update_lanes_defaults_checked`; the original immediate update
+  keeps its finite-only contract. Added capability bits 8 and 16; ABI remains 1.
+
+- An explicit capability registry with bit/symbol gating. An early local prototype used bit 1 for the unregistered
+  `BOSDI_CHECKED_BOUND_RETAINED` contract, colliding with this branch's delay-observation bit. The old retained name is
+  retired; any future retained-storage feature is permanently reassigned reserved bit 32 with new symbols. Bit 32 is not
+  advertised, and all checked calls continue to restore snapshots. Hosts must audit old literal-bit checks.
+
+- Additive checked runtime capabilities (initial mask 7, now extended to 95; ABI v1 retained): OSDI 0.5 raw delay-node
+  metadata, literal prepared durations, optional evaluated per-lane durations, and explicit checked preparation for
+  compilers which initialize duration slots only during eval. Full/residual DC/AC/transient calls preserve raw hidden
+  nodes and leave delay acceptance, history and condensation to the host.
+
+- Actual worker participation for checked calls, allocation-free warmed serial evaluation, and a default parallel
+  dispatch threshold of 128 lanes with chunks of 32 lanes; per-handle overrides remain available.
+
+- Atomic checked changed-lane setup with fresh storage, full numerical validation, topology rejection, duration refresh,
+  rollback on failure, and binding-generation invalidation until rebind. No library reload or publication during eval.
+
 - Experimental OSDI 0.5 ABI support via `version="0.5"` in `load_osdi_model` and `osdi_component`, preserving the
   selected ABI across analysis and simulator-setting variants. Binary ABI exports are checked before descriptor access.
+
 - Native Kelvin temperature and case-sensitive numeric `$simparam` settings at setup and evaluation, with immutable DC,
   AC and transient analysis modes.
+
 - A process-local registration LRU keyed by binary identity, ABI and simulation settings. Native IDs remain registered
   for the process lifetime after cache eviction.
+
 - Explicit `limiting_only` policy for audited models using state slots solely for `$limit`; native evaluation disables
   limiting. General hidden-state history and native harmonic balance remain unsupported.
+
 - A separate Circulax integration environment and IHP device comparisons.
+
 - Git-derived release versions, artifact version validation and support for updating an existing GitHub release.
+
 - Installed-wheel smoke checks and Linux/Windows integration gates before publishing release artifacts.
 
 ### Removed

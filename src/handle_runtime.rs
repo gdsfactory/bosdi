@@ -28,8 +28,8 @@ fn defaults() -> (usize, usize, usize) {
                 "RAYON_NUM_THREADS",
                 std::thread::available_parallelism().map_or(1, usize::from),
             ),
-            env_usize("BOSDI_RAYON_THRESHOLD", 1024),
-            env_usize("BOSDI_RAYON_MIN_CHUNK", 256),
+            env_usize("BOSDI_RAYON_THRESHOLD", 128),
+            env_usize("BOSDI_RAYON_MIN_CHUNK", 32),
         )
     })
 }
@@ -378,6 +378,7 @@ pub(super) struct Lane {
     instance: Memory,
 }
 struct Binding {
+    revision: u64,
     handle_id: u64,
     generation: u64,
     buffers: Buffers,
@@ -446,9 +447,9 @@ impl BosdiBufferBinding {
             && disjoint_regions(&self.regions(), 8)
     }
 }
-fn disjoint_regions(regions: &[(usize, usize)], element_size: usize) -> bool {
-    let mut ranges = Vec::with_capacity(regions.len());
-    for &(addr, len) in regions {
+pub(super) fn disjoint_regions(regions: &[(usize, usize)], element_size: usize) -> bool {
+    // Quadratic in at most eight regions; no heap allocation on checked calls.
+    for (i, &(addr, len)) in regions.iter().enumerate() {
         if len == 0 {
             continue;
         }
@@ -464,13 +465,20 @@ fn disjoint_regions(regions: &[(usize, usize)], element_size: usize) -> bool {
         if addr == 0 || addr % element_size != 0 {
             return false;
         }
-        if ranges
-            .iter()
-            .any(|&(start, stop)| addr < stop && start < end)
-        {
-            return false;
+        for &(start, width) in &regions[..i] {
+            if width == 0 {
+                continue;
+            }
+            let Some(stop) = width
+                .checked_mul(element_size)
+                .and_then(|n| start.checked_add(n))
+            else {
+                return false;
+            };
+            if addr < stop && start < end {
+                return false;
+            }
         }
-        ranges.push((addr, end));
     }
     true
 }
@@ -540,6 +548,7 @@ pub unsafe extern "C" fn bosdi_bind_buffers(
         id,
         Arc::new(Mutex::new(Binding {
             handle_id,
+            revision: h.revision,
             generation: next_generation(),
             buffers: desc.buffers(),
             lanes,
@@ -575,6 +584,17 @@ pub unsafe extern "C" fn bosdi_rebind_buffers(id: u64, desc: *const BosdiBufferB
     if !(*desc).valid(h, m) {
         return 0;
     }
+    if b.revision != h.revision {
+        b.lanes = (0..h.num_devices)
+            .map(|i| Lane {
+                model: Memory::new(&h.model_data_flat[i * m.model_size..(i + 1) * m.model_size]),
+                instance: Memory::new(
+                    &h.inst_data_flat[i * m.instance_size..(i + 1) * m.instance_size],
+                ),
+            })
+            .collect();
+        b.revision = h.revision;
+    }
     b.buffers = (*desc).buffers();
     b.generation = next_generation();
     b.generation
@@ -602,6 +622,9 @@ pub extern "C" fn bosdi_qualify_binding(id: u64, pure_recomputing_eval: bool) ->
     let Some(h) = handles.get(&b.handle_id) else {
         return false;
     };
+    if b.revision != h.revision {
+        return false;
+    }
     let registry = OSDI_REGISTRY.read().unwrap();
     let Some(m) = registry.get(&h.model_id) else {
         return false;
@@ -704,6 +727,9 @@ unsafe fn eval_bound_impl(
     let Some(h) = handles.get(&b.handle_id) else {
         return -1;
     };
+    if b.revision != h.revision {
+        return -1;
+    }
     let registry = OSDI_REGISTRY.read().unwrap();
     let Some(m) = registry.get(&h.model_id) else {
         return -1;
@@ -1002,6 +1028,7 @@ mod tests {
     }
     #[test]
     fn owned_pool_and_comparison_contract() {
+        let _guard = RUNTIME_TEST_LOCK.lock().unwrap();
         assert!(bosdi_set_num_threads(2));
         let config = configuration();
         assert_eq!(config.pool.install(rayon::current_num_threads), 2);
@@ -1053,6 +1080,9 @@ pub unsafe extern "C" fn bosdi_eval_bound_checked(
     let Some(h) = handles.get(&b.handle_id) else {
         return finish(bad(-1), error);
     };
+    if b.revision != h.revision {
+        return finish(bad(-1), error);
+    }
     let registry = OSDI_REGISTRY.read().unwrap();
     let Some(m) = registry.get(&h.model_id) else {
         return finish(bad(-1), error);

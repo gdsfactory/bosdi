@@ -92,7 +92,7 @@ def num_threads():
     return _num_threads()
 
 
-def set_parallel_policy(min_lanes=1024, min_chunk=256, *, handle=None):
+def set_parallel_policy(min_lanes=128, min_chunk=32, *, handle=None):
     """Set dispatch granularity globally or for one handle (both zero resets it)."""
     allow_zero = handle is not None
     args = (
