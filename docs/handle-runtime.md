@@ -304,11 +304,9 @@ and output initialization remain exact for unqualified providers. A test provide
 to guard that contract. The warmed serial full checked call has a Rust allocation-counting regression test. Initial
 worker/model/pool warm-up may allocate.
 
-The [2026-11-24 measurements](benchmarks/checked-groups-2026-11-24.md) include before/after ns/lane and process
-CPU-to-wall ratios for 32/128/512/2048 lanes and 1/2/4 workers, controlled ablations, setup comparisons and exact
-commands. The new default is 128 lanes / 32 lanes per chunk; explicit environment, global and per-handle overrides
-remain available. These are provider-level Linux CPU qualifications. Other hosts, general delayed providers, host
-history/condensation, and end-to-end host admission remain unqualified.
+The default parallel policy uses a threshold of 128 lanes and chunks of 32 lanes; explicit environment, global and
+per-handle overrides remain available. Host history, delay condensation and end-to-end admission remain caller
+responsibilities. Performance should be evaluated through a reproducible open consumer workflow, such as Circulax.
 
 ## Owned staged lane candidates (CG2)
 
@@ -366,10 +364,8 @@ per-model defaults vector cannot reproduce that lifecycle. No defaults-query sho
 Compiled tests cover canonical waveguide, all delay fixtures, resistor and PSP103, including full default rows, bitwise
 F/Q/G/C, raw snapshot bytes, maps and durations, signed zero, rollback, simultaneous stages, stale tokens, binding
 invalidation, in-flight staging, busy commit/retry, freed handles and repeated discard. The Linux Rust fixture tests
-load libm explicitly, matching the math-symbol environment supplied by Python/native hosts. The
-[CG2 measurements](benchmarks/checked-stages-2026-11-24.md) report stage/discard versus fresh validated setup and
-explicit versus bound checked evaluation. No bound delay-observation variant or parallel-policy change was added in this
-follow-up.
+load libm explicitly, matching the math-symbol environment supplied by Python/native hosts. No bound delay-observation
+variant or parallel-policy change was added in this follow-up.
 
 ### Explicit context follow-up (CG3)
 

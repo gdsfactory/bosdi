@@ -9,4 +9,11 @@ analysis mode. `duration_voltage.va` and `duration_mode.va` add the correspondin
 analysis-dependent duration cases. These differences are intentional and tested explicitly.
 
 Tests compile all fixtures with `BOSDI_OPENVAF_05`, falling back to `openvaf-r` on PATH. Use a compiler supporting OSDI
-0.5 and `absdelay`. The qualification compiler SHA-256 and commands are in the checked-groups benchmark report.
+0.5 and `absdelay`. Run the delay correctness tests from the repository root:
+
+```bash
+BOSDI_OPENVAF_05=/path/to/openvaf-r pixi run pytest tests/test_checked_groups.py tests/test_staged_groups.py
+```
+
+The existing legacy-model tests require an OSDI 0.4 compiler on PATH; select the OSDI 0.5 compiler separately with
+`BOSDI_OPENVAF_05`.

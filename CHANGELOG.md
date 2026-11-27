@@ -28,8 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   compilers which initialize duration slots only during eval. Full/residual DC/AC/transient calls preserve raw hidden
   nodes and leave delay acceptance, history and condensation to the host.
 
-- Actual worker participation for checked calls, allocation-free warmed serial evaluation, and measured 128/32 default
-  parallel dispatch for optical, resistor and PSP103 groups; per-handle overrides remain available.
+- Actual worker participation for checked calls, allocation-free warmed serial evaluation, and a default parallel
+  dispatch threshold of 128 lanes with chunks of 32 lanes; per-handle overrides remain available.
 
 - Atomic checked changed-lane setup with fresh storage, full numerical validation, topology rejection, duration refresh,
   rollback on failure, and binding-generation invalidation until rebind. No library reload or publication during eval.

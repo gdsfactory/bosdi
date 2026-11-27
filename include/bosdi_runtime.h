@@ -150,7 +150,7 @@ int32_t bosdi_handle_node_maps(uint64_t handle, size_t count, size_t num_nodes, 
  * after quiescing the host. Free handles and unbind buffers before unloading.
  */
 bool bosdi_free_model(uint32_t model);
-/* Capability registry v1 (ABI v1), introduced checked-groups-2026-11-24.
+/* Capability registry v1 (ABI v1), introduced 2026-11-24.
  * Value Symbol                              Entry points governed                 Introduced
  * 1     BOSDI_CAP_DELAY_OBSERVATION           model_delays, handle_prepared_delays, CG1
  *                                           setup_batch_delays_checked,
