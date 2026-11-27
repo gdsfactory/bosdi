@@ -1,6 +1,6 @@
 # CG2 staged setup and checked-call measurements, 2026-11-24
 
-This is the Circulox review follow-up to [the CG1 measurements](checked-groups-2026-11-24.md). All work remains
+This is the integration review follow-up to [the CG1 measurements](checked-groups-2026-11-24.md). All work remains
 uncommitted on `codex/checked-delay-groups`, based on `343b468`. ABI version remains **1**; the capability mask is now
 **31**. The [header](../../include/bosdi_runtime.h) and
 [runtime guide](../handle-runtime.md#owned-staged-lane-candidates-cg2) define ownership, locking, staleness, defaults
@@ -58,7 +58,7 @@ perform equivalent validation and is not the reference here.
 
 Stage/discard is cheaper in every measured median. The 512-lane serial comparison is close (about 3%); short laptop
 measurements do not establish a universal timing bound. The larger parallel groups show more substantial savings. This
-measures BOSDI pre-check preparation only, without Circulox's orchestration, history or condensation.
+measures BOSDI pre-check preparation only, without host orchestration, history or condensation.
 
 ## Explicit-buffer versus bound checked evaluation
 
@@ -91,8 +91,8 @@ comparison, as requested. No bound delay-observation variant was added.
 
 There is no consistent bound advantage across worker counts in these short trials. The largest median separation is
 about 1.15 us for a full 512-lane serial call; parallel differences vary in sign. These comparisons do not establish
-statistical significance or justify retained storage. Circulox should make its admission/API decision using its own
-measured explicit delay-observation path. No API for bound duration observation is introduced in this round.
+statistical significance or justify retained storage. Hosts should make admission/API decisions using their own measured
+explicit delay-observation path. No API for bound duration observation is introduced in this round.
 
 ## Tests and commands
 
@@ -109,7 +109,7 @@ The same compiler SHA-256 as CG1 is used: `613fd46951fdca2de255bd3fadcbf927cf5d1
 complete suite selects the packaged 0.4 compiler for existing tests and the explicit 0.5 compiler for delay fixtures:
 
 ```bash
-PATH=/tmp/bosdi-tools:$PATH CIRCULOX_OPENVAF=/home/cdaunt/.local/bin/openvaf-r BOSDI_OPENVAF_05=/home/cdaunt/.local/bin/openvaf-r BOSDI_BASELINE_LIBRARY=/tmp/bosdi-before.so pixi run test
+PATH=/tmp/bosdi-tools:$PATH BOSDI_OPENVAF_05=/home/cdaunt/.local/bin/openvaf-r BOSDI_BASELINE_LIBRARY=/tmp/bosdi-before.so pixi run test
 ln -sf /home/cdaunt/code/bosdi/tests/compiled_osdi/resistor.osdi build/checked-groups/resistor.osdi
 ln -sf /home/cdaunt/code/bosdi/tests/compiled_osdi/psp103v4_psp103.osdi build/checked-groups/psp103v4_psp103.osdi
 BOSDI_STAGE_FIXTURES=/home/cdaunt/code/bosdi/build/checked-groups pixi run cargo test
@@ -139,8 +139,8 @@ treated as NaN/default. Existing finite-only immediate behavior remains tested s
 
 ## Remaining qualification and host responsibilities
 
-Only trusted local Linux CPU artifacts are qualified. Other hosts, general providers, and end-to-end Circulox optical
-sweeps remain unqualified. History and y/z condensation remain entirely host-owned. Default resolution is the provider's
+Only trusted local Linux CPU artifacts are qualified. Other hosts, general providers, and end-to-end host optical sweeps
+remain unqualified. History and y/z condensation remain entirely host-owned. Default resolution is the provider's
 ordinary setup lifecycle, which may depend on other overridden parameters; there is no universal defaults-vector query.
 
 Commit is atomic per handle. A host-wide transaction must validate all candidates first, honor cancellation before

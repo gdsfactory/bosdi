@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Optical coordinates retain the common-real-r0 power-wave normalization.
-`ifndef CIRCULOX_PHOTONIC_DISCIPLINES
-`define CIRCULOX_PHOTONIC_DISCIPLINES
+`ifndef BOSDI_TEST_PHOTONIC_DISCIPLINES
+`define BOSDI_TEST_PHOTONIC_DISCIPLINES
 nature cl_optical_potential;
     units = "sqrt(W*Ohm)";
     access = OpticalPotential;

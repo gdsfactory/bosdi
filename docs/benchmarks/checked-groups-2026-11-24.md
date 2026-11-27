@@ -133,8 +133,8 @@ From `/home/cdaunt/code/bosdi`, the baseline extension was preserved **before** 
 ```bash
 cp src/osdi_shim_nb.cpython-313-x86_64-linux-gnu.so /tmp/bosdi-before.so
 mkdir -p build/checked-groups
-CIRCULOX_OPENVAF=/home/cdaunt/.local/bin/openvaf-r
-"$CIRCULOX_OPENVAF" tests/devices/delays/waveguide.va -o build/checked-groups/waveguide.osdi
+BOSDI_OPENVAF_05=/home/cdaunt/.local/bin/openvaf-r
+"$BOSDI_OPENVAF_05" tests/devices/delays/waveguide.va -o build/checked-groups/waveguide.osdi
 PYTHONPATH=src:tests taskset -c 0-3 pixi run python scripts/benchmark_checked_groups.py --library /tmp/bosdi-before.so --optical build/checked-groups/waveguide.osdi --output build/checked-groups/before-pinned.json
 pixi run build
 PYTHONPATH=src:tests taskset -c 0-3 pixi run python scripts/benchmark_checked_groups.py --library src/osdi_shim_nb.cpython-313-x86_64-linux-gnu.so --optical build/checked-groups/waveguide.osdi --output build/checked-groups/after-pinned.json
@@ -161,12 +161,12 @@ The timing-only baseline exports `bosdi_bench_lock_ns(size_t)` and `bosdi_bench_
 ns/call. After `bosdi_set_num_threads(4)`, the recorded three trials used 1,000,000 and 10,000 iterations respectively.
 
 The installed default `openvaf-r` emits ABI 0.5; existing legacy tests expect 0.4. A local PATH entry selects the
-packaged 0.4 compiler while explicitly selecting the Circulox compiler for new delays and existing optional 0.5 cases:
+packaged 0.4 compiler while explicitly selecting the OSDI 0.5 compiler for new delays and existing optional 0.5 cases:
 
 ```bash
 mkdir -p /tmp/bosdi-tools
 ln -s /home/cdaunt/code/bosdi/.pixi/envs/integration/lib/python3.13/site-packages/vacask_bin/data/bin/openvaf-r /tmp/bosdi-tools/openvaf-r
-PATH=/tmp/bosdi-tools:$PATH CIRCULOX_OPENVAF=/home/cdaunt/.local/bin/openvaf-r BOSDI_OPENVAF_05=/home/cdaunt/.local/bin/openvaf-r BOSDI_BASELINE_LIBRARY=/tmp/bosdi-before.so pixi run test
+PATH=/tmp/bosdi-tools:$PATH BOSDI_OPENVAF_05=/home/cdaunt/.local/bin/openvaf-r BOSDI_BASELINE_LIBRARY=/tmp/bosdi-before.so pixi run test
 pixi run cargo test
 ```
 
@@ -176,14 +176,14 @@ qualification in this run. Python formatting/lint and `git diff --check` pass.
 
 ## Remaining qualification
 
-The supplied Circulox `variable_delay` has maxdelay with a parameter-only duration; `mode_delay` changes the delayed
-signal. They are tested unchanged. Separate compiled fixtures exercise voltage-dependent and analysis-dependent td. The
-canonical waveguide is copied unchanged with its discipline include. Its four td values agree per lane, vary with lane
-length, and are refreshed after changed-lane setup. Both raw hidden-node maps and Jacobian references are checked; z
-residual rows remain zero for the host's history relationship.
+The supplied `variable_delay` has maxdelay with a parameter-only duration; `mode_delay` changes the delayed signal. They
+are tested unchanged. Separate compiled fixtures exercise voltage-dependent and analysis-dependent td. The canonical
+waveguide is copied unchanged with its discipline include. Its four td values agree per lane, vary with lane length, and
+are refreshed after changed-lane setup. Both raw hidden-node maps and Jacobian references are checked; z residual rows
+remain zero for the host's history relationship.
 
 This qualifies trusted local Linux CPU artifacts. Windows, macOS, browser execution, general OSDI delay providers and
-end-to-end Circulox waveguide admission have not been exercised here. BOSDI owns no accepted history, interpolation,
-condensation, transactions in Circulox, or alternate numerical backend. The global staging lock is conservative: it
-excludes unrelated handle evaluations too. Warm-up allocations and initial model loading remain. No provider has been
-newly certified for snapshot omission, and no universal four-worker speedup is claimed. Changes remain uncommitted.
+end-to-end host waveguide admission have not been exercised here. BOSDI owns no accepted history, interpolation,
+condensation, host transactions, or alternate numerical backend. The global staging lock is conservative: it excludes
+unrelated handle evaluations too. Warm-up allocations and initial model loading remain. No provider has been newly
+certified for snapshot omission, and no universal four-worker speedup is claimed. Changes remain uncommitted.

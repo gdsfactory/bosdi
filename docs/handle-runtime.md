@@ -219,8 +219,8 @@ independent audit.
 
 The CG2 capability query `bosdi_runtime_capabilities()` returned **31**; the explicit-context extension below raises the
 current mask to **95**. `bosdi_runtime_abi_version()` remains **1**. The capability registry preserves all CG1
-assignments (first checked-groups candidate, mask 7); CG2 is the Circulox integration-review follow-up, mask 31, both
-dated 2026-11-24.
+assignments (first checked-groups candidate, mask 7); CG2 is the integration-review follow-up, mask 31, both dated
+2026-11-24.
 
 | Value | Symbol                                  | Governed entry points / contract                                                                                             | Introduced |
 | ----: | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------- |
@@ -308,11 +308,11 @@ The [2026-11-24 measurements](benchmarks/checked-groups-2026-11-24.md) include b
 CPU-to-wall ratios for 32/128/512/2048 lanes and 1/2/4 workers, controlled ablations, setup comparisons and exact
 commands. The new default is 128 lanes / 32 lanes per chunk; explicit environment, global and per-handle overrides
 remain available. These are provider-level Linux CPU qualifications. Other hosts, general delayed providers, host
-history/condensation, and end-to-end Circulox admission remain unqualified.
+history/condensation, and end-to-end host admission remain unqualified.
 
 ## Owned staged lane candidates (CG2)
 
-Circulox can now prepare a candidate without publishing it: call `bosdi_stage_lanes_checked`, inspect durations through
+A host can prepare a candidate without publishing it: call `bosdi_stage_lanes_checked`, inspect durations through
 `bosdi_stage_prepared_delays`, then call `bosdi_commit_stage` or `bosdi_discard_stage`. All input pointers, X, context,
 callback and user storage are borrowed only for the stage call. On failure, the output token is zero. A successful token
 owns model/instance bytes, topology plans, lane indices and prepared durations; it holds no lock or library reference

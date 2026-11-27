@@ -175,10 +175,10 @@ class Group:
 
 @pytest.fixture(scope="module")
 def compiled_delays(tmp_path_factory):
-    requested = os.environ.get("CIRCULOX_OPENVAF") or os.environ.get("BOSDI_OPENVAF_05")
+    requested = os.environ.get("BOSDI_OPENVAF_05")
     compiler = requested or shutil.which("openvaf-r")
     if not compiler:
-        pytest.skip("CIRCULOX_OPENVAF / openvaf-r required")
+        pytest.skip("BOSDI_OPENVAF_05 / openvaf-r required")
     dest = tmp_path_factory.mktemp("checked-delays")
     probe = subprocess.run(
         [
@@ -192,12 +192,12 @@ def compiled_delays(tmp_path_factory):
     if probe.returncode != 0:
         if requested:
             pytest.fail(probe.stderr.decode(errors="replace"))
-        pytest.skip("OSDI 0.5 absdelay compiler required; set CIRCULOX_OPENVAF")
+        pytest.skip("OSDI 0.5 absdelay compiler required; set BOSDI_OPENVAF_05")
     artifact = ct.CDLL(str(dest / "probe.osdi"))
     if ct.c_uint32.in_dll(artifact, "OSDI_VERSION_MINOR").value != 5:
         if requested:
             pytest.fail("Explicit delay compiler must emit OSDI 0.5")
-        pytest.skip("OSDI 0.5 compiler required; set CIRCULOX_OPENVAF")
+        pytest.skip("OSDI 0.5 compiler required; set BOSDI_OPENVAF_05")
     for src in (ROOT / "devices/delays").glob("*.va"):
         subprocess.run(
             [compiler, str(src), "-o", str(dest / (src.stem + ".osdi"))],

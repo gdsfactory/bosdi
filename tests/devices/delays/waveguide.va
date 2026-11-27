@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Scalar-port Circulox library adapter. See models/README.md.
+// Scalar-port waveguide fixture. See README.md.
 `include "disciplines.vams"
 `include "photonic_disciplines.vams"
 

@@ -165,7 +165,7 @@ bool bosdi_free_model(uint32_t model);
  * 32    BOSDI_RESERVED_CHECKED_BOUND_RETAINED       NONE: reserved, NOT advertised         CG2
  * 64    BOSDI_CAP_EXPLICIT_CONTEXT           runtime_context_options              CG3
  * All function names above have the bosdi_ prefix. CG1 is the first local
- * checked-groups candidate (mask 7); CG2 is its Circulox review follow-up (31).
+ * checked-groups candidate (mask 7); CG2 is its integration review follow-up (31).
  * No assigned/reserved registry bit may be reused for another feature.
  * Unknown bits confer no guarantees. Gate features on BOTH bit and symbol
  * presence. Legacy local candidate 98626261 used bit 1 for the unregistered
